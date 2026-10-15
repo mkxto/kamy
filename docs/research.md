@@ -12,7 +12,7 @@ Commercial bin2bin protector for Windows PE (x86-64 + ARM64). No source changes 
 
 **Pipeline:** Analyze (PE + optional PDB → functions, CFG, unwind metadata) → Transform (composable passes: VM, mutation, MBA, CFF, constant/import hiding, diversification) → Rebuild (new protected PE + optional debug map).
 
-**Stated coverage:** 98.9% ntoskrnl.exe functions, 95.8% chrome.dll. SEH + C++ EH exception-aware. CET + CFG mitigation-compatible. ([codedefender.io](https://codedefender.io/))
+**Stated coverage** (internal production-scale targets): hvix64.exe 98.9%, chrome.dll 95.8%, ntoskrnl.exe 92.0% functions transformed. SEH + C++ EH exception-aware. CET + CFG mitigation-compatible, ACG-aware profiles. ARM64 shipped; Android listed as upcoming. Formats: EXE, DLL, drivers, incl. UEFI modules where supported. ([codedefender.io](https://codedefender.io/))
 
 **Key product differentiators:**
 - Per-function, per-layer composable protection profiles (not one opaque preset)
@@ -27,8 +27,11 @@ Custom disassembler → SSA IR → optimization pipeline → compiler backend (i
 - Backend lowers optimized IR to near-1:1 reinsertable native code — "that last part separates it from most lifting frameworks." They explicitly reject LLVM for this backend.
 - Byte-level memory model with store-forwarding, individual flag SSA values, backward-walkable def-use DAG.
 - Declarative pattern-rewrite DSL over IR DAGs, run to fixed point.
-- Small pass set to convergence: constant promotion + folding + dead-store elimination (scoped) + inst-combine + branch folding + dead-dependency analysis.
-- Register pressure avoidance as first-class allocator goal; stack-frame high-water-mark reconstruction.
+- Small pass set to convergence: constant promotion + folding + dead-store elimination (scoped) + inst-combine + branch folding + dead-dependency analysis. Passes are not independent — "each pass feeds the next, and the VM scaffolding unravels as a consequence of all of them running together."
+- Register pressure avoidance as first-class allocator goal. Rationale, verbatim: "If the register allocator spills, the devirtualized code gets its own stack frame alongside the original function's stack frame... stack-passed arguments to calls inside the devirtualized region will be misread by IDA, Binary Ninja, and anything else an analyst loads the binary into." The backend may select different instructions/registers than the original, but never spills.
+- Dead-dependency analysis: registers/flags clobbered by the native code immediately after the exit point are dead and their symbolic expressions are dropped. Their ZF example: the IR carries the full expression tree for a symbolic ZF even though the very next native instruction overwrites it.
+- Concrete-RSP lifting: RSP starts concrete (everything else symbolic) so stack-pointer arithmetic constant-folds and the generic load/store machinery handles stack accesses with no special casing. Limitation they accept: functions with dynamic stack allocations (alloca/VLA) are unsupported.
+- Stack-frame high-water-mark reconstruction: the concretized RSP at sink points (calls, boxed instructions) reveals the original frame size, and the prolog/epilog is rebuilt from it. If spilling ever happens, the original frame is placed after the recompiler's own spill frame.
 
 Sources: [Themida devirt](https://aftermathlabs.net/blog/09/05/2026/), [Tencent VM devirt](https://aftermathlabs.net/blog/31/07/2026/)
 
@@ -117,6 +120,33 @@ Replace individual instructions with semantically-equivalent larger sequences. E
 ### 2.2 Mixed Boolean Arithmetic (MBA)
 Rewrite simple expressions as complex tangles mixing arithmetic and bitwise ops. E.g. `x + y → (x^y) + 2*(x&y)`, `x ^ y → (x & ~y) | (~x & y)`.
 
+**Tencent VM's published MBA identity ruleset** (claimed exhaustive; applied recursively to build expressions). The same list doubles as the attacker's reduction playbook: an inst-combine carrying these rules, run to fixed point, fully collapses the generated linear MBA.
+
+```
+(A|B) + (A&B)        = A + B
+(A^B) + (A&B)        = A | B
+(A|B) - (A&B)        = A ^ B
+((A|B)^A) + A        = A | B
+~((~A ^ ~B) | ~A)    = A & B
+~(((A^B) & ~B) ^ ~A) = A & B
+A - (A - (A&B))      = A & B
+B - (((A&B)&B) ^ B)  = A & B
+((c&A) ^ A) | A      = A              [+ all operand orderings]
+(A & ((A^c) | c))    = A
+(((A&c) ^ A) | A)    = A
+(((c|A) ^ c) | A)    = A
+(((A^B)|B) & A) + B  = A + B
+(A&B) + (A|B)        = A + B
+~(A - c)             = -A + (c-1)
+~( <A+c gadget> )    = -A + c
+```
+
+The inverse pairs `(A^B)+(A&B) = A|B` and `(A|B)-(A&B) = A^B` bracket the same linear family our initial add/sub rules occupy — reducible by this ruleset and by known tooling. Acceptable for the v1 round-trip proof; MBA strength (nonlinear/polynomial, machine-generated) is D12+ work.
+
+**MBA on branch targets** (Themida post): encoding an indirect-branch destination as an MBA expression over opaque values prevented concretization — "this worked well for a while" — but is now trivially reducible; CodeDefender claims stronger, unpublished techniques in its heavier tiers. Corollary for future CFF/opaque-predicate work: branch-adjacent MBA must not be statically resolvable.
+
+**EFLAGS layout cross-check** (from the Tencent VJCC rewrite templates): CF = 0x1 (idx 0), PF = 0x4 (idx 1), AF = 0x10 (idx 2, never read by Jcc), ZF = 0x40 (idx 3), SF = 0x80 (idx 4), OF = 0x800 (idx 5).
+
 **Design against known attacks:**
 | Attack | What it beats | Design defense |
 |--------|--------------|----------------|
@@ -129,7 +159,7 @@ Rewrite simple expressions as complex tangles mixing arithmetic and bitwise ops.
 
 **Strongest posture:** polynomial/nonlinear MBA + scattered terms + point-function-like behavior + materialized opaque constants whose small-bit-width I/O is unrepresentative.
 
-Source: [secret.club](https://secret.club/2022/08/08/eqsat-oracle-synthesis.html), [MBA-Blast](https://www.usenix.org/system/files/sec21fall-liu-binbin.pdf)
+Source: [secret.club](https://secret.club/2022/08/08/eqsat-oracle-synthesis.html), [MBA-Blast](https://www.usenix.org/system/files/sec21fall-liu-binbin.pdf), [Tencent VM devirt](https://aftermathlabs.net/blog/31/07/2026/), [Themida devirt](https://aftermathlabs.net/blog/09/05/2026/)
 
 ### 2.3 Control-Flow Flattening (CFF)
 Dismantle structured control flow into `while(swVar){ switch(swVar){…} }` dispatcher. Must preserve exception regions, SEH/C++ EH unwind descriptors, and live-register state. Combine with opaque predicates / MBA on the switch variable to resist constant-propagation.

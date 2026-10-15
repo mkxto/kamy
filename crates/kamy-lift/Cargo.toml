@@ -12,4 +12,5 @@ workspace = true
 [dependencies]
 kamy-core.workspace = true
 kamy-disasm.workspace = true
+kamy-analysis.workspace = true
 iced-x86.workspace = true

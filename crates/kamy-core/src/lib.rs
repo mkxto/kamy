@@ -6,6 +6,7 @@
 
 mod addr;
 mod cfg;
+pub mod ir;
 mod module;
 mod reject;
 mod reloc;

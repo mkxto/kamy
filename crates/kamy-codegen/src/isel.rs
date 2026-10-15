@@ -1,0 +1,893 @@
+use std::collections::HashMap;
+
+use iced_x86::{Code, Decoder, DecoderOptions, Instruction, MemoryOperand, Register};
+use kamy_core::ir::{
+    BlockId, Gpr, IrFunction, IrOp, IrTerminator, IrType, PhysReg, ValueId, XmmReg,
+};
+
+use crate::regalloc::{RegAllocation, RegCopy};
+
+fn gpr_register(gpr: Gpr, ty: IrType) -> Register {
+    match (gpr, ty) {
+        (Gpr::Rax, IrType::I64) => Register::RAX,
+        (Gpr::Rax, IrType::I32) => Register::EAX,
+        (Gpr::Rax, IrType::I16) => Register::AX,
+        (Gpr::Rax, IrType::I8) => Register::AL,
+        (Gpr::Rcx, IrType::I64) => Register::RCX,
+        (Gpr::Rcx, IrType::I32) => Register::ECX,
+        (Gpr::Rcx, IrType::I16) => Register::CX,
+        (Gpr::Rcx, IrType::I8) => Register::CL,
+        (Gpr::Rdx, IrType::I64) => Register::RDX,
+        (Gpr::Rdx, IrType::I32) => Register::EDX,
+        (Gpr::Rdx, IrType::I16) => Register::DX,
+        (Gpr::Rdx, IrType::I8) => Register::DL,
+        (Gpr::Rbx, IrType::I64) => Register::RBX,
+        (Gpr::Rbx, IrType::I32) => Register::EBX,
+        (Gpr::Rbx, IrType::I16) => Register::BX,
+        (Gpr::Rbx, IrType::I8) => Register::BL,
+        (Gpr::Rsp, IrType::I64) => Register::RSP,
+        (Gpr::Rsp, IrType::I32) => Register::ESP,
+        (Gpr::Rsp, IrType::I16) => Register::SP,
+        (Gpr::Rsp, IrType::I8) => Register::SPL,
+        (Gpr::Rbp, IrType::I64) => Register::RBP,
+        (Gpr::Rbp, IrType::I32) => Register::EBP,
+        (Gpr::Rbp, IrType::I16) => Register::BP,
+        (Gpr::Rbp, IrType::I8) => Register::BPL,
+        (Gpr::Rsi, IrType::I64) => Register::RSI,
+        (Gpr::Rsi, IrType::I32) => Register::ESI,
+        (Gpr::Rsi, IrType::I16) => Register::SI,
+        (Gpr::Rsi, IrType::I8) => Register::SIL,
+        (Gpr::Rdi, IrType::I64) => Register::RDI,
+        (Gpr::Rdi, IrType::I32) => Register::EDI,
+        (Gpr::Rdi, IrType::I16) => Register::DI,
+        (Gpr::Rdi, IrType::I8) => Register::DIL,
+        (Gpr::R8, IrType::I64) => Register::R8,
+        (Gpr::R8, IrType::I32) => Register::R8D,
+        (Gpr::R8, IrType::I16) => Register::R8W,
+        (Gpr::R8, IrType::I8) => Register::R8L,
+        (Gpr::R9, IrType::I64) => Register::R9,
+        (Gpr::R9, IrType::I32) => Register::R9D,
+        (Gpr::R9, IrType::I16) => Register::R9W,
+        (Gpr::R9, IrType::I8) => Register::R9L,
+        (Gpr::R10, IrType::I64) => Register::R10,
+        (Gpr::R10, IrType::I32) => Register::R10D,
+        (Gpr::R10, IrType::I16) => Register::R10W,
+        (Gpr::R10, IrType::I8) => Register::R10L,
+        (Gpr::R11, IrType::I64) => Register::R11,
+        (Gpr::R11, IrType::I32) => Register::R11D,
+        (Gpr::R11, IrType::I16) => Register::R11W,
+        (Gpr::R11, IrType::I8) => Register::R11L,
+        (Gpr::R12, IrType::I64) => Register::R12,
+        (Gpr::R12, IrType::I32) => Register::R12D,
+        (Gpr::R12, IrType::I16) => Register::R12W,
+        (Gpr::R12, IrType::I8) => Register::R12L,
+        (Gpr::R13, IrType::I64) => Register::R13,
+        (Gpr::R13, IrType::I32) => Register::R13D,
+        (Gpr::R13, IrType::I16) => Register::R13W,
+        (Gpr::R13, IrType::I8) => Register::R13L,
+        (Gpr::R14, IrType::I64) => Register::R14,
+        (Gpr::R14, IrType::I32) => Register::R14D,
+        (Gpr::R14, IrType::I16) => Register::R14W,
+        (Gpr::R14, IrType::I8) => Register::R14L,
+        (Gpr::R15, IrType::I64) => Register::R15,
+        (Gpr::R15, IrType::I32) => Register::R15D,
+        (Gpr::R15, IrType::I16) => Register::R15W,
+        (Gpr::R15, IrType::I8) => Register::R15L,
+        (_, IrType::I128) => gpr_register(gpr, IrType::I64),
+    }
+}
+
+fn xmm_register(xmm: XmmReg) -> Register {
+    match xmm {
+        XmmReg::Xmm0 => Register::XMM0,
+        XmmReg::Xmm1 => Register::XMM1,
+        XmmReg::Xmm2 => Register::XMM2,
+        XmmReg::Xmm3 => Register::XMM3,
+        XmmReg::Xmm4 => Register::XMM4,
+        XmmReg::Xmm5 => Register::XMM5,
+        XmmReg::Xmm6 => Register::XMM6,
+        XmmReg::Xmm7 => Register::XMM7,
+        XmmReg::Xmm8 => Register::XMM8,
+        XmmReg::Xmm9 => Register::XMM9,
+        XmmReg::Xmm10 => Register::XMM10,
+        XmmReg::Xmm11 => Register::XMM11,
+        XmmReg::Xmm12 => Register::XMM12,
+        XmmReg::Xmm13 => Register::XMM13,
+        XmmReg::Xmm14 => Register::XMM14,
+        XmmReg::Xmm15 => Register::XMM15,
+    }
+}
+
+fn phys_to_register(phys: PhysReg, ty: IrType) -> Register {
+    match phys {
+        PhysReg::Gpr(g) => gpr_register(g, ty),
+        PhysReg::Xmm(x) => xmm_register(x),
+        PhysReg::Flag(_) => gpr_register(Gpr::Rax, IrType::I8),
+    }
+}
+
+fn reg_of(alloc: &RegAllocation, vid: ValueId, ty: IrType) -> Register {
+    let phys = alloc.assignments[&vid];
+    phys_to_register(phys, ty)
+}
+
+fn alu_code(op: &IrOp, ty: IrType) -> Code {
+    match (op, ty) {
+        (IrOp::Add, IrType::I64) => Code::Add_rm64_r64,
+        (IrOp::Add, IrType::I32) => Code::Add_rm32_r32,
+        (IrOp::Add, IrType::I16) => Code::Add_rm16_r16,
+        (IrOp::Add, IrType::I8) => Code::Add_rm8_r8,
+        (IrOp::Sub, IrType::I64) => Code::Sub_rm64_r64,
+        (IrOp::Sub, IrType::I32) => Code::Sub_rm32_r32,
+        (IrOp::Sub, IrType::I16) => Code::Sub_rm16_r16,
+        (IrOp::Sub, IrType::I8) => Code::Sub_rm8_r8,
+        (IrOp::And, IrType::I64) => Code::And_rm64_r64,
+        (IrOp::And, IrType::I32) => Code::And_rm32_r32,
+        (IrOp::And, IrType::I16) => Code::And_rm16_r16,
+        (IrOp::And, IrType::I8) => Code::And_rm8_r8,
+        (IrOp::Or, IrType::I64) => Code::Or_rm64_r64,
+        (IrOp::Or, IrType::I32) => Code::Or_rm32_r32,
+        (IrOp::Or, IrType::I16) => Code::Or_rm16_r16,
+        (IrOp::Or, IrType::I8) => Code::Or_rm8_r8,
+        (IrOp::Xor, IrType::I64) => Code::Xor_rm64_r64,
+        (IrOp::Xor, IrType::I32) => Code::Xor_rm32_r32,
+        (IrOp::Xor, IrType::I16) => Code::Xor_rm16_r16,
+        (IrOp::Xor, IrType::I8) => Code::Xor_rm8_r8,
+        _ => Code::Nopd,
+    }
+}
+
+fn shift_code(op: &IrOp, ty: IrType) -> Code {
+    match (op, ty) {
+        (IrOp::Shl, IrType::I64) => Code::Shl_rm64_CL,
+        (IrOp::Shl, IrType::I32) => Code::Shl_rm32_CL,
+        (IrOp::Shl, IrType::I16) => Code::Shl_rm16_CL,
+        (IrOp::Shl, IrType::I8) => Code::Shl_rm8_CL,
+        (IrOp::Shr, IrType::I64) => Code::Shr_rm64_CL,
+        (IrOp::Shr, IrType::I32) => Code::Shr_rm32_CL,
+        (IrOp::Shr, IrType::I16) => Code::Shr_rm16_CL,
+        (IrOp::Shr, IrType::I8) => Code::Shr_rm8_CL,
+        (IrOp::Sar, IrType::I64) => Code::Sar_rm64_CL,
+        (IrOp::Sar, IrType::I32) => Code::Sar_rm32_CL,
+        (IrOp::Sar, IrType::I16) => Code::Sar_rm16_CL,
+        (IrOp::Sar, IrType::I8) => Code::Sar_rm8_CL,
+        (IrOp::Rol, IrType::I64) => Code::Rol_rm64_CL,
+        (IrOp::Rol, IrType::I32) => Code::Rol_rm32_CL,
+        (IrOp::Rol, IrType::I16) => Code::Rol_rm16_CL,
+        (IrOp::Rol, IrType::I8) => Code::Rol_rm8_CL,
+        (IrOp::Ror, IrType::I64) => Code::Ror_rm64_CL,
+        (IrOp::Ror, IrType::I32) => Code::Ror_rm32_CL,
+        (IrOp::Ror, IrType::I16) => Code::Ror_rm16_CL,
+        (IrOp::Ror, IrType::I8) => Code::Ror_rm8_CL,
+        _ => Code::Nopd,
+    }
+}
+
+fn mov_code(ty: IrType) -> Code {
+    match ty {
+        IrType::I64 | IrType::I128 => Code::Mov_r64_rm64,
+        IrType::I32 => Code::Mov_r32_rm32,
+        IrType::I16 => Code::Mov_r16_rm16,
+        IrType::I8 => Code::Mov_r8_rm8,
+    }
+}
+
+fn neg_code(ty: IrType) -> Code {
+    match ty {
+        IrType::I64 | IrType::I128 => Code::Neg_rm64,
+        IrType::I32 => Code::Neg_rm32,
+        IrType::I16 => Code::Neg_rm16,
+        IrType::I8 => Code::Neg_rm8,
+    }
+}
+
+fn not_code(ty: IrType) -> Code {
+    match ty {
+        IrType::I64 | IrType::I128 => Code::Not_rm64,
+        IrType::I32 => Code::Not_rm32,
+        IrType::I16 => Code::Not_rm16,
+        IrType::I8 => Code::Not_rm8,
+    }
+}
+
+fn test_code(ty: IrType) -> Code {
+    match ty {
+        IrType::I64 | IrType::I128 => Code::Test_rm64_r64,
+        IrType::I32 => Code::Test_rm32_r32,
+        IrType::I16 => Code::Test_rm16_r16,
+        IrType::I8 => Code::Test_rm8_r8,
+    }
+}
+
+fn load_code(ty: IrType) -> Code {
+    match ty {
+        IrType::I64 | IrType::I128 => Code::Mov_r64_rm64,
+        IrType::I32 => Code::Mov_r32_rm32,
+        IrType::I16 => Code::Mov_r16_rm16,
+        IrType::I8 => Code::Mov_r8_rm8,
+    }
+}
+
+fn store_code(ty: IrType) -> Code {
+    match ty {
+        IrType::I64 | IrType::I128 => Code::Mov_rm64_r64,
+        IrType::I32 => Code::Mov_rm32_r32,
+        IrType::I16 => Code::Mov_rm16_r16,
+        IrType::I8 => Code::Mov_rm8_r8,
+    }
+}
+
+fn emit_copy(out: &mut Vec<Instruction>, copy: &RegCopy) {
+    let from_reg = phys_to_register(copy.from, copy.ty);
+    let to_reg = phys_to_register(copy.to, copy.ty);
+    let code = mov_code(copy.ty);
+    out.push(Instruction::with2(code, to_reg, from_reg).unwrap());
+}
+
+fn block_order(func: &IrFunction) -> Vec<BlockId> {
+    let mut order = Vec::with_capacity(func.blocks.len());
+    let mut visited = vec![false; func.blocks.len()];
+    let mut stack = vec![func.entry];
+    while let Some(bid) = stack.pop() {
+        let idx = bid.0 as usize;
+        if idx >= visited.len() || visited[idx] {
+            continue;
+        }
+        visited[idx] = true;
+        order.push(bid);
+        let block = func.block(bid);
+        match &block.term {
+            IrTerminator::Jump(t) => stack.push(*t),
+            IrTerminator::Branch {
+                taken, not_taken, ..
+            } => {
+                stack.push(*not_taken);
+                stack.push(*taken);
+            }
+            IrTerminator::Ret | IrTerminator::Unreachable => {}
+        }
+    }
+    order
+}
+
+fn is_branch_cond_producer(func: &IrFunction, vid: ValueId) -> bool {
+    for block in &func.blocks {
+        if let IrTerminator::Branch { cond, .. } = &block.term {
+            if *cond == vid {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn value_type(func: &IrFunction, vid: ValueId) -> IrType {
+    for block in &func.blocks {
+        for phi in &block.phis {
+            if phi.dest == vid {
+                return phi.ty;
+            }
+        }
+        for inst in &block.insts {
+            if inst.dest == Some(vid) {
+                return inst.ty;
+            }
+        }
+    }
+    IrType::I64
+}
+
+fn flag_op_to_setcc(op: &IrOp) -> Code {
+    match op {
+        IrOp::IsZero => Code::Sete_rm8,
+        IrOp::IsNeg => Code::Sets_rm8,
+        IrOp::Parity => Code::Setp_rm8,
+        IrOp::CarryAdd | IrOp::CarryShl | IrOp::CarryShr | IrOp::CarrySar => Code::Setb_rm8,
+        IrOp::BorrowSub => Code::Setb_rm8,
+        IrOp::OverflowAdd | IrOp::OverflowSub => Code::Seto_rm8,
+        IrOp::AuxCarryAdd | IrOp::AuxBorrowSub => Code::Seta_rm8,
+        _ => Code::Sete_rm8,
+    }
+}
+
+fn flag_op_to_jcc(op: &IrOp) -> Code {
+    match op {
+        IrOp::IsZero => Code::Je_rel32_64,
+        IrOp::IsNeg => Code::Js_rel32_64,
+        IrOp::Parity => Code::Jp_rel32_64,
+        IrOp::CarryAdd | IrOp::CarryShl | IrOp::CarryShr | IrOp::CarrySar => Code::Jb_rel32_64,
+        IrOp::BorrowSub => Code::Jb_rel32_64,
+        IrOp::OverflowAdd | IrOp::OverflowSub => Code::Jo_rel32_64,
+        IrOp::AuxCarryAdd | IrOp::AuxBorrowSub => Code::Ja_rel32_64,
+        _ => Code::Je_rel32_64,
+    }
+}
+
+pub fn select_instructions(
+    func: &IrFunction,
+    alloc: &RegAllocation,
+    _image_base: u64,
+    entry_va: u64,
+) -> Vec<Instruction> {
+    let order = block_order(func);
+    let mut out: Vec<Instruction> = Vec::new();
+    let mut block_labels: HashMap<BlockId, u64> = HashMap::new();
+
+    let va = entry_va;
+    for (bi, &bid) in order.iter().enumerate() {
+        block_labels.insert(bid, va + (bi as u64) * 0x100);
+    }
+
+    let mut copy_map: HashMap<usize, Vec<&RegCopy>> = HashMap::new();
+    for c in &alloc.copies {
+        copy_map.entry(c.point).or_default().push(c);
+    }
+
+    let mut global_point: usize = 0;
+
+    for &bid in &order {
+        let block = func.block(bid);
+
+        for inst in &block.insts {
+            if let Some(copies) = copy_map.get(&global_point) {
+                for c in copies {
+                    emit_copy(&mut out, c);
+                }
+            }
+
+            select_inst(func, alloc, inst, &block_labels, &mut out);
+            global_point += 1;
+        }
+
+        select_terminator(func, alloc, &block.term, &block_labels, &mut out);
+    }
+
+    out
+}
+
+fn select_inst(
+    func: &IrFunction,
+    alloc: &RegAllocation,
+    inst: &kamy_core::ir::Inst,
+    _block_labels: &HashMap<BlockId, u64>,
+    out: &mut Vec<Instruction>,
+) {
+    let ty = inst.ty;
+
+    match &inst.op {
+        IrOp::Const(imm) => {
+            let dest = inst.dest.unwrap();
+            let dest_reg = reg_of(alloc, dest, ty);
+            if *imm == 0 {
+                let xor_code = match ty {
+                    IrType::I64 | IrType::I128 => Code::Xor_rm32_r32,
+                    IrType::I32 => Code::Xor_rm32_r32,
+                    IrType::I16 => Code::Xor_rm16_r16,
+                    IrType::I8 => Code::Xor_rm8_r8,
+                };
+                let zero_reg = if matches!(ty, IrType::I64 | IrType::I128) {
+                    phys_to_register(alloc.assignments[&dest], IrType::I32)
+                } else {
+                    dest_reg
+                };
+                out.push(Instruction::with2(xor_code, zero_reg, zero_reg).unwrap());
+            } else {
+                match ty {
+                    IrType::I64 | IrType::I128 => {
+                        out.push(Instruction::with2(Code::Mov_r64_imm64, dest_reg, *imm).unwrap());
+                    }
+                    IrType::I32 => {
+                        out.push(
+                            Instruction::with2(Code::Mov_r32_imm32, dest_reg, *imm as u32).unwrap(),
+                        );
+                    }
+                    IrType::I16 => {
+                        out.push(
+                            Instruction::with2(Code::Mov_r16_imm16, dest_reg, *imm as u32).unwrap(),
+                        );
+                    }
+                    IrType::I8 => {
+                        out.push(
+                            Instruction::with2(Code::Mov_r8_imm8, dest_reg, *imm as u32).unwrap(),
+                        );
+                    }
+                }
+            }
+        }
+
+        IrOp::Copy => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let src_ty = value_type(func, src);
+            let src_reg = reg_of(alloc, src, src_ty);
+            if dest_reg != src_reg {
+                out.push(Instruction::with2(mov_code(ty), dest_reg, src_reg).unwrap());
+            }
+        }
+
+        IrOp::Add | IrOp::Sub | IrOp::And | IrOp::Or | IrOp::Xor => {
+            let dest = inst.dest.unwrap();
+            let lhs = inst.args[0];
+            let rhs = inst.args[1];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let lhs_reg = reg_of(alloc, lhs, ty);
+            let rhs_reg = reg_of(alloc, rhs, ty);
+            if dest_reg != lhs_reg {
+                out.push(Instruction::with2(mov_code(ty), dest_reg, lhs_reg).unwrap());
+            }
+            let code = alu_code(&inst.op, ty);
+            out.push(Instruction::with2(code, dest_reg, rhs_reg).unwrap());
+        }
+
+        IrOp::Neg => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let src_reg = reg_of(alloc, src, ty);
+            if dest_reg != src_reg {
+                out.push(Instruction::with2(mov_code(ty), dest_reg, src_reg).unwrap());
+            }
+            out.push(Instruction::with1(neg_code(ty), dest_reg).unwrap());
+        }
+
+        IrOp::Not => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let src_reg = reg_of(alloc, src, ty);
+            if dest_reg != src_reg {
+                out.push(Instruction::with2(mov_code(ty), dest_reg, src_reg).unwrap());
+            }
+            out.push(Instruction::with1(not_code(ty), dest_reg).unwrap());
+        }
+
+        IrOp::Shl | IrOp::Shr | IrOp::Sar | IrOp::Rol | IrOp::Ror => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let src_reg = reg_of(alloc, src, ty);
+            if dest_reg != src_reg {
+                out.push(Instruction::with2(mov_code(ty), dest_reg, src_reg).unwrap());
+            }
+            let count = inst.args[1];
+            let count_reg = reg_of(alloc, count, IrType::I8);
+            if count_reg != Register::CL {
+                out.push(Instruction::with2(Code::Mov_r8_rm8, Register::CL, count_reg).unwrap());
+            }
+            let code = shift_code(&inst.op, ty);
+            out.push(Instruction::with1(code, dest_reg).unwrap());
+        }
+
+        IrOp::Mul => {
+            let dest = inst.dest.unwrap();
+            let lhs = inst.args[0];
+            let rhs = inst.args[1];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let lhs_reg = reg_of(alloc, lhs, ty);
+            let rhs_reg = reg_of(alloc, rhs, ty);
+            let code = match ty {
+                IrType::I64 | IrType::I128 => Code::Imul_r64_rm64,
+                IrType::I32 => Code::Imul_r32_rm32,
+                IrType::I16 => Code::Imul_r16_rm16,
+                _ => Code::Imul_r32_rm32,
+            };
+            if dest_reg != lhs_reg {
+                out.push(Instruction::with2(mov_code(ty), dest_reg, lhs_reg).unwrap());
+            }
+            out.push(Instruction::with2(code, dest_reg, rhs_reg).unwrap());
+        }
+
+        IrOp::Load => {
+            let dest = inst.dest.unwrap();
+            let addr = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let addr_reg = reg_of(alloc, addr, IrType::I64);
+            let mem = MemoryOperand::with_base(addr_reg);
+            let code = load_code(ty);
+            out.push(Instruction::with2(code, dest_reg, mem).unwrap());
+        }
+
+        IrOp::Store => {
+            let addr = inst.args[0];
+            let val = inst.args[1];
+            let addr_reg = reg_of(alloc, addr, IrType::I64);
+            let val_reg = reg_of(alloc, val, ty);
+            let mem = MemoryOperand::with_base(addr_reg);
+            let code = store_code(ty);
+            out.push(Instruction::with2(code, mem, val_reg).unwrap());
+        }
+
+        IrOp::Zext => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let src_ty = value_type(func, src);
+            let src_reg = reg_of(alloc, src, src_ty);
+            let code = match (src_ty, ty) {
+                (IrType::I8, IrType::I16) => Code::Movzx_r16_rm8,
+                (IrType::I8, IrType::I32) => Code::Movzx_r32_rm8,
+                (IrType::I8, IrType::I64) => Code::Movzx_r64_rm8,
+                (IrType::I16, IrType::I32) => Code::Movzx_r32_rm16,
+                (IrType::I16, IrType::I64) => Code::Movzx_r64_rm16,
+                (IrType::I32, IrType::I64) => {
+                    let dest32 = phys_to_register(alloc.assignments[&dest], IrType::I32);
+                    let src32 = phys_to_register(alloc.assignments[&src], IrType::I32);
+                    out.push(Instruction::with2(Code::Mov_r32_rm32, dest32, src32).unwrap());
+                    return;
+                }
+                _ => {
+                    out.push(Instruction::with2(mov_code(ty), dest_reg, src_reg).unwrap());
+                    return;
+                }
+            };
+            out.push(Instruction::with2(code, dest_reg, src_reg).unwrap());
+        }
+
+        IrOp::Sext => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let src_ty = value_type(func, src);
+            let src_reg = reg_of(alloc, src, src_ty);
+            let code = match (src_ty, ty) {
+                (IrType::I8, IrType::I16) => Code::Movsx_r16_rm8,
+                (IrType::I8, IrType::I32) => Code::Movsx_r32_rm8,
+                (IrType::I8, IrType::I64) => Code::Movsx_r64_rm8,
+                (IrType::I16, IrType::I32) => Code::Movsx_r32_rm16,
+                (IrType::I16, IrType::I64) => Code::Movsx_r64_rm16,
+                (IrType::I32, IrType::I64) => Code::Movsxd_r64_rm32,
+                _ => {
+                    out.push(Instruction::with2(mov_code(ty), dest_reg, src_reg).unwrap());
+                    return;
+                }
+            };
+            out.push(Instruction::with2(code, dest_reg, src_reg).unwrap());
+        }
+
+        IrOp::Trunc => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let _src_ty = value_type(func, src);
+            let src_reg = phys_to_register(alloc.assignments[&src], ty);
+            if dest_reg != src_reg {
+                out.push(Instruction::with2(mov_code(ty), dest_reg, src_reg).unwrap());
+            }
+        }
+
+        IrOp::IsZero
+        | IrOp::IsNeg
+        | IrOp::Parity
+        | IrOp::CarryAdd
+        | IrOp::OverflowAdd
+        | IrOp::BorrowSub
+        | IrOp::OverflowSub
+        | IrOp::AuxCarryAdd
+        | IrOp::AuxBorrowSub
+        | IrOp::CarryShl
+        | IrOp::CarryShr
+        | IrOp::CarrySar => {
+            let dest = inst.dest.unwrap();
+            if is_branch_cond_producer(func, dest) {
+                return;
+            }
+            let dest_reg = reg_of(alloc, dest, IrType::I8);
+            if !inst.args.is_empty() {
+                let arg = inst.args[0];
+                let arg_ty = value_type(func, arg);
+                let arg_reg = reg_of(alloc, arg, arg_ty);
+                let tc = test_code(arg_ty);
+                out.push(Instruction::with2(tc, arg_reg, arg_reg).unwrap());
+            }
+            let setcc = flag_op_to_setcc(&inst.op);
+            out.push(Instruction::with1(setcc, dest_reg).unwrap());
+        }
+
+        IrOp::SetIf => {
+            let dest = inst.dest.unwrap();
+            let cond = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, IrType::I8);
+            let cond_reg = reg_of(alloc, cond, IrType::I8);
+            let tc = test_code(IrType::I8);
+            out.push(Instruction::with2(tc, cond_reg, cond_reg).unwrap());
+            out.push(Instruction::with1(Code::Setne_rm8, dest_reg).unwrap());
+        }
+
+        IrOp::Select => {
+            let dest = inst.dest.unwrap();
+            let cond = inst.args[0];
+            let true_val = inst.args[1];
+            let false_val = inst.args[2];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let false_reg = reg_of(alloc, false_val, ty);
+            let true_reg = reg_of(alloc, true_val, ty);
+            let cond_reg = reg_of(alloc, cond, IrType::I8);
+            if dest_reg != false_reg {
+                out.push(Instruction::with2(mov_code(ty), dest_reg, false_reg).unwrap());
+            }
+            out.push(Instruction::with2(test_code(IrType::I8), cond_reg, cond_reg).unwrap());
+            let cmov_code = match ty {
+                IrType::I64 | IrType::I128 => Code::Cmovne_r64_rm64,
+                IrType::I32 => Code::Cmovne_r32_rm32,
+                IrType::I16 => Code::Cmovne_r16_rm16,
+                _ => Code::Cmovne_r32_rm32,
+            };
+            out.push(Instruction::with2(cmov_code, dest_reg, true_reg).unwrap());
+        }
+
+        IrOp::Call { target } => {
+            out.push(Instruction::with_branch(Code::Call_rel32_64, *target).unwrap());
+        }
+
+        IrOp::NativeInline(native) => {
+            let mut decoder = Decoder::new(64, &native.bytes, DecoderOptions::NONE);
+            for instr in &mut decoder {
+                out.push(instr);
+            }
+        }
+
+        IrOp::Mov128 => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, IrType::I128);
+            let src_reg = reg_of(alloc, src, IrType::I128);
+            if dest_reg != src_reg {
+                if matches!(alloc.assignments[&dest], PhysReg::Xmm(_))
+                    && matches!(alloc.assignments[&src], PhysReg::Xmm(_))
+                {
+                    out.push(
+                        Instruction::with2(Code::Movaps_xmm_xmmm128, dest_reg, src_reg).unwrap(),
+                    );
+                } else {
+                    out.push(Instruction::with2(mov_code(IrType::I64), dest_reg, src_reg).unwrap());
+                }
+            }
+        }
+
+        IrOp::Bswap => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let src_reg = reg_of(alloc, src, ty);
+            if dest_reg != src_reg {
+                out.push(Instruction::with2(mov_code(ty), dest_reg, src_reg).unwrap());
+            }
+            let code = match ty {
+                IrType::I64 | IrType::I128 => Code::Bswap_r64,
+                _ => Code::Bswap_r32,
+            };
+            out.push(Instruction::with1(code, dest_reg).unwrap());
+        }
+
+        IrOp::Bsf => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let src_reg = reg_of(alloc, src, ty);
+            let code = match ty {
+                IrType::I64 | IrType::I128 => Code::Bsf_r64_rm64,
+                IrType::I32 => Code::Bsf_r32_rm32,
+                IrType::I16 => Code::Bsf_r16_rm16,
+                _ => Code::Bsf_r32_rm32,
+            };
+            out.push(Instruction::with2(code, dest_reg, src_reg).unwrap());
+        }
+
+        IrOp::Bsr => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let src_reg = reg_of(alloc, src, ty);
+            let code = match ty {
+                IrType::I64 | IrType::I128 => Code::Bsr_r64_rm64,
+                IrType::I32 => Code::Bsr_r32_rm32,
+                IrType::I16 => Code::Bsr_r16_rm16,
+                _ => Code::Bsr_r32_rm32,
+            };
+            out.push(Instruction::with2(code, dest_reg, src_reg).unwrap());
+        }
+
+        IrOp::Popcnt => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let src_reg = reg_of(alloc, src, ty);
+            let code = match ty {
+                IrType::I64 | IrType::I128 => Code::Popcnt_r64_rm64,
+                IrType::I32 => Code::Popcnt_r32_rm32,
+                IrType::I16 => Code::Popcnt_r16_rm16,
+                _ => Code::Popcnt_r32_rm32,
+            };
+            out.push(Instruction::with2(code, dest_reg, src_reg).unwrap());
+        }
+
+        IrOp::Lzcnt => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let src_reg = reg_of(alloc, src, ty);
+            let code = match ty {
+                IrType::I64 | IrType::I128 => Code::Lzcnt_r64_rm64,
+                IrType::I32 => Code::Lzcnt_r32_rm32,
+                IrType::I16 => Code::Lzcnt_r16_rm16,
+                _ => Code::Lzcnt_r32_rm32,
+            };
+            out.push(Instruction::with2(code, dest_reg, src_reg).unwrap());
+        }
+
+        IrOp::Tzcnt => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, ty);
+            let src_reg = reg_of(alloc, src, ty);
+            let code = match ty {
+                IrType::I64 | IrType::I128 => Code::Tzcnt_r64_rm64,
+                IrType::I32 => Code::Tzcnt_r32_rm32,
+                IrType::I16 => Code::Tzcnt_r16_rm16,
+                _ => Code::Tzcnt_r32_rm32,
+            };
+            out.push(Instruction::with2(code, dest_reg, src_reg).unwrap());
+        }
+
+        IrOp::UDiv | IrOp::SDiv | IrOp::URem | IrOp::SRem | IrOp::UMulHi | IrOp::SMulHi => {
+            let dest = inst.dest.unwrap();
+            let dest_reg = reg_of(alloc, dest, ty);
+            out.push(Instruction::with2(mov_code(ty), dest_reg, dest_reg).unwrap());
+        }
+
+        IrOp::Undef => {}
+    }
+}
+
+fn find_flag_producer(func: &IrFunction, cond_vid: ValueId) -> Option<&kamy_core::ir::Inst> {
+    for block in &func.blocks {
+        for inst in &block.insts {
+            if inst.dest == Some(cond_vid) {
+                return Some(inst);
+            }
+        }
+    }
+    None
+}
+
+fn select_terminator(
+    func: &IrFunction,
+    alloc: &RegAllocation,
+    term: &IrTerminator,
+    block_labels: &HashMap<BlockId, u64>,
+    out: &mut Vec<Instruction>,
+) {
+    match term {
+        IrTerminator::Ret => {
+            out.push(Instruction::with(Code::Retnq));
+        }
+        IrTerminator::Jump(target) => {
+            let target_va = block_labels[target];
+            out.push(Instruction::with_branch(Code::Jmp_rel32_64, target_va).unwrap());
+        }
+        IrTerminator::Branch {
+            cond,
+            taken,
+            not_taken,
+        } => {
+            let taken_va = block_labels[taken];
+            let not_taken_va = block_labels[not_taken];
+
+            if let Some(producer) = find_flag_producer(func, *cond) {
+                match &producer.op {
+                    IrOp::IsZero
+                    | IrOp::IsNeg
+                    | IrOp::Parity
+                    | IrOp::CarryAdd
+                    | IrOp::OverflowAdd
+                    | IrOp::BorrowSub
+                    | IrOp::OverflowSub
+                    | IrOp::AuxCarryAdd
+                    | IrOp::AuxBorrowSub
+                    | IrOp::CarryShl
+                    | IrOp::CarryShr
+                    | IrOp::CarrySar => {
+                        if !producer.args.is_empty() {
+                            let arg = producer.args[0];
+                            let arg_ty = value_type(func, arg);
+                            let arg_reg = reg_of(alloc, arg, arg_ty);
+                            let tc = test_code(arg_ty);
+                            out.push(Instruction::with2(tc, arg_reg, arg_reg).unwrap());
+                        }
+                        let jcc = flag_op_to_jcc(&producer.op);
+                        out.push(Instruction::with_branch(jcc, taken_va).unwrap());
+                        out.push(
+                            Instruction::with_branch(Code::Jmp_rel32_64, not_taken_va).unwrap(),
+                        );
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+
+            let cond_reg = reg_of(alloc, *cond, IrType::I8);
+            out.push(Instruction::with2(test_code(IrType::I8), cond_reg, cond_reg).unwrap());
+            out.push(Instruction::with_branch(Code::Jne_rel32_64, taken_va).unwrap());
+            out.push(Instruction::with_branch(Code::Jmp_rel32_64, not_taken_va).unwrap());
+        }
+        IrTerminator::Unreachable => {
+            out.push(Instruction::with(Code::Int3));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kamy_core::ir::*;
+
+    #[test]
+    fn select_const_add_ret() {
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+
+        let v0 = func.alloc_value();
+        let v1 = func.alloc_value();
+        let v2 = func.alloc_value();
+
+        let block = IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![
+                Inst {
+                    dest: Some(v0),
+                    op: IrOp::Const(42),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(v1),
+                    op: IrOp::Const(58),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(v2),
+                    op: IrOp::Add,
+                    args: vec![v0, v1],
+                    ty: IrType::I64,
+                },
+            ],
+            term: IrTerminator::Ret,
+        };
+        func.blocks.push(block);
+
+        let mut assignments = HashMap::new();
+        assignments.insert(v0, PhysReg::Gpr(Gpr::Rax));
+        assignments.insert(v1, PhysReg::Gpr(Gpr::Rcx));
+        assignments.insert(v2, PhysReg::Gpr(Gpr::Rax));
+
+        let alloc = RegAllocation {
+            assignments,
+            copies: vec![],
+        };
+
+        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000);
+
+        assert!(!instrs.is_empty());
+
+        use iced_x86::Mnemonic;
+        let mnemonics: Vec<Mnemonic> = instrs.iter().map(|i| i.mnemonic()).collect();
+        assert!(
+            mnemonics.contains(&Mnemonic::Mov),
+            "should contain mov: {mnemonics:?}"
+        );
+        assert!(
+            mnemonics.contains(&Mnemonic::Add),
+            "should contain add: {mnemonics:?}"
+        );
+        assert!(
+            mnemonics.contains(&Mnemonic::Ret),
+            "should contain ret: {mnemonics:?}"
+        );
+    }
+}

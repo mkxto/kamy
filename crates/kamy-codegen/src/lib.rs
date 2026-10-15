@@ -1,5 +1,13 @@
 //! Instruction selector, linear-scan register allocator, and assembler.
 
+pub mod encode;
+pub mod isel;
+pub mod regalloc;
+
+pub use encode::assemble;
+pub use isel::select_instructions;
+pub use regalloc::{RegAllocation, RegCopy, allocate_registers};
+
 use std::fmt;
 
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Instruction, InstructionBlock};

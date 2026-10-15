@@ -212,6 +212,7 @@ name = "kamy-lift"
 version = "0.0.0"
 dependencies = [
  "iced-x86",
+ "kamy-analysis",
  "kamy-core",
  "kamy-disasm",
 ]
@@ -251,7 +252,7 @@ dependencies = [
  "kamy-core",
  "kamy-lift",
  "rand_chacha",
- "rand_core 0.9.5",
+ "rand_core",
 ]
 
 [[package]]
@@ -307,14 +308,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e6af7f3e25ded52c41df4e0b1af2d047e45896c2f3281792ed68a1c243daedb"
 dependencies = [
  "ppv-lite86",
- "rand_core 0.10.1",
+ "rand_core",
 ]
-
-[[package]]
-name = "rand_core"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 
 [[package]]
 name = "rand_core"
