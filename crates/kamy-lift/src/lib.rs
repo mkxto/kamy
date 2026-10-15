@@ -25,6 +25,7 @@ pub struct LiftResult {
     pub func: IrFunction,
     pub block_entry: Vec<[ValueId; 38]>,
     pub block_exit: Vec<[ValueId; 38]>,
+    pub rsp_chain: std::collections::HashSet<ValueId>,
 }
 
 pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLookup) -> LiftResult {
@@ -63,6 +64,7 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
     let n = ordered_bbs.len();
     let mut block_entry = Vec::with_capacity(n);
     let mut block_exit = Vec::with_capacity(n);
+    let mut rsp_chain = std::collections::HashSet::new();
 
     let mut builder = IrBuilder::new(&mut ir_func, BlockId(0));
 
@@ -131,12 +133,14 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
             }
         }
         block_exit.push(lift_state.snapshot());
+        rsp_chain.extend(&lift_state.rsp_chain);
     }
 
     LiftResult {
         func: ir_func,
         block_entry,
         block_exit,
+        rsp_chain,
     }
 }
 

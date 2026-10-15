@@ -104,13 +104,41 @@ fn ssa_body(
     kamy_lift::ssa::construct_ssa(&mut result);
     transform(&mut result.func);
     kamy_transforms::optimize(&mut result.func);
-    let alloc = kamy_codegen::allocate_registers(&result.func, &[]).map_err(|_| {
-        LinkError::Codegen(kamy_codegen::CodegenError::Encode(
-            "register pressure".into(),
-        ))
-    })?;
-    let instrs = kamy_codegen::select_instructions(&result.func, &alloc, base, new_va);
+
+    // Callee-saved activation deferred to Phase 4 (needs RSP alignment
+    // handling + UNWIND_INFO reconstruction). RSP pinning is active.
+    let alloc =
+        kamy_codegen::allocate_registers(&result.func, &[], &result.rsp_chain).map_err(|_| {
+            LinkError::Codegen(kamy_codegen::CodegenError::Encode(
+                "register pressure".into(),
+            ))
+        })?;
+
+    let instrs = kamy_codegen::select_instructions(&result.func, &alloc, base, new_va, &[]);
     relocate(&instrs, new_va).map_err(LinkError::from)
+}
+
+#[allow(dead_code)]
+fn gpr_to_iced(g: kamy_core::ir::Gpr) -> iced_x86::Register {
+    use kamy_core::ir::Gpr::*;
+    match g {
+        Rax => iced_x86::Register::RAX,
+        Rcx => iced_x86::Register::RCX,
+        Rdx => iced_x86::Register::RDX,
+        Rbx => iced_x86::Register::RBX,
+        Rsp => iced_x86::Register::RSP,
+        Rbp => iced_x86::Register::RBP,
+        Rsi => iced_x86::Register::RSI,
+        Rdi => iced_x86::Register::RDI,
+        R8 => iced_x86::Register::R8,
+        R9 => iced_x86::Register::R9,
+        R10 => iced_x86::Register::R10,
+        R11 => iced_x86::Register::R11,
+        R12 => iced_x86::Register::R12,
+        R13 => iced_x86::Register::R13,
+        R14 => iced_x86::Register::R14,
+        R15 => iced_x86::Register::R15,
+    }
 }
 
 fn protect_inner(

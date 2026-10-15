@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use kamy_core::RejectionReason;
 use kamy_core::ir::{
@@ -176,9 +176,15 @@ fn compute_live_intervals(func: &IrFunction, order: &[BlockId]) -> Vec<LiveInter
 pub fn allocate_registers(
     func: &IrFunction,
     saved_regs: &[PhysReg],
+    rsp_pinned: &HashSet<ValueId>,
 ) -> Result<RegAllocation, RejectionReason> {
     let order = block_order(func);
-    let intervals = compute_live_intervals(func, &order);
+    let mut intervals = compute_live_intervals(func, &order);
+    for iv in &mut intervals {
+        if rsp_pinned.contains(&iv.value) {
+            iv.pinned = Some(PhysReg::Gpr(Gpr::Rsp));
+        }
+    }
 
     let mut avail_gprs: Vec<Gpr> = VOLATILE_GPRS.to_vec();
     let mut avail_xmms: Vec<XmmReg> = VOLATILE_XMMS.to_vec();
@@ -378,7 +384,7 @@ mod tests {
     #[test]
     fn allocate_simple_no_copies() {
         let func = make_test_function();
-        let result = allocate_registers(&func, &[]).unwrap();
+        let result = allocate_registers(&func, &[], &HashSet::new()).unwrap();
 
         assert!(result.assignments.contains_key(&ValueId(0)));
         assert!(result.assignments.contains_key(&ValueId(1)));

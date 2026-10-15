@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use kamy_core::ir::{Gpr, IrType, ValueId, X86Flag, XmmReg};
 
 use crate::IrOp;
@@ -7,6 +9,7 @@ pub(crate) struct LiftState {
     gprs: [ValueId; 16],
     xmms: [ValueId; 16],
     flags: [ValueId; 6],
+    pub(crate) rsp_chain: HashSet<ValueId>,
 }
 
 impl LiftState {
@@ -14,8 +17,12 @@ impl LiftState {
         let mut gprs = [ValueId(0); 16];
         let mut xmms = [ValueId(0); 16];
         let mut flags = [ValueId(0); 6];
-        for g in &mut gprs {
+        let mut rsp_chain = HashSet::new();
+        for (i, g) in gprs.iter_mut().enumerate() {
             *g = builder.emit(IrOp::Undef, &[], IrType::I64);
+            if i == Gpr::Rsp.index() {
+                rsp_chain.insert(*g);
+            }
         }
         for x in &mut xmms {
             *x = builder.emit(IrOp::Undef, &[], IrType::I128);
@@ -23,7 +30,12 @@ impl LiftState {
         for f in &mut flags {
             *f = builder.emit(IrOp::Undef, &[], IrType::I8);
         }
-        Self { gprs, xmms, flags }
+        Self {
+            gprs,
+            xmms,
+            flags,
+            rsp_chain,
+        }
     }
 
     pub(crate) fn get_gpr(&self, gpr: Gpr) -> ValueId {
@@ -32,6 +44,9 @@ impl LiftState {
 
     pub(crate) fn set_gpr(&mut self, gpr: Gpr, val: ValueId) {
         self.gprs[gpr.index()] = val;
+        if gpr == Gpr::Rsp {
+            self.rsp_chain.insert(val);
+        }
     }
 
     pub(crate) fn get_xmm(&self, xmm: XmmReg) -> ValueId {

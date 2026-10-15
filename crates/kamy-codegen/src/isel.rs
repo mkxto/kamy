@@ -308,6 +308,7 @@ pub fn select_instructions(
     alloc: &RegAllocation,
     _image_base: u64,
     entry_va: u64,
+    callee_saved_used: &[Register],
 ) -> Vec<Instruction> {
     let order = block_order(func);
     let mut out: Vec<Instruction> = Vec::new();
@@ -321,6 +322,10 @@ pub fn select_instructions(
     let mut copy_map: HashMap<usize, Vec<&RegCopy>> = HashMap::new();
     for c in &alloc.copies {
         copy_map.entry(c.point).or_default().push(c);
+    }
+
+    for &r in callee_saved_used {
+        out.push(Instruction::with1(Code::Push_r64, r).unwrap());
     }
 
     let mut global_point: usize = 0;
@@ -339,6 +344,11 @@ pub fn select_instructions(
             global_point += 1;
         }
 
+        if matches!(block.term, IrTerminator::Ret) {
+            for &r in callee_saved_used.iter().rev() {
+                out.push(Instruction::with1(Code::Pop_r64, r).unwrap());
+            }
+        }
         select_terminator(func, alloc, &block.term, &block_labels, &mut out);
     }
 
@@ -871,7 +881,7 @@ mod tests {
             copies: vec![],
         };
 
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000);
+        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[]);
 
         assert!(!instrs.is_empty());
 

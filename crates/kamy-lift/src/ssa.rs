@@ -182,6 +182,7 @@ mod tests {
             },
             block_entry: vec![make_entry(&block_entry_0), make_entry(&block_entry_1)],
             block_exit: vec![block_exit_0, block_exit_1],
+            rsp_chain: std::collections::HashSet::new(),
         };
 
         construct_ssa(&mut result);
@@ -327,6 +328,7 @@ mod tests {
                 make_entry(&d_entry),
             ],
             block_exit: vec![a_exit, b_exit, c_exit, d_exit],
+            rsp_chain: std::collections::HashSet::new(),
         };
 
         construct_ssa(&mut result);
