@@ -70,15 +70,9 @@ pub fn protect_with_transforms(
     module: &Module,
     functions: &[Function],
     opts: &Options,
-    _cc: &dyn CallingConvLookup,
-    _transform: &mut dyn FnMut(&mut IrFunction),
+    cc: &dyn CallingConvLookup,
+    transform: &mut dyn FnMut(&mut IrFunction),
 ) -> Result<(Vec<u8>, Report), LinkError> {
-    let _rfs = pe.runtime_functions();
-    // SSA codegen path is wired but gated pending two known integration bugs:
-    //   1. DCE removes return-value writes (Ret doesn't consume RAX/XMM0)
-    //   2. isel/regalloc produce wrong code for some function patterns
-    // Both require the D12 test-vector harness to isolate systematically.
-    // Until fixed, all functions use the proven relocation path.
     protect_inner(
         pe,
         module,
@@ -86,13 +80,17 @@ pub fn protect_with_transforms(
         opts,
         |module, func, base, new_rva| {
             let new_va = base + u64::from(new_rva);
-            let instrs = function_instructions(module, func);
-            relocate(&instrs, new_va).map_err(LinkError::from)
+            match ssa_body(module, func, cc, transform, base, new_va) {
+                Ok(body) => Ok(body),
+                Err(_) => {
+                    let instrs = function_instructions(module, func);
+                    relocate(&instrs, new_va).map_err(LinkError::from)
+                }
+            }
         },
     )
 }
 
-#[allow(dead_code)]
 fn ssa_body(
     module: &Module,
     func: &Function,

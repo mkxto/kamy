@@ -80,6 +80,8 @@ pub enum IrOp {
     // --- native passthrough ---
     NativeInline(NativeInst),
 
+    // --- live-out marker (DCE root, no codegen output) ---
+    Use,
     // --- call ---
     Call { target: u64 },
 }

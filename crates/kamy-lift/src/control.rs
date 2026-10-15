@@ -114,6 +114,22 @@ pub(crate) fn lift_ret(b: &mut IrBuilder, s: &mut LiftState) {
     let eight = b.emit(IrOp::Const(8), &[], IrType::I64);
     let new_rsp = b.emit(IrOp::Add, &[rsp, eight], IrType::I64);
     s.set_gpr(Gpr::Rsp, new_rsp);
+
+    // Mark live-out registers as used so DCE preserves return value + callee-saved.
+    b.emit_void(IrOp::Use, &[s.get_gpr(Gpr::Rax)]);
+    b.emit_void(IrOp::Use, &[s.get_gpr(Gpr::Rsp)]);
+    for &g in &[
+        Gpr::Rbx,
+        Gpr::Rbp,
+        Gpr::Rsi,
+        Gpr::Rdi,
+        Gpr::R12,
+        Gpr::R13,
+        Gpr::R14,
+        Gpr::R15,
+    ] {
+        b.emit_void(IrOp::Use, &[s.get_gpr(g)]);
+    }
 }
 
 pub(crate) fn lift_cmovcc(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {

@@ -736,7 +736,7 @@ fn select_inst(
             out.push(Instruction::with2(mov_code(ty), dest_reg, dest_reg).unwrap());
         }
 
-        IrOp::Undef => {}
+        IrOp::Undef | IrOp::Use => {}
     }
 }
 
