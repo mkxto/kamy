@@ -82,7 +82,7 @@ impl super::Pass for MbaPass {
                         continue;
                     }
 
-                    if rng.next_u32() % 100 >= self.config.probability as u32 {
+                    if (rng.next_u32() % 100) as u8 >= self.config.probability {
                         i += 1;
                         continue;
                     }
