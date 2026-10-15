@@ -456,7 +456,7 @@ fn select_inst(
                 out.push(Instruction::with2(Code::Mov_r8_rm8, Register::CL, count_reg).unwrap());
             }
             let code = shift_code(&inst.op, ty);
-            out.push(Instruction::with1(code, dest_reg).unwrap());
+            out.push(Instruction::with2(code, dest_reg, Register::CL).unwrap());
         }
 
         IrOp::Mul => {

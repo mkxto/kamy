@@ -173,6 +173,7 @@ dependencies = [
  "kamy-disasm",
  "kamy-link",
  "kamy-pe",
+ "kamy-transforms",
 ]
 
 [[package]]
@@ -222,10 +223,13 @@ name = "kamy-link"
 version = "0.0.0"
 dependencies = [
  "iced-x86",
+ "kamy-analysis",
  "kamy-codegen",
  "kamy-core",
  "kamy-disasm",
+ "kamy-lift",
  "kamy-pe",
+ "kamy-transforms",
  "thiserror",
 ]
 

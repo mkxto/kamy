@@ -250,6 +250,16 @@ Every MBA rewrite rule verified once at authoring time with SMT bit-vector proof
 ### 6.3 Coverage Tracking
 Measure fraction of targeted functions successfully transformed. CodeDefender reports 92-99% depending on binary. Track per-module, report untransformable functions with reasons.
 
+### 6.4 External verification corpus (Aftermath Labs)
+
+**bintests** ([aftermathlabs/bintests](https://github.com/aftermathlabs/bintests)) — ~3k prebuilt 32/64-bit PE files for verifying bin2bin transformations, used by their CI. Usage model matches ours: run the original, capture stdout, transform, compare. The `seh/` folder is 64-bit PEs that print nothing on success — verify via exit code 0. Contents: zasm examples, OpenSSL test bins, LLVM JIT examples (Fibonacci, IRTransforms, OrcV2), testfloat, coremark, Microsoft `windows_seh_tests` + `compiler-tests` (the concrete SEH suite §3.3 calls for), corkami weird PEs, vulnerable drivers, VisualUEFI, UE5 demo, loki real-world crypto, plus deliberate disassembler-breakers (recursion, mutually-calling functions, noreturn, all sorts of jump tables). Compile options deliberately mixed (/O2, /GL, /LTCG not uniform).
+
+**LTCG hazard** (their warning, verbatim): "code compiled with /GL you cannot assume volatile registers are really volatile. The compiler can do some non-abi stuff with functions inside of the binary." Implication: modeling calls with the Win64-default clobber set is conservative-safe when we rewrite the *caller*; the unsound direction is rewriting a *callee* whose /GL callers relied on non-ABI preservation — our regalloc would use volatile scratch they expected to survive. Must be settled (profile/target-selection rules) before transforming functions in real LTCG binaries.
+
+**binstats** ([aftermathlabs/binstats](https://github.com/aftermathlabs/binstats)) — their coverage methodology, no debug info used: per-binary `func-info.csv` (function/BB counts, reference counts), `inst-data.csv`, coverage pie per binary, and leaf-status classification per MSVC stack-usage types — a stealable function-selection heuristic. Shipped targets: chrome.dll, hvix64, ntoskrnl, ntdll, mpengine, nvlddmkm, bootmgfw.efi, Telegram, Signal, Discord, xul, CS2 engine2, notepad++.
+
+**Supporting assets:** llvm-msvc (LLVM with MSVC 2022 compatibility — toolchain for MSVC-ABI-faithful test binaries), testfloat-pe (TestFloat as import-free PEs — clean FP round-trip targets), coremark-pe (perf-measurable round-trip target), themida-devirt (original/virtualized/devirtualized triplet), pdbgen2 + elderscroll (PDB rewriting from old PDB + address mapping — prior art for a debug-map feature), pelite fork (their PE parsing stack).
+
 ---
 
 ## 7. Rust Ecosystem
@@ -297,6 +307,10 @@ From the devirt posts, these are documented concretization footholds:
 - secret.club (MBA/eqsat): https://secret.club/2022/08/08/eqsat-oracle-synthesis.html
 - k0mkc blog: https://k0mkc.hatenablog.com/
 - Win32metadata: https://github.com/microsoft/win32metadata
+- Aftermath Labs bintests (bin2bin PE corpus): https://github.com/aftermathlabs/bintests
+- Aftermath Labs binstats (coverage stats): https://github.com/aftermathlabs/binstats
+- Aftermath Labs themida-devirt (devirt triplet): https://github.com/aftermathlabs/themida-devirt
+- Aftermath Labs llvm-msvc (MSVC-compatible LLVM): https://github.com/aftermathlabs/llvm-msvc
 
 ### Academic Papers
 - Ddisasm/Datalog Disassembly (USENIX'20): arXiv:1906.03969

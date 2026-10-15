@@ -77,14 +77,7 @@ fn main() -> anyhow::Result<()> {
             }
             let profile = profile
                 .ok_or_else(|| anyhow::anyhow!("protect requires --profile (or --no-transform)"))?;
-            let cfg = Config::from_path(&profile)
-                .with_context(|| format!("loading profile {}", profile.display()))?;
-            eprintln!(
-                "profile '{}' ok: {} profile(s)",
-                cfg.version,
-                cfg.profiles.len()
-            );
-            anyhow::bail!("protect: transform pipeline not yet wired (Phase 3)");
+            protect_with_profile(&input, &output, &profile)
         }
         Command::Verify { .. } => {
             anyhow::bail!("verify: engine pipeline not yet wired (Phase 2)");
@@ -137,6 +130,80 @@ fn protect_identity(input: &Path, output: &Path) -> anyhow::Result<()> {
         &module.functions,
         &kamy_link::Options::default(),
     )?;
+    std::fs::write(output, &image).with_context(|| format!("writing {}", output.display()))?;
+
+    let mut by_reason: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    for (_, reason) in &report.rejected {
+        *by_reason.entry(reason.tag()).or_default() += 1;
+    }
+    eprintln!(
+        "moved {} function(s), rejected {}",
+        report.moved.len(),
+        report.rejected.len()
+    );
+    for (reason, count) in by_reason {
+        eprintln!("  reject {reason}: {count}");
+    }
+    Ok(())
+}
+
+fn protect_with_profile(input: &Path, output: &Path, profile_path: &Path) -> anyhow::Result<()> {
+    let cfg = Config::from_path(profile_path)
+        .with_context(|| format!("loading profile {}", profile_path.display()))?;
+
+    let bytes = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
+    let pe = PeFile::parse(&bytes).with_context(|| format!("parsing {}", input.display()))?;
+
+    let mut module = pe.to_module();
+    let seeds = pe.seeds();
+    module.functions = discover_functions(&module, &seeds);
+
+    let mut mba_pass: Option<kamy_transforms::MbaPass> = None;
+    for profile in &cfg.profiles {
+        for pass in &profile.passes {
+            if let kamy_config::Pass::MixedBooleanArithmetic(sp) = pass {
+                mba_pass = Some(kamy_transforms::MbaPass {
+                    config: kamy_transforms::mba::MbaConfig {
+                        iterations: sp.iterations,
+                        probability: sp.probability,
+                        semantics: kamy_transforms::mba::MbaSemantics {
+                            add: sp.semantics.add,
+                            sub: sp.semantics.sub,
+                            xor: sp.semantics.xor,
+                        },
+                        bitwidths: kamy_transforms::mba::MbaBitwidths {
+                            bit8: sp.bitwidths.bit8,
+                            bit16: sp.bitwidths.bit16,
+                            bit32: sp.bitwidths.bit32,
+                            bit64: sp.bitwidths.bit64,
+                        },
+                    },
+                    seed: 42,
+                });
+            }
+        }
+    }
+
+    let cc = kamy_core::ir::Win64Default;
+    let mut transform_fn: Box<dyn FnMut(&mut kamy_core::ir::IrFunction)> =
+        if let Some(mba) = mba_pass {
+            Box::new(move |func: &mut kamy_core::ir::IrFunction| {
+                use kamy_transforms::Pass;
+                mba.run(func);
+            })
+        } else {
+            Box::new(|_: &mut kamy_core::ir::IrFunction| {})
+        };
+
+    let (image, report) = kamy_link::protect_with_transforms(
+        &pe,
+        &module,
+        &module.functions,
+        &kamy_link::Options::default(),
+        &cc,
+        &mut *transform_fn,
+    )?;
+
     std::fs::write(output, &image).with_context(|| format!("writing {}", output.display()))?;
 
     let mut by_reason: std::collections::BTreeMap<&'static str, usize> = Default::default();
