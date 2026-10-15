@@ -1,0 +1,50 @@
+use std::fmt;
+
+/// Reason a function was left untransformed, surfaced in the structured
+/// protection report (grilling D22).
+///
+/// `tag` values are stable identifiers safe to assert on in CI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RejectionReason {
+    /// Original function too small to host a thunk (< 5 bytes).
+    NoThunkSpace,
+    /// Unresolvable indirect jump that matched no known jump-table pattern.
+    BadIndirectBranch,
+    /// Instruction the lifter can neither model nor safely pass through verbatim.
+    UnsupportedInstruction,
+    /// Lifter error such as malformed code or data-in-code confusion.
+    LiftFailure,
+    /// SEH scope structure too complex for current support.
+    SehComplex,
+    /// Stack frame exceeds the configured `max_stack_copy_size`.
+    StackTooLarge,
+    /// Symbolization confidence fell below the acceptance threshold.
+    SymbolizationUncertain,
+    /// Register allocator or instruction selector failed.
+    CodegenFailure,
+    /// Transforms would require spills, violating the zero-spill constraint (D5).
+    RegisterPressure,
+}
+
+impl RejectionReason {
+    /// Stable machine-readable tag for report serialization and CI assertions.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::NoThunkSpace => "NoThunkSpace",
+            Self::BadIndirectBranch => "BadIndirectBranch",
+            Self::UnsupportedInstruction => "UnsupportedInstruction",
+            Self::LiftFailure => "LiftFailure",
+            Self::SehComplex => "SEHComplex",
+            Self::StackTooLarge => "StackTooLarge",
+            Self::SymbolizationUncertain => "SymbolizationUncertain",
+            Self::CodegenFailure => "CodegenFailure",
+            Self::RegisterPressure => "RegisterPressure",
+        }
+    }
+}
+
+impl fmt::Display for RejectionReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.tag())
+    }
+}

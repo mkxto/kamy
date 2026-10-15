@@ -1,0 +1,20 @@
+version: 1.0.0
+module_settings:
+  import_protection: false
+  obscure_entry_point: false
+
+profiles:
+- name: default
+  passes:
+  - type: ObscureReferences
+  - type: MixedBooleanArithmetic
+    iterations: 1
+    probability: 100
+    semantics: { add: true, sub: true, xor: true, or: true, not: true, neg: true }
+    bitwidths: { bit8: true, bit16: true, bit32: true, bit64: true }
+  - type: MutationEngine
+    iterations: 1
+    probability: 100
+  symbols:
+  - !Pattern "crypto_*"
+  - !Name main

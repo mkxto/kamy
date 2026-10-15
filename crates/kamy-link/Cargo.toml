@@ -1,0 +1,16 @@
+[package]
+name = "kamy-link"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kamy-core.workspace = true
+kamy-pe.workspace = true
+kamy-seh.workspace = true
+rayon.workspace = true

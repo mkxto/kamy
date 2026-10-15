@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "LicenseRef-Proprietary"
+repository = "https://github.com/mkxto/kamy"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.dependencies]
+# Internal crates
+kamy-core = { path = "crates/kamy-core", version = "0.0.0" }
+kamy-pe = { path = "crates/kamy-pe", version = "0.0.0" }
+kamy-disasm = { path = "crates/kamy-disasm", version = "0.0.0" }
+kamy-lift = { path = "crates/kamy-lift", version = "0.0.0" }
+kamy-analysis = { path = "crates/kamy-analysis", version = "0.0.0" }
+kamy-transforms = { path = "crates/kamy-transforms", version = "0.0.0" }
+kamy-codegen = { path = "crates/kamy-codegen", version = "0.0.0" }
+kamy-link = { path = "crates/kamy-link", version = "0.0.0" }
+kamy-seh = { path = "crates/kamy-seh", version = "0.0.0" }
+kamy-verify = { path = "crates/kamy-verify", version = "0.0.0" }
+kamy-config = { path = "crates/kamy-config", version = "0.0.0" }
+
+# External crates
+iced-x86 = "1.21.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_norway = "0.9.42"
+rayon = "1.12.0"
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+clap = { version = "4.6.7", features = ["derive"] }
+rand_chacha = "0.10.0"
+rand_core = "0.9.3"

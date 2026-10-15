@@ -1,0 +1,19 @@
+[package]
+name = "kamy-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "kamy"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+kamy-config.workspace = true
+clap.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.exe binary
+*.dll binary
+*.efi binary
+*.pdb binary

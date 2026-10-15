@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+
+# Local test corpora / large binaries
+/tests/corpus/
+*.exe
+*.dll
+*.efi
+!tests/**/*.exe
+
+# Editor
+.vscode/
+.idea/
+*.swp

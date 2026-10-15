@@ -1,0 +1,21 @@
+[package]
+name = "kamy-verify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kamy-core.workspace = true
+
+# Authoring-layer verification tools (grilling D12) are offline/dev-only and
+# land with the MBA rule-authoring tooling in Phase 5:
+#   egg  — e-graph equality saturation for MBA rule synthesis/verification
+#   z3   — bit-vector SMT proofs (kept out of the default build: C++ source build)
+# [dev-dependencies]
+# egg = "..."
+# z3  = { version = "...", features = ["static-link-z3"] }
