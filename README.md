@@ -88,11 +88,11 @@ kamy verify input.exe protected.exe --vectors 1000
 
 ### Phase 1 — Foundation (current)
 - [x] Research & documentation
-- [ ] Workspace scaffold, CI setup
-- [ ] PE parser/writer (headers, sections, .reloc, .pdata, imports)
-- [ ] Disassembler integration (iced-x86)
-- [ ] Function discovery (from .pdata, exports, call targets)
-- [ ] Container IR (Chunk, Link, SymbolicExpression)
+- [x] Workspace scaffold, CI setup
+- [x] PE parser (headers, sections, .reloc, .pdata, imports, exports) — emit deferred to Phase 2 linker
+- [x] Disassembler integration (iced-x86)
+- [x] Function discovery (from .pdata, exports, call targets)
+- [x] Container IR (Module, Section, Symbol, Relocation, CFG) — Chunk/Link/SymbolicExpression land with Phase 2 symbolization
 
 ### Phase 2 — SSA IR Engine
 - [ ] x86 → SSA IR lifter (core GPR + basic SSE data movement)

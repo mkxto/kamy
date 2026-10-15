@@ -200,6 +200,9 @@ dependencies = [
  "anyhow",
  "clap",
  "kamy-config",
+ "kamy-core",
+ "kamy-disasm",
+ "kamy-pe",
 ]
 
 [[package]]
