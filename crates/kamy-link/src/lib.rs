@@ -1,9 +1,5 @@
 //! Relocating linker: move selected functions into a new section, leave a thunk
 //! at each original entry, scrub the vacated body, and rebuild the PE.
-//!
-//! Two code-production paths: relocation (BlockEncoder re-encode, Phase 1) and
-//! SSA (lift→ssa→transform→opt→regalloc→isel→encode, Phase 2). Selection is
-//! per-function; the SSA path falls back to relocation on any failure.
 
 use std::collections::HashMap;
 
@@ -64,7 +60,12 @@ pub fn protect(
     })
 }
 
-/// SSA path with optional transforms. Falls back to relocation on SSA failure.
+/// SSA path with IR-level transforms. Falls back to relocation when the
+/// regalloc can't fit the transformed code into volatile registers.
+///
+/// MBA and other IR transforms are architecturally correct but produce
+/// relocation-identical output until callee-saved register support lands
+/// (RSP pinning + prologue/epilogue emission + UNWIND_INFO reconstruction).
 pub fn protect_with_transforms(
     pe: &PeFile,
     module: &Module,
