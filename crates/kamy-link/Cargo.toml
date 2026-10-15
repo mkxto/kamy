@@ -12,5 +12,7 @@ workspace = true
 [dependencies]
 kamy-core.workspace = true
 kamy-pe.workspace = true
-kamy-seh.workspace = true
-rayon.workspace = true
+kamy-disasm.workspace = true
+kamy-codegen.workspace = true
+iced-x86.workspace = true
+thiserror.workspace = true

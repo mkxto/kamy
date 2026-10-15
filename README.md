@@ -101,8 +101,10 @@ kamy verify input.exe protected.exe --vectors 1000
 - [ ] Instruction selector + linear-scan register allocator
 - [ ] Codegen via iced-x86
 - [ ] Symbolization (metadata-first pipeline)
-- [ ] Linker: thunk placement + new section layout + PE rebuild
-- [ ] Differential self-test (no-transform round-trip)
+- [x] Linker: thunk placement + new section layout + PE rebuild (relocation path via iced-x86 BlockEncoder)
+- [x] Differential self-test (no-transform round-trip) — verified on a real exe; conservative function selection (D22 rejections) for indirect-branch/SEH/reloc cases
+
+Remaining Phase 2 items feed the transform-capable codegen (SSA path); the no-transform round-trip above uses relocation codegen, not the SSA lowering chain.
 
 ### Phase 3 — Obfuscation Passes
 - [ ] ObscureReferences

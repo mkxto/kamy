@@ -3,7 +3,10 @@
 mod exports;
 mod imports;
 mod pdata;
+mod rebuild;
 mod reloc;
+
+pub use rebuild::{BytePatch, DirectoryUpdate, NewSection, PeEdits};
 
 use kamy_core::{Machine, Module, Relocation, Rva, Section, SectionFlags, Symbol, SymbolKind};
 
@@ -29,6 +32,10 @@ pub enum PeError {
     BadOptionalMagic,
     #[error("unsupported machine (expected x86-64 0x8664)")]
     UnsupportedMachine,
+    #[error("patch target falls outside existing raw section data")]
+    PatchOutOfBounds,
+    #[error("no room in section-header table for a new section")]
+    NoHeaderRoom,
     #[error("malformed PE: {0}")]
     Malformed(&'static str),
 }
@@ -52,6 +59,14 @@ pub struct PeFile {
     pdata_begins: Vec<u32>,
     exports: Vec<exports::ExportEntry>,
     imports: Vec<imports::ImportEntry>,
+}
+
+/// A `.pdata` unwind entry: the code range `[begin, end)` and its `UNWIND_INFO`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeFunction {
+    pub begin: Rva,
+    pub end: Rva,
+    pub unwind: Rva,
 }
 
 impl PeFile {
@@ -211,6 +226,22 @@ impl PeFile {
         }
         out
     }
+
+    /// Full `.pdata` `RUNTIME_FUNCTION` entries as `(begin, end, unwind)` RVAs.
+    pub fn runtime_functions(&self) -> Vec<RuntimeFunction> {
+        self.directory_slice(DIR_EXCEPTION)
+            .map_or_else(Vec::new, pdata::parse_runtime_functions)
+            .into_iter()
+            .map(|(begin, end, unwind)| RuntimeFunction {
+                begin: Rva::new(begin),
+                end: Rva::new(end),
+                unwind: Rva::new(unwind),
+            })
+            .collect()
+    }
+
+    /// Data-directory index of the exception (`.pdata`) table.
+    pub const EXCEPTION_DIRECTORY: usize = DIR_EXCEPTION;
 
     fn directory_slice(&self, index: usize) -> Option<&[u8]> {
         let (va, size) = self.data_directories.get(index).copied()?;

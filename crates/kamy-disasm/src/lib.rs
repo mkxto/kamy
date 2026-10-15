@@ -3,10 +3,12 @@
 mod branch;
 mod cfg;
 mod discover;
+mod instrs;
 
 pub use branch::branch_target;
 pub use cfg::recover_function;
 pub use discover::discover_functions;
+pub use instrs::function_instructions;
 
 use kamy_core::{Module, Rva};
 

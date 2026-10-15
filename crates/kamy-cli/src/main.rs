@@ -1,8 +1,8 @@
 //! `kamy` command-line entry point.
 //!
-//! Thin consumer of the engine library crates (grilling D15). `analyze` runs the
-//! Phase 1 pipeline (parse -> discover); `protect`/`verify` await the Phase 2
-//! transform/codegen pipeline.
+//! Thin consumer of the engine library crates (grilling D15). `analyze` and
+//! `protect --no-transform` run today; transform-driven `protect` and `verify`
+//! await Phase 3.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -37,15 +37,19 @@ enum Command {
     Protect {
         /// Input PE to protect.
         input: PathBuf,
-        /// Protection profile (YAML).
+        /// Protection profile (YAML). Omit together with --no-transform.
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         /// Protected output path.
         #[arg(short, long)]
         output: PathBuf,
         /// Write the old->new address map here.
         #[arg(long)]
         debug_map: Option<PathBuf>,
+        /// Relocate functions through the engine without applying transforms
+        /// (round-trip validation path).
+        #[arg(long)]
+        no_transform: bool,
     },
     /// Test-vector equivalence check between two binaries.
     Verify {
@@ -61,7 +65,18 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Analyze { input, output, .. } => analyze(&input, output.as_deref()),
-        Command::Protect { profile, .. } => {
+        Command::Protect {
+            input,
+            profile,
+            output,
+            no_transform,
+            ..
+        } => {
+            if no_transform {
+                return protect_identity(&input, &output);
+            }
+            let profile = profile
+                .ok_or_else(|| anyhow::anyhow!("protect requires --profile (or --no-transform)"))?;
             let cfg = Config::from_path(&profile)
                 .with_context(|| format!("loading profile {}", profile.display()))?;
             eprintln!(
@@ -69,7 +84,7 @@ fn main() -> anyhow::Result<()> {
                 cfg.version,
                 cfg.profiles.len()
             );
-            anyhow::bail!("protect: engine pipeline not yet wired (Phase 2)");
+            anyhow::bail!("protect: transform pipeline not yet wired (Phase 3)");
         }
         Command::Verify { .. } => {
             anyhow::bail!("verify: engine pipeline not yet wired (Phase 2)");
@@ -104,6 +119,37 @@ fn analyze(input: &Path, output: Option<&Path>) -> anyhow::Result<()> {
         Some(path) => std::fs::write(path, report)
             .with_context(|| format!("writing report {}", path.display()))?,
         None => print!("{report}"),
+    }
+    Ok(())
+}
+
+fn protect_identity(input: &Path, output: &Path) -> anyhow::Result<()> {
+    let bytes = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
+    let pe = PeFile::parse(&bytes).with_context(|| format!("parsing {}", input.display()))?;
+
+    let mut module = pe.to_module();
+    let seeds = pe.seeds();
+    module.functions = discover_functions(&module, &seeds);
+
+    let (image, report) = kamy_link::protect(
+        &pe,
+        &module,
+        &module.functions,
+        &kamy_link::Options::default(),
+    )?;
+    std::fs::write(output, &image).with_context(|| format!("writing {}", output.display()))?;
+
+    let mut by_reason: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    for (_, reason) in &report.rejected {
+        *by_reason.entry(reason.tag()).or_default() += 1;
+    }
+    eprintln!(
+        "moved {} function(s), rejected {}",
+        report.moved.len(),
+        report.rejected.len()
+    );
+    for (reason, count) in by_reason {
+        eprintln!("  reject {reason}: {count}");
     }
     Ok(())
 }

@@ -1,1 +1,281 @@
-//! Linker: section layout, relocation resolution, thunk placement, PE rebuild.
+//! Relocating linker: move selected functions into a new section, leave a thunk
+//! at each original entry, scrub the vacated body, and rebuild the PE.
+//!
+//! This is the no-transform path (grilling D23 round-trip milestone). Function
+//! selection is conservative: anything whose correctness we cannot yet
+//! guarantee is rejected with a reason (grilling D22) rather than risked.
+
+use std::collections::HashMap;
+
+use kamy_codegen::{relocate, thunk};
+use kamy_core::{Function, Module, RejectionReason, Rva, SectionFlags};
+use kamy_disasm::function_instructions;
+use kamy_pe::{BytePatch, DirectoryUpdate, NewSection, PeEdits, PeFile};
+
+const ENDBR64: [u8; 4] = [0xF3, 0x0F, 0x1E, 0xFA];
+const INT3: u8 = 0xCC;
+const NEAR_JMP_LEN: u32 = 5;
+const FUNCTION_ALIGN: u32 = 16;
+
+#[derive(Debug, thiserror::Error)]
+pub enum LinkError {
+    #[error("codegen: {0}")]
+    Codegen(#[from] kamy_codegen::CodegenError),
+    #[error("pe rebuild: {0}")]
+    Pe(#[from] kamy_pe::PeError),
+}
+
+pub struct Options {
+    pub code_section: String,
+    pub pdata_section: String,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            code_section: ".kamy".into(),
+            pdata_section: ".kamypd".into(),
+        }
+    }
+}
+
+pub struct Report {
+    pub moved: Vec<Rva>,
+    pub rejected: Vec<(Rva, RejectionReason)>,
+}
+
+struct Moved {
+    entry: Rva,
+    new_rva: u32,
+    new_len: u32,
+}
+
+/// Relocate the movable subset of `functions` and return the rebuilt image.
+pub fn protect(
+    pe: &PeFile,
+    module: &Module,
+    functions: &[Function],
+    opts: &Options,
+) -> Result<(Vec<u8>, Report), LinkError> {
+    let base = module.image_base;
+    let code_rva = pe.next_section_rva().get();
+    let runtime_fns = pe.runtime_functions();
+
+    let mut report = Report {
+        moved: Vec::new(),
+        rejected: Vec::new(),
+    };
+    let mut code: Vec<u8> = Vec::new();
+    let mut moved: Vec<Moved> = Vec::new();
+    let mut pending_patches: Vec<BytePatch> = Vec::new();
+
+    let mut ordered: Vec<&Function> = functions.iter().collect();
+    ordered.sort_by_key(|f| f.entry.get());
+
+    for func in ordered {
+        match classify(module, func, &runtime_fns) {
+            Ok(cand) => {
+                pad_to_align(&mut code, FUNCTION_ALIGN);
+                let new_rva = code_rva + code.len() as u32;
+                let instrs = function_instructions(module, func);
+                let body = relocate(&instrs, base + u64::from(new_rva))?;
+
+                let patch = entry_patch(base, cand.entry.get(), new_rva, cand.endbr);
+                let thunk_len = patch.len() as u32;
+                code.extend_from_slice(&body);
+
+                let mut patches = vec![BytePatch {
+                    rva: cand.entry,
+                    bytes: patch,
+                }];
+                let scrub_start = cand.entry.get() + thunk_len;
+                if cand.end > scrub_start {
+                    patches.push(BytePatch {
+                        rva: Rva::new(scrub_start),
+                        bytes: vec![INT3; (cand.end - scrub_start) as usize],
+                    });
+                }
+                report.moved.push(cand.entry);
+                moved.push(Moved {
+                    entry: cand.entry,
+                    new_rva,
+                    new_len: body.len() as u32,
+                });
+                pending_patches.extend(patches);
+            }
+            Err(Some(reason)) => report.rejected.push((func.entry, reason)),
+            Err(None) => {}
+        }
+    }
+
+    if moved.is_empty() {
+        return Ok((pe.rebuild(&PeEdits::default())?, report));
+    }
+
+    let code_len = code.len() as u32;
+    let mut new_sections = vec![NewSection {
+        name: opts.code_section.clone(),
+        rva: Rva::new(code_rva),
+        flags: SectionFlags {
+            read: true,
+            write: false,
+            execute: true,
+        },
+        data: code,
+    }];
+    let mut directories = Vec::new();
+
+    if !runtime_fns.is_empty() {
+        let moved_by_entry: HashMap<u32, &Moved> =
+            moved.iter().map(|m| (m.entry.get(), m)).collect();
+        let pdata = rebuild_pdata(&runtime_fns, &moved_by_entry);
+        let pdata_rva = align_up(code_rva + code_len, pe.section_alignment());
+        let size = pdata.len() as u32;
+        new_sections.push(NewSection {
+            name: opts.pdata_section.clone(),
+            rva: Rva::new(pdata_rva),
+            flags: SectionFlags {
+                read: true,
+                write: false,
+                execute: false,
+            },
+            data: pdata,
+        });
+        directories.push(DirectoryUpdate {
+            index: PeFile::EXCEPTION_DIRECTORY,
+            rva: Rva::new(pdata_rva),
+            size,
+        });
+    }
+
+    let edits = PeEdits {
+        new_sections,
+        patches: pending_patches,
+        directories,
+    };
+    Ok((pe.rebuild(&edits)?, report))
+}
+
+struct Candidate {
+    entry: Rva,
+    end: u32,
+    endbr: bool,
+}
+
+/// `Ok` = movable; `Err(Some)` = rejected with a reason; `Err(None)` = not code
+/// we should touch (skipped silently).
+fn classify(
+    module: &Module,
+    func: &Function,
+    runtime_fns: &[kamy_pe::RuntimeFunction],
+) -> Result<Candidate, Option<RejectionReason>> {
+    let entry = func.entry;
+    if !module.is_executable(entry) {
+        return Err(None);
+    }
+    let end = func
+        .blocks
+        .iter()
+        .map(|b| b.end.get())
+        .max()
+        .unwrap_or(entry.get());
+    let size = end.saturating_sub(entry.get());
+
+    use kamy_core::Terminator::{Indirect, Unknown};
+    for b in &func.blocks {
+        match b.terminator {
+            Indirect => return Err(Some(RejectionReason::BadIndirectBranch)),
+            Unknown => return Err(Some(RejectionReason::LiftFailure)),
+            _ => {}
+        }
+    }
+
+    if reloc_in_range(module, entry.get(), end) {
+        return Err(Some(RejectionReason::SymbolizationUncertain));
+    }
+
+    let frags: Vec<_> = runtime_fns
+        .iter()
+        .filter(|r| r.begin.get() >= entry.get() && r.begin.get() < end)
+        .collect();
+    if frags.len() > 1 {
+        return Err(Some(RejectionReason::SehComplex));
+    }
+    if let Some(rf) = frags.first() {
+        if rf.begin != entry || unwind_flags(module, rf.unwind) != 0 {
+            return Err(Some(RejectionReason::SehComplex));
+        }
+    }
+
+    let endbr = module
+        .bytes_at(entry)
+        .is_some_and(|b| b.len() >= ENDBR64.len() && b[..ENDBR64.len()] == ENDBR64);
+    let thunk_total = if endbr { ENDBR64.len() as u32 } else { 0 } + NEAR_JMP_LEN;
+    if size < thunk_total {
+        return Err(Some(RejectionReason::NoThunkSpace));
+    }
+
+    Ok(Candidate { entry, end, endbr })
+}
+
+fn entry_patch(base: u64, entry: u32, new_rva: u32, endbr: bool) -> Vec<u8> {
+    let prefix_len = if endbr { ENDBR64.len() as u32 } else { 0 };
+    let site = base + u64::from(entry) + u64::from(prefix_len);
+    let target = base + u64::from(new_rva);
+    let mut bytes = Vec::new();
+    if endbr {
+        bytes.extend_from_slice(&ENDBR64);
+    }
+    bytes.extend_from_slice(&thunk(site, target));
+    bytes
+}
+
+fn rebuild_pdata(
+    runtime_fns: &[kamy_pe::RuntimeFunction],
+    moved: &HashMap<u32, &Moved>,
+) -> Vec<u8> {
+    let mut entries: Vec<(u32, u32, u32)> = runtime_fns
+        .iter()
+        .map(|rf| match moved.get(&rf.begin.get()) {
+            Some(m) => (m.new_rva, m.new_rva + m.new_len, rf.unwind.get()),
+            None => (rf.begin.get(), rf.end.get(), rf.unwind.get()),
+        })
+        .collect();
+    entries.sort_by_key(|&(begin, _, _)| begin);
+
+    let mut out = Vec::with_capacity(entries.len() * 12);
+    for (begin, end, unwind) in entries {
+        out.extend_from_slice(&begin.to_le_bytes());
+        out.extend_from_slice(&end.to_le_bytes());
+        out.extend_from_slice(&unwind.to_le_bytes());
+    }
+    out
+}
+
+fn reloc_in_range(module: &Module, start: u32, end: u32) -> bool {
+    module
+        .relocations
+        .iter()
+        .any(|r| r.rva.get() >= start && r.rva.get() < end)
+}
+
+fn unwind_flags(module: &Module, unwind: Rva) -> u8 {
+    module
+        .bytes_at(unwind)
+        .and_then(|b| b.first())
+        .map_or(0xff, |b| b >> 3)
+}
+
+fn align_up(value: u32, align: u32) -> u32 {
+    if align == 0 {
+        return value;
+    }
+    value.div_ceil(align) * align
+}
+
+fn pad_to_align(buf: &mut Vec<u8>, align: u32) {
+    let rem = buf.len() % align as usize;
+    if rem != 0 {
+        buf.extend(std::iter::repeat_n(INT3, align as usize - rem));
+    }
+}
