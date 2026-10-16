@@ -180,6 +180,41 @@ fn mov_code(ty: IrType) -> Code {
     }
 }
 
+fn const_value(func: &IrFunction, vid: ValueId) -> Option<u64> {
+    func.blocks.iter().find_map(|b| {
+        b.insts.iter().find_map(|i| match (i.dest, &i.op) {
+            (Some(d), IrOp::Const(c)) if d == vid => Some(*c),
+            _ => None,
+        })
+    })
+}
+
+fn shift_imm_code(op: &IrOp, ty: IrType) -> Code {
+    match (op, ty) {
+        (IrOp::Shl, IrType::I64) => Code::Shl_rm64_imm8,
+        (IrOp::Shl, IrType::I32) => Code::Shl_rm32_imm8,
+        (IrOp::Shl, IrType::I16) => Code::Shl_rm16_imm8,
+        (IrOp::Shl, IrType::I8) => Code::Shl_rm8_imm8,
+        (IrOp::Shr, IrType::I64) => Code::Shr_rm64_imm8,
+        (IrOp::Shr, IrType::I32) => Code::Shr_rm32_imm8,
+        (IrOp::Shr, IrType::I16) => Code::Shr_rm16_imm8,
+        (IrOp::Shr, IrType::I8) => Code::Shr_rm8_imm8,
+        (IrOp::Sar, IrType::I64) => Code::Sar_rm64_imm8,
+        (IrOp::Sar, IrType::I32) => Code::Sar_rm32_imm8,
+        (IrOp::Sar, IrType::I16) => Code::Sar_rm16_imm8,
+        (IrOp::Sar, IrType::I8) => Code::Sar_rm8_imm8,
+        (IrOp::Rol, IrType::I64) => Code::Rol_rm64_imm8,
+        (IrOp::Rol, IrType::I32) => Code::Rol_rm32_imm8,
+        (IrOp::Rol, IrType::I16) => Code::Rol_rm16_imm8,
+        (IrOp::Rol, IrType::I8) => Code::Rol_rm8_imm8,
+        (IrOp::Ror, IrType::I64) => Code::Ror_rm64_imm8,
+        (IrOp::Ror, IrType::I32) => Code::Ror_rm32_imm8,
+        (IrOp::Ror, IrType::I16) => Code::Ror_rm16_imm8,
+        (IrOp::Ror, IrType::I8) => Code::Ror_rm8_imm8,
+        _ => Code::Nopd,
+    }
+}
+
 fn neg_code(ty: IrType) -> Code {
     match ty {
         IrType::I64 | IrType::I128 => Code::Neg_rm64,
@@ -575,12 +610,22 @@ fn select_inst(
                 out.push(Instruction::with2(mov_code(ty), dest_reg, src_reg).unwrap());
             }
             let count = inst.args[1];
-            let count_reg = reg_of(alloc, count, IrType::I8);
-            if count_reg != Register::CL {
-                out.push(Instruction::with2(Code::Mov_r8_rm8, Register::CL, count_reg).unwrap());
+            // A constant count lowers to the immediate form, which never touches
+            // CL/RCX. The allocator does not model the CL clobber, so the runtime
+            // path is kept only for a genuine non-constant count.
+            if let Some(c) = const_value(func, count).filter(|c| *c < u64::from(ty.bits())) {
+                let code = shift_imm_code(&inst.op, ty);
+                out.push(Instruction::with2(code, dest_reg, c as i32).unwrap());
+            } else {
+                let count_reg = reg_of(alloc, count, IrType::I8);
+                if count_reg != Register::CL {
+                    out.push(
+                        Instruction::with2(Code::Mov_r8_rm8, Register::CL, count_reg).unwrap(),
+                    );
+                }
+                let code = shift_code(&inst.op, ty);
+                out.push(Instruction::with2(code, dest_reg, Register::CL).unwrap());
             }
-            let code = shift_code(&inst.op, ty);
-            out.push(Instruction::with2(code, dest_reg, Register::CL).unwrap());
         }
 
         IrOp::Mul => {
@@ -1298,6 +1343,77 @@ mod tests {
             jmp.near_branch_target(),
             TARGET,
             "tail jmp must resolve to the callee VA"
+        );
+    }
+
+    #[test]
+    fn const_shift_uses_immediate_not_cl() {
+        // A constant shift count with a live value pinned to RCX must lower to
+        // the immediate form; the CL path would clobber RCX (the MBA crash).
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let v_val = func.alloc_value();
+        let v_cnt = func.alloc_value();
+        let v_res = func.alloc_value();
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![
+                Inst {
+                    dest: Some(v_val),
+                    op: IrOp::Const(7),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(v_cnt),
+                    op: IrOp::Const(1),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(v_res),
+                    op: IrOp::Shl,
+                    args: vec![v_val, v_cnt],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: None,
+                    op: IrOp::Use,
+                    args: vec![v_res],
+                    ty: IrType::I64,
+                },
+            ],
+            term: IrTerminator::Ret,
+        });
+        let mut assignments = HashMap::new();
+        assignments.insert(v_val, PhysReg::Gpr(Gpr::Rax));
+        assignments.insert(v_cnt, PhysReg::Gpr(Gpr::Rcx));
+        assignments.insert(v_res, PhysReg::Gpr(Gpr::Rax));
+        let alloc = RegAllocation {
+            assignments,
+            copies: vec![],
+            edge_copies: HashMap::new(),
+        };
+        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[]);
+        use iced_x86::{Mnemonic, OpKind};
+        let shl = instrs
+            .iter()
+            .find(|i| i.mnemonic() == Mnemonic::Shl)
+            .expect("shl emitted");
+        assert_eq!(
+            shl.op1_kind(),
+            OpKind::Immediate8,
+            "a constant shift must use the immediate form, not CL"
+        );
+        assert!(
+            !instrs.iter().any(|i| i.mnemonic() == Mnemonic::Mov
+                && i.op0_kind() == OpKind::Register
+                && i.op0_register() == Register::CL),
+            "a constant shift must not move the count into CL"
         );
     }
 }

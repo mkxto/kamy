@@ -586,7 +586,7 @@ pub(crate) fn write_operand(
         }
         OpKind::Memory => {
             let addr = compute_mem_addr(insn, builder, state);
-            builder.emit_void(IrOp::Store, &[addr, val]);
+            builder.emit_void(IrOp::Store, &[addr, val], ty);
         }
         _ => {}
     }

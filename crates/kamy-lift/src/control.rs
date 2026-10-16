@@ -30,7 +30,7 @@ pub(crate) fn lift_push(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState
     let eight = b.emit(IrOp::Const(8), &[], IrType::I64);
     let new_rsp = b.emit(IrOp::Sub, &[rsp, eight], IrType::I64);
     s.set_gpr(Gpr::Rsp, new_rsp);
-    b.emit_void(IrOp::Store, &[new_rsp, val]);
+    b.emit_void(IrOp::Store, &[new_rsp, val], IrType::I64);
 }
 
 pub(crate) fn lift_pop(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
@@ -234,8 +234,8 @@ pub(crate) fn lift_ret(b: &mut IrBuilder, s: &mut LiftState) {
         rax_value
     };
     s.reg_pins.insert(ret_val, PhysReg::Gpr(Gpr::Rax));
-    b.emit_void(IrOp::Use, &[ret_val]);
-    b.emit_void(IrOp::Use, &[s.get_gpr(Gpr::Rsp)]);
+    b.emit_void(IrOp::Use, &[ret_val], IrType::I64);
+    b.emit_void(IrOp::Use, &[s.get_gpr(Gpr::Rsp)], IrType::I64);
 }
 
 pub(crate) fn lift_tail_call(
@@ -273,10 +273,10 @@ pub(crate) fn lift_tail_call(
                 s.reg_pins.insert(v, *phys);
                 v
             };
-            b.emit_void(IrOp::Use, &[arg]);
+            b.emit_void(IrOp::Use, &[arg], IrType::I64);
         }
     }
-    b.emit_void(IrOp::Use, &[s.get_gpr(Gpr::Rsp)]);
+    b.emit_void(IrOp::Use, &[s.get_gpr(Gpr::Rsp)], IrType::I64);
 }
 
 pub(crate) fn lift_cmovcc(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
@@ -317,7 +317,7 @@ pub(crate) fn lift_movsd(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftStat
             b.emit(IrOp::Undef, &[], IrType::I64)
         };
         let addr = compute_mem_addr(insn, b, s);
-        b.emit_void(IrOp::Store, &[addr, val]);
+        b.emit_void(IrOp::Store, &[addr, val], IrType::I64);
     } else {
         let (src, _) = read_operand(insn, 1, b, s);
         let copy = b.emit(IrOp::Copy, &[src], IrType::I64);
@@ -343,7 +343,7 @@ pub(crate) fn lift_movss(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftStat
             b.emit(IrOp::Undef, &[], IrType::I32)
         };
         let addr = compute_mem_addr(insn, b, s);
-        b.emit_void(IrOp::Store, &[addr, val]);
+        b.emit_void(IrOp::Store, &[addr, val], IrType::I32);
     } else {
         let (src, _) = read_operand(insn, 1, b, s);
         let copy = b.emit(IrOp::Copy, &[src], IrType::I32);

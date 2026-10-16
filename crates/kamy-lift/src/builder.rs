@@ -24,12 +24,12 @@ impl<'a> IrBuilder<'a> {
         dest
     }
 
-    pub(crate) fn emit_void(&mut self, op: IrOp, args: &[ValueId]) {
+    pub(crate) fn emit_void(&mut self, op: IrOp, args: &[ValueId], ty: IrType) {
         self.func.block_mut(self.current_block).insts.push(Inst {
             dest: None,
             op,
             args: args.to_vec(),
-            ty: IrType::I64,
+            ty,
         });
     }
 
