@@ -95,7 +95,7 @@ Living document. Updated as work lands.
 | MutationEngine | Not started |
 | LoopEncodeSemantics | Not started (underspecified — needs design) |
 | Per-function config profiles + symbol matching | Not started |
-| Jump table recovery & retargeting (D24) | Layer 0 done | `jmp [rip+slot]` classified at discovery (`Terminator::Indirect { slot }`); link skips import/forwarder thunks (IAT-slot) and reports in-image static-ptr tail-calls as `ResolvableIndirect`. Measured (post runaway-recovery fix): kernel32 `BadIndirectBranch` 922→9, target.exe 114→30. Remaining: noreturn tracking → layer 2 use-def DAG + petgraph VF2 → re-emit/retarget (our own gap) |
+| Jump table recovery & retargeting (D24) | Layers 0 + 2-detection done | Layer 0: `jmp [rip+slot]` classified at discovery; link skips import thunks, reports in-image static-ptr as `ResolvableIndirect`. Layer 2: per-function use-def DAG + petgraph VF2 (research.md §10.5) recovers the dispatch table (bound-or-reject, in-range cross-check) and tags `Terminator::Switch`; link reports `RecoverableSwitch`. Measured: `BadIndirectBranch` kernel32 922→6, target.exe 114→19; recovered switches kernel32 3, target.exe 11 (fixture: 16/16 cases exact). **Not done — Phase B:** re-emit/retarget a moved table (BLARE2's documented gap, §10.5 L458-461), so switch functions stay in place (not moved) |
 | Trampoline stub obfuscation (D29: flavor diversification + junk fill + direct-call re-pointing) | Not started |
 
 ## Phase 5 — Advanced Passes
@@ -163,8 +163,20 @@ is finer than §10.2's coarse ".rdata window" bucket).
 `LiftFailure` (target 94 → 71, kernel32 20 → 17). target.exe round-trip still
 reproduces `acc=0x97a61ac866cf61c7` (exit 7) after all three fixes.
 
-Remaining D24 order: residual data-in-code phantom seeds / local-noreturn
-fixpoint → layer 2 (use-def DAG + petgraph VF2) for the residual
-`BadIndirectBranch`.
+**D24 layer 2 detection** (use-def DAG + petgraph VF2, research.md §10.5):
+recovers the dispatch table and tags `Terminator::Switch`; the linker reports
+`RecoverableSwitch` instead of `BadIndirectBranch`. `BadIndirectBranch` dropped
+further (kernel32 9 → **6**, target.exe 30 → **19**); recovered switches
+(kernel32 3, target.exe 11) are reclassified, not moved. On the runnable switch
+fixture all 16 cases are recovered exactly, and the protected fixture still
+reproduces `acc=0xade56742d39ef7e2` (exit 34). Reclassification is
+non-destructive: switch functions are rejected (not moved), so a mismatch could
+only mislabel a reject reason, never produce a wrong binary. `moved` is
+unchanged — coverage does not rise without Phase B.
 
-Jump table recovery (D24) is the #1 coverage improvement.
+**Not done — layer 2 Phase B (retarget):** moving a switch function needs the
+table re-emitted with recomputed deltas/RVAs and the dispatch `lea` redirected
+to the new table (overriding `BlockEncoder`'s RIP fixup), plus an
+original→new RVA map and runtime verification across all cases. This is the gap
+BLARE2 does not document (§10.5 L458-461); until it lands, switch functions stay
+in place and D24 does not improve `moved`.

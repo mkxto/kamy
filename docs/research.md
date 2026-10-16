@@ -414,10 +414,20 @@ bounds) and register-value analysis for masked forms.
    calls end blocks (`LiftFailure` target 94 → 71, kernel32 20 → 17), and
    `moved` rose (target 169 → 202, kernel32 1214 → 1274). Residual 2–3
    data-in-code phantom seeds remain; a local-noreturn fixpoint is the follow-up.
-3. **Layer 2 — canonical switch pattern** with entry-count + .pdata
-   bounds cross-check, reject on ambiguity (D24 unchanged).
-4. **Layer 3 — masked-table register analysis** (narrow; only real user is
-   the `and`-mask variant).
+3. **Layer 2 — canonical switch pattern** — **detection DONE.** Per-function
+   use-def DAG + petgraph VF2 (§10.5) matches the dispatch, derives the entry
+   count from the index bound (`cmp imm`+1 or mask `2^k`; unbounded → reject),
+   parses the table (table-relative i32 deltas for LLVM, module-base RVAs for
+   MSVC), and cross-checks every target against the recovered function range.
+   On a match the block becomes `Terminator::Switch { targets }` and the linker
+   reports `RecoverableSwitch`. Measured: `BadIndirectBranch` kernel32 9 → 6,
+   target.exe 30 → 19; switch fixture recovers 16/16 cases exactly. The `and`
+   mask (layer 3) variant is handled by the same bound logic (count `2^k`), so
+   no separate layer 3 pass is needed yet.
+   **Phase B — re-emit/retarget (NOT done):** moving a switch needs the table
+   recomputed for the new layout and the dispatch redirected to it (§10.5
+   L458-461, BLARE2's documented gap). Until then switch functions stay in place
+   and `moved` does not rise.
 
 Dynamic vtable tail-calls remain honest rejections — protecting them is
 runtime-tier (Phase 7) territory, not static recovery.
