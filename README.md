@@ -102,17 +102,27 @@ kamy verify input.exe protected.exe --vectors 1000
 - [ ] Codegen via iced-x86
 - [ ] Symbolization (metadata-first pipeline)
 - [ ] Pressure-aware transform budgeting (D28) — degrade pass intensity on RegisterPressure; zero-spill stands, no spill path
+- [ ] Callee-saved activation (moved from Phase 4, D31) — push/pop emission + RSP alignment shim + drop live-through Use pins
+- [ ] .pdata/UNWIND_INFO emission for generated prologues, plain functions (moved from Phase 4, D31)
+- [ ] XMM5 memory-operand encode fix
+- [ ] Differential self-test harness (kamy-verify: original vs protected, stdout + exit diff)
 - [x] Linker: thunk placement + new section layout + PE rebuild (relocation path via iced-x86 BlockEncoder)
 - [x] Differential self-test (no-transform round-trip) — verified on a real exe; conservative function selection (D22 rejections) for indirect-branch/SEH/reloc cases
 
 The transform-capable SSA codegen now lowers correctly-threaded IR: with the
 callee-saved pool enabled it reaches 95/169 functions regalloc-ready on the test
 binary (0 before the threading fix). Shipping SSA-lowered functions is gated on
-callee-saved activation (push/pop + UNWIND_INFO, Phase 4); until then the
+callee-saved activation (push/pop + UNWIND_INFO — Phase 2 completion items, D31); until then the
 no-transform round-trip and `protect` ship via the relocation codegen path.
 Remaining isel gaps: 4 XMM5 memory-operand encode failures, zero-spill pressure.
 
-### Phase 3 — Obfuscation Passes
+### Phase 3 — SEH & CET (D31: correctness before obfuscation)
+- [ ] Full UNWIND_INFO reconstruction (SEH functions: scope tables, handler re-pointing, chained unwind)
+- [ ] C_SCOPE_TABLE re-pointing
+- [ ] CET shadow stack reconciliation (RDSSPQ/INCSSPQ)
+- [ ] MSVC SEH test suite (58+ tests)
+
+### Phase 4 — Obfuscation Passes
 - [ ] ObscureReferences
 - [ ] ObscureConstants
 - [ ] MBA (configurable semantics/bitwidths/iterations)
@@ -121,14 +131,6 @@ Remaining isel gaps: 4 XMM5 memory-operand encode failures, zero-spill pressure.
 - [ ] Per-function config profiles
 - [ ] Jump table recovery & retargeting
 - [ ] Trampoline stub obfuscation (D29) — flavor diversification, junk fill, direct-call re-pointing
-
-### Phase 4 — SEH & CET
-- [ ] Callee-saved activation (regalloc pool + isel push/pop + UNWIND_INFO) — gates shipping SSA-lowered functions and visible MBA
-- [ ] .pdata/.xdata parser & rebuilder
-- [ ] UNWIND_INFO reconstruction
-- [ ] C_SCOPE_TABLE re-pointing
-- [ ] CET shadow stack reconciliation (RDSSPQ/INCSSPQ)
-- [ ] MSVC SEH test suite (58+ tests)
 
 ### Phase 5 — Advanced Passes
 - [ ] Control-flow flattening

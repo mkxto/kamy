@@ -683,6 +683,26 @@ Ground truth (RE of `HelloWorld-Injected.exe`, `.belabs` sections, base 0x140000
 - Their old-`.pdata`→`.text` repurposing is space reclamation (D2 option 2) — evidence the commercial tool reclaims section space; stays deferred for us.
 - Open external RE threads: confirm `sub_140007000` (import resolver vs anti-tamper); enumerate the full trampoline set (5 verified: 0x1000, 0x1070, 0x10c0, 0x17c8, 0x1d54); inspect init callbacks at `.rdata` 0x27f0.
 
+---
+
+### D31 — Phase Reordering: Unwind Kernel into Phase 2; SEH before Obfuscation
+
+**Decision:** The unwind-correctness kernel moves into Phase 2; full SEH (was Phase 4) runs before Obfuscation Passes (was Phase 3).
+
+1. **Phase 2 completion set** (pulled from the old Phase 4):
+   - Callee-saved activation: wire isel push/pop emission, RSP 16-byte alignment shim (odd push count flips entry parity), and drop the redundant live-through `Use` pins for the 9 callee-saved GPRs in `lift_ret` — push/pop owns preservation, so those chains no longer need to be live through the body (major register-pressure relief, D5 untouched).
+   - `.pdata`/UNWIND_INFO emission describing our *generated* prologues for plain (non-EH) functions. Without it, any stack walk through a moved function (exceptions, ETW, debuggers) reads garbage.
+   - XMM5 mem-operand encode fix (4 functions).
+   - D28 pressure ladder once the above land.
+   - Gate: identity SSA round-trip ships real functions through SSA, differential-verified (kamy-verify: original vs protected, stdout + exit code).
+2. **New order:** Phase 3 = SEH & CET in full (scope tables, handler re-pointing, CET reconciliation, MSVC test suite — SEHComplex functions stay rejected until then); Phase 4 = Obfuscation Passes.
+
+**Reasoning:** Correctness before transforms. No obfuscation pass is verifiable while the SSA backend ships 0/169 and silently falls back to relocation — the differential harness would test the fallback, not the transform. D11 already mandated SEH "baked in from Phase 2"; the kernel split realizes that without dragging the whole SEH suite into Phase 2. D23's stage order (parse → disasm → lift → codegen → link) is untouched.
+
+**Implications:**
+- Functions with SEH handlers (`SEHComplex`) remain out of scope for obfuscation until Phase 3 lands.
+- Win32metadata (D14) stays deferred: over-approximated call args are correctness-neutral (conservative), pressure-negative only.
+
 ## Decision Summary
 
 | # | Decision | Choice |
@@ -717,6 +737,7 @@ Ground truth (RE of `HelloWorld-Injected.exe`, `.belabs` sections, base 0x140000
 | D28 | Coverage robustness | Depth-adaptive transforms; zero-spill stands |
 | D29 | Stub stealth | Flavor diversification + junk fill + direct-call re-pointing |
 | D30 | Runtime & plugin SDK | CodeDefender model: EP hijack, init table, COFF plugins (D17 enriched) |
+| D31 | Phase order | Unwind kernel into Phase 2; SEH before obfuscation |
 
 ---
 

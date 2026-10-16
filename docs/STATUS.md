@@ -30,7 +30,7 @@ Living document. Updated as work lands.
 | Register allocator (linear-scan, zero-spill hard constraint) | Done | `1cfc37b` |
 | Instruction selector (IR → x86, flag fusion, NativeInline re-emit) | Done | `1cfc37b` |
 | RSP pinning (lifter tracks RSP chain, regalloc pins to physical RSP) | Done | `26216be` |
-| Callee-saved interfaces (regalloc pool + isel push/pop) | Wired | Activation deferred to Phase 4 |
+| Callee-saved activation (moved from Phase 4, D31) | **Next** | Push/pop emission + RSP alignment shim + drop live-through `Use` pins (control.rs:118-133) |
 | Relocating linker (thunks, .kamy section, .pdata rebuild, scrub) | Done | `b29b83b` |
 | SSA linker path (lift→ssa→opt→regalloc→isel→encode + fallback) | Done | `13196a1` |
 | No-transform relocation round-trip (169 functions, verified) | ✅ Proven | `b29b83b` |
@@ -38,9 +38,11 @@ Living document. Updated as work lands.
 | SSA lowering reachability (callee-saved pool enabled, diagnostic) | 95/169 regalloc-ready | Proves the SSA engine lowers real functions once the pool is available. Remaining 74: 70 zero-spill pressure, 4 XMM5 encode bug. |
 | MBA pass (add/sub/xor rules, D13 config shape) | Done | `1cfc37b` |
 | MBA probability fix | Done | `fa6b941` |
-| MBA visible output | **Blocked** | Gated on callee-saved activation (Phase 4). Lifter threading no longer blocks it (fixed). |
+| MBA visible output | **Blocked** | Gated on callee-saved activation (now a Phase 2 item, D31). Lifter threading no longer blocks it (fixed). |
 | Win32metadata calling-convention DB | Deferred | Trait wired + Win64Default + WinmdLookup todo!() |
 | Pressure-aware transform budgeting (D28) | Planned | Degrade pass intensity on RegisterPressure; zero-spill stands |
+| .pdata/UNWIND_INFO emission for generated prologues (moved from Phase 4, D31) | Not started | Plain functions only; SEH functions stay rejected |
+| Differential self-test harness (kamy-verify) | Not started | Original vs protected: stdout + exit code diff; the Phase 2 shipping gate |
 
 ### Known bugs
 
@@ -59,7 +61,16 @@ Living document. Updated as work lands.
 5. **Over-approximated call args.** Win64Default passes 4 args for every call.
    Resolved by Win32metadata DB (D14) or PDB symbol lookup.
 
-## Phase 3 — Obfuscation Passes
+## Phase 3 — SEH & CET (D31: correctness before obfuscation)
+
+| Item | Status |
+|------|--------|
+| Full UNWIND_INFO reconstruction (SEH functions: scope tables, handler re-pointing, chained unwind) | Not started |
+| C_SCOPE_TABLE re-pointing | Not started |
+| CET shadow stack reconciliation | Not started |
+| MSVC SEH test suite (58+ tests, D11) | Not started |
+
+## Phase 4 — Obfuscation Passes
 
 | Item | Status |
 |------|--------|
@@ -69,18 +80,7 @@ Living document. Updated as work lands.
 | LoopEncodeSemantics | Not started (underspecified — needs design) |
 | Per-function config profiles + symbol matching | Not started |
 | Jump table recovery & retargeting (D24) | Not started |
-
 | Trampoline stub obfuscation (D29: flavor diversification + junk fill + direct-call re-pointing) | Not started |
-
-## Phase 4 — SEH & CET
-
-| Item | Status |
-|------|--------|
-| Callee-saved activation (regalloc pool + isel push/pop + UNWIND_INFO) | Interfaces wired; gates shipping the 95/169 regalloc-ready SSA functions and visible MBA |
-| UNWIND_INFO reconstruction (kamy-seh) | Not started |
-| C_SCOPE_TABLE re-pointing | Not started |
-| CET shadow stack reconciliation | Not started |
-| MSVC SEH test suite (58+ tests, D11) | Not started |
 
 ## Phase 5 — Advanced Passes
 
