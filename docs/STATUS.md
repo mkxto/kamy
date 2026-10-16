@@ -60,12 +60,20 @@ Living document. Updated as work lands.
    Call could be folded into the Call node. Optimization, not correctness.
 5. **Over-approximated call args.** Win64Default passes 4 args for every call.
    Resolved by Win32metadata DB (D14) or PDB symbol lookup.
-6. **Phantom discovery seeds.** Unaligned "functions" (target.exe 0xa4dc,
-   0xb0b4, …; kernel32 0x40c1, 0x4391, 0x5bcf) sharing identical blocks with real
-   functions — call-like decoding seeds functions inside other functions' code.
-   Inflates function + rejection counts. Possible contributor: missing noreturn
-   tracking (BLARE2's documented failure mode). Fix before any coverage metric is
-   trusted; see research.md §10.2.
+6. ✅ **MOSTLY FIXED — Runaway function recovery.** Recovery followed far branch
+   targets across `.pdata` boundaries, producing functions with multi-hundred-KiB
+   spans (kernel32 max 478 KiB) that swallowed neighbors, falsely tripped
+   `SEHComplex` (multiple unwind frags in the bloated range), and inflated
+   counts. Fix (`kamy-disasm`): bound each function's recovery at the next
+   `.pdata`/export/entry start — those partition x64 code into non-overlapping
+   ranges — and treat `jmp` to a known start as a tail call. Measured: kernel32
+   max span 478 KiB → 17.7 KiB (oversized >16 KiB: 17 → 1), target.exe 84 KiB →
+   2.9 KiB (19 → 0); `moved` rose (kernel32 1214 → 1271, target 169 → 197) as
+   mis-`SEHComplex` functions reclassified. Residual: a handful of phantom
+   call-seeds still land inside real code (target 2, kernel32 1); eliminating
+   them needs noreturn tracking (post-noreturn-call bytes decoded as fallthrough
+   now truncate to a `LiftFailure` reject instead of corrupting). See
+   research.md §10.2.
 
 ## Phase 3 — SEH & CET (D31: correctness before obfuscation)
 
@@ -85,7 +93,7 @@ Living document. Updated as work lands.
 | MutationEngine | Not started |
 | LoopEncodeSemantics | Not started (underspecified — needs design) |
 | Per-function config profiles + symbol matching | Not started |
-| Jump table recovery & retargeting (D24) | Layer 0 done | `jmp [rip+slot]` classified at discovery (`Terminator::Indirect { slot }`); link skips import/forwarder thunks (IAT-slot) and reports in-image static-ptr tail-calls as `ResolvableIndirect`. Measured: kernel32 `BadIndirectBranch` 922→12, target.exe 114→58. Remaining: phantom-seed fix → layer 2 use-def DAG + petgraph VF2 → re-emit/retarget (our own gap) |
+| Jump table recovery & retargeting (D24) | Layer 0 done | `jmp [rip+slot]` classified at discovery (`Terminator::Indirect { slot }`); link skips import/forwarder thunks (IAT-slot) and reports in-image static-ptr tail-calls as `ResolvableIndirect`. Measured (post runaway-recovery fix): kernel32 `BadIndirectBranch` 922→9, target.exe 114→30. Remaining: noreturn tracking → layer 2 use-def DAG + petgraph VF2 → re-emit/retarget (our own gap) |
 | Trampoline stub obfuscation (D29: flavor diversification + junk fill + direct-call re-pointing) | Not started |
 
 ## Phase 5 — Advanced Passes
@@ -133,28 +141,26 @@ inspect the init callbacks at `.rdata` 0x27f0.
 
 | Binary | Moved | Rejected | Rate | Top rejection |
 |--------|-------|----------|------|---------------|
-| target.exe (Rust) | 169 | 162 | 51.1% | SEHComplex (56) |
-| kernel32.dll | 1214 | 488 | 71.3% | SEHComplex (449) |
+| target.exe (Rust) | 197 | 152 | 56.4% | LiftFailure (94) |
+| kernel32.dll | 1271 | 438 | 74.4% | SEHComplex (396) |
 
-D24 layer 0 landed (`jmp [rip+slot]` classification). Measured reject
-breakdown after the change:
+Two correctness fixes landed since the §10 study.
 
-- **kernel32.dll:** `BadIndirectBranch` 922 → **12** (genuine register/indexed
-  dispatch only). The former 922 split into 12 `BadIndirectBranch` + 24
-  `ResolvableIndirect` (in-image static-pointer tail-calls, direct-ification
-  pending) + 886 import/forwarder thunks now **skipped** (not rejected — not
-  protection targets). Total rejected 1374 → 488; `moved` unchanged at 1214.
-- **target.exe:** `BadIndirectBranch` 114 → **58** + 1 `ResolvableIndirect`;
-  the other 55 were `jmp [__imp_…]` import thunks, now skipped. Total rejected
-  217 → 162; `moved` unchanged at 169. (Exact IAT-slot membership is finer than
-  the study's coarse ".rdata window" bucket, so more target.exe jumps classify
-  as imports than §10.2's block-level estimate predicted.)
+**D24 layer 0** (`jmp [rip+slot]` classification): kernel32 `BadIndirectBranch`
+922 → **9** (genuine register/indexed dispatch only) plus `ResolvableIndirect`
+(in-image static-pointer tail-calls, direct-ification pending); import/forwarder
+thunks are **skipped** (not protection targets). target.exe `BadIndirectBranch`
+114 → **30**; `jmp [__imp_…]` import thunks skipped (exact IAT-slot membership
+is finer than §10.2's coarse ".rdata window" bucket).
 
-`moved` is byte-identical before/after on both binaries — layer 0 only
-reclassifies already-rejected functions, so the protected output is unchanged
-(target.exe round-trip still reproduces `acc=0x97a61ac866cf61c7`, exit 7).
+**Runaway-recovery fix** (known bug #6): bounding recovery at the next
+`.pdata`/export/entry start removed the 478 KiB phantom spans, so `moved` rose
+(kernel32 1214 → 1271, target 169 → 197) as functions previously mis-flagged
+`SEHComplex` reclassified; post-noreturn fallthrough now truncates to a
+conservative `LiftFailure` instead of swallowing the next function. target.exe
+round-trip still reproduces `acc=0x97a61ac866cf61c7` (exit 7) after both fixes.
 
-Remaining D24 order: phantom-seed fix (known bug #6) → layer 2 (use-def DAG +
-petgraph VF2) for the residual `BadIndirectBranch` (register/indexed dispatch).
+Remaining D24 order: residual phantom call-seeds / noreturn tracking → layer 2
+(use-def DAG + petgraph VF2) for the residual `BadIndirectBranch`.
 
 Jump table recovery (D24) is the #1 coverage improvement.

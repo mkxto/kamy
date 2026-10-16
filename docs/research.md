@@ -361,10 +361,16 @@ register-dispatch. Conclusion: on this binary "jump-table recovery" is 99%
 | RVA-relative switch tables | 51 blocks | `movsxd rX,[base+idx*4]; add rX,base; jmp rX`, plus an `and`-masked no-bounds-check variant (`and r8d,3`) | Layer 2 (+ layer 3 for masked forms) |
 | Dynamic tail dispatch | 38 blocks | `mov r9,[rcx+0x18]; mov rcx,rax; jmp r9` vtable tail-calls, register thunks | Genuinely dynamic → reject |
 
-**Discovery artifact:** unaligned "functions" (0xa4dc, 0xb0b4, …) sharing
-identical blocks with real functions — phantom seeds from call-like decoding.
-These inflate both the function count and the rejection count and must be
-deduplicated before any coverage number is meaningful.
+**Discovery artifact (fixed):** recovery followed far branch targets across
+`.pdata` boundaries, producing functions with multi-hundred-KiB spans (kernel32
+max 478 KiB) that swallowed real neighbors — inflating function and rejection
+counts and falsely tripping `SEHComplex`. Fix: bound each function's recovery at
+the next `.pdata`/export/entry start (these partition x64 code into
+non-overlapping ranges) and treat `jmp` to a known start as a tail call. Spans
+collapsed (kernel32 478 KiB → 17.7 KiB, target 84 KiB → 2.9 KiB) and `moved`
+rose (kernel32 1214 → 1271, target 169 → 197). A residual handful of phantom
+call-seeds still land inside real code; removing them needs noreturn tracking
+(post-noreturn bytes currently truncate to a conservative `LiftFailure`).
 
 ### 10.3 The canonical recoverable shape (both compilers)
 
@@ -394,13 +400,15 @@ bounds) and register-value analysis for masked forms.
    (not a protection target, never a rejection); other in-image slot →
    `ResolvableIndirect` (recoverable, direct-ification pending); register or
    table-indexed (`slot: None`) → stays `BadIndirectBranch`.
-   Measured: kernel32 `BadIndirectBranch` 922 → **12** (as predicted; 886 thunks
-   skipped, 24 `ResolvableIndirect`); target.exe 114 → **58** + 1
-   `ResolvableIndirect` (55 were `jmp [__imp_…]` import thunks — exact IAT-slot
-   membership is finer than this section's coarse ".rdata window" bucket, which
-   over-counted target.exe static-pointers). `moved` unchanged on both.
-2. **Fix phantom seeds in discovery** (unaligned call-target seeds inside
-   existing .pdata ranges) — otherwise coverage numbers lie.
+   Measured (after the runaway-recovery fix in §10.2 re-ran discovery): kernel32
+   `BadIndirectBranch` 922 → **9** + `ResolvableIndirect`; target.exe 114 → **30**
+   (`jmp [__imp_…]` import thunks skipped — exact IAT-slot membership is finer
+   than this section's coarse ".rdata window" bucket, which over-counted
+   target.exe static-pointers). `moved` set correct on both.
+2. **Fix runaway recovery / phantom seeds in discovery** — **DONE** (dominant
+   mechanism). Recovery is bounded at the next `.pdata`/export/entry start (see
+   §10.2); the 478 KiB phantom spans are gone and `moved` rose. Residual phantom
+   call-seeds inside real code need noreturn tracking (follow-up).
 3. **Layer 2 — canonical switch pattern** with entry-count + .pdata
    bounds cross-check, reject on ambiguity (D24 unchanged).
 4. **Layer 3 — masked-table register analysis** (narrow; only real user is
