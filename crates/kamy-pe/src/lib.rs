@@ -6,6 +6,7 @@ mod pdata;
 mod rebuild;
 mod reloc;
 
+pub use pdata::build_unwind_info;
 pub use rebuild::{BytePatch, DirectoryUpdate, NewSection, PeEdits};
 
 use kamy_core::{Machine, Module, Relocation, Rva, Section, SectionFlags, Symbol, SymbolKind};

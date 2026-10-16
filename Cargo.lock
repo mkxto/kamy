@@ -180,6 +180,7 @@ dependencies = [
  "kamy-link",
  "kamy-pe",
  "kamy-transforms",
+ "kamy-verify",
 ]
 
 [[package]]
@@ -244,6 +245,7 @@ dependencies = [
 name = "kamy-pe"
 version = "0.0.0"
 dependencies = [
+ "iced-x86",
  "kamy-core",
  "thiserror",
 ]

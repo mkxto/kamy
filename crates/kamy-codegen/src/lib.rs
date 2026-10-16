@@ -6,7 +6,9 @@ pub mod regalloc;
 
 pub use encode::assemble;
 pub use isel::select_instructions;
-pub use regalloc::{RegAllocation, RegCopy, allocate_registers};
+pub use regalloc::{
+    CALLEE_SAVED_GPRS, RegAllocation, RegCopy, allocate_registers, callee_saved_used,
+};
 
 use std::fmt;
 

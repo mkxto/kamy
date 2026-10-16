@@ -1,8 +1,8 @@
 //! `kamy` command-line entry point.
 //!
-//! Thin consumer of the engine library crates (grilling D15). `analyze` and
-//! `protect --no-transform` run today; transform-driven `protect` and `verify`
-//! await Phase 3.
+//! Thin consumer of the engine library crates (grilling D15). `analyze`,
+//! `protect --no-transform`, and `verify` run today; transform-driven
+//! `protect` awaits Phase 3.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -53,7 +53,11 @@ enum Command {
     },
     /// Test-vector equivalence check between two binaries.
     Verify {
+        /// Original (unprotected) executable.
+        #[arg(long)]
         original: PathBuf,
+        /// Protected executable to compare against the original.
+        #[arg(long)]
         protected: PathBuf,
         /// Number of random input vectors.
         #[arg(long, default_value_t = 1000)]
@@ -79,10 +83,38 @@ fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("protect requires --profile (or --no-transform)"))?;
             protect_with_profile(&input, &output, &profile)
         }
-        Command::Verify { .. } => {
-            anyhow::bail!("verify: engine pipeline not yet wired (Phase 2)");
-        }
+        Command::Verify {
+            original,
+            protected,
+            vectors,
+        } => verify(&original, &protected, vectors),
     }
+}
+
+/// Fixed seed so the differential harness is reproducible across invocations.
+const VERIFY_SEED: u64 = 0xC0FF_EE15_D31B_A5E5;
+
+fn verify(original: &Path, protected: &Path, vectors: u32) -> anyhow::Result<()> {
+    let report = kamy_verify::differential(original, protected, vectors, VERIFY_SEED)
+        .context("running differential self-test")?;
+
+    if report.passed() {
+        println!("verify PASS: {} run(s), no mismatches", report.runs);
+        return Ok(());
+    }
+
+    eprintln!(
+        "verify FAIL: {} run(s), {} mismatch(es)",
+        report.runs,
+        report.mismatches.len()
+    );
+    for m in report.mismatches.iter().take(5) {
+        eprintln!(
+            "  run {} {}: original={} protected={}",
+            m.run, m.field, m.original, m.protected
+        );
+    }
+    anyhow::bail!("verify failed: protected binary diverges from original");
 }
 
 fn analyze(input: &Path, output: Option<&Path>) -> anyhow::Result<()> {

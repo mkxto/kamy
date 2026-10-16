@@ -49,8 +49,13 @@ enum Expansion {
     Xor,
 }
 
-impl super::Pass for MbaPass {
-    fn run(&self, func: &mut IrFunction) -> bool {
+impl MbaPass {
+    /// Expand MBA candidates, scaling each site's rewrite probability by
+    /// `intensity` (clamped to [0.0, 1.0]). `intensity == 1.0` reproduces the
+    /// unscaled behaviour exactly; `0.0` makes the pass a no-op. The RNG is
+    /// drawn at every candidate regardless of intensity, so a seed stays stable.
+    pub fn run_with_intensity(&self, func: &mut IrFunction, intensity: f32) -> bool {
+        let intensity = intensity.clamp(0.0, 1.0);
         let mut rng = ChaCha8Rng::seed_from_u64(self.seed);
         let mut changed = false;
         let mut expanded: HashSet<ValueId> = HashSet::new();
@@ -82,7 +87,8 @@ impl super::Pass for MbaPass {
                         continue;
                     }
 
-                    if (rng.next_u32() % 100) as u8 >= self.config.probability {
+                    let threshold = (self.config.probability as f32 * intensity).round() as u32;
+                    if rng.next_u32() % 100 >= threshold {
                         i += 1;
                         continue;
                     }
@@ -222,6 +228,12 @@ impl super::Pass for MbaPass {
     }
 }
 
+impl super::Pass for MbaPass {
+    fn run(&self, func: &mut IrFunction) -> bool {
+        self.run_with_intensity(func, 1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +326,32 @@ mod tests {
         let pass = MbaPass { config, seed: 0 };
         assert!(!pass.run(&mut func));
         assert_eq!(func.blocks[0].insts.len(), 3);
+    }
+
+    #[test]
+    fn intensity_zero_no_change() {
+        let (mut func, _, _, _) = add_func();
+        let pass = MbaPass {
+            config: all_enabled(),
+            seed: 0,
+        };
+        assert!(!pass.run_with_intensity(&mut func, 0.0));
+        assert_eq!(func.blocks[0].insts.len(), 3);
+    }
+
+    #[test]
+    fn intensity_one_matches_default_run() {
+        let (mut a, ..) = add_func();
+        let (mut b, ..) = add_func();
+        let pass = MbaPass {
+            config: all_enabled(),
+            seed: 0,
+        };
+        assert_eq!(pass.run(&mut a), pass.run_with_intensity(&mut b, 1.0));
+        assert_eq!(a.blocks[0].insts.len(), b.blocks[0].insts.len());
+        for (x, y) in a.blocks[0].insts.iter().zip(&b.blocks[0].insts) {
+            assert_eq!(x.dest, y.dest);
+            assert_eq!(x.args, y.args);
+        }
     }
 }

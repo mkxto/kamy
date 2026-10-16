@@ -30,19 +30,19 @@ Living document. Updated as work lands.
 | Register allocator (linear-scan, zero-spill hard constraint) | Done | `1cfc37b` |
 | Instruction selector (IR → x86, flag fusion, NativeInline re-emit) | Done | `1cfc37b` |
 | RSP pinning (lifter tracks RSP chain, regalloc pins to physical RSP) | Done | `26216be` |
-| Callee-saved activation (moved from Phase 4, D31) | **Next** | Push/pop emission + RSP alignment shim + drop live-through `Use` pins (control.rs:118-133) |
+| Callee-saved activation (D31) | ✅ Done | Pool enabled; push/pop + RSP 16-byte align shim; dropped live-through `Use` pins. Required the SSA backend ABI-correctness pass below to ship correctly. |
 | Relocating linker (thunks, .kamy section, .pdata rebuild, scrub) | Done | `b29b83b` |
 | SSA linker path (lift→ssa→opt→regalloc→isel→encode + fallback) | Done | `13196a1` |
 | No-transform relocation round-trip (169 functions, verified) | ✅ Proven | `b29b83b` |
-| No-transform SSA round-trip (shipped config) | ⚠️ 0/169 shipped | Callee-saved disabled (`&[]`) → zero-spill `RegisterPressure`; falls back to relocation. exit=7 is relocation. |
-| SSA lowering reachability (callee-saved pool enabled, diagnostic) | 95/169 regalloc-ready | Proves the SSA engine lowers real functions once the pool is available. Remaining 74: 70 zero-spill pressure, 4 XMM5 encode bug. |
+| No-transform SSA round-trip (shipped config) | ✅ ~22/fixture, verified | SSA now lowers real functions correctly: `sw`/`target`/`sw2`/`sw3` reproduce exact accumulators and `kamy verify` PASS (1000 runs). Ships single-block, position-independent, resolved-control-flow functions; everything else relocates (reject-on-ambiguity). |
+| SSA backend ABI correctness (D31 prerequisite) | ✅ Done | The backend had never emitted correct code (the 95/169 figure was reachability, not correctness). Fixed: entry/arg/return register pinning, RSP chain (no materialized call-push/ret-adjust, no eviction), call-clobber → callee-saved, two-address aliasing, sound conflict handler, isel↔regalloc point numbering. **Conservative gates relocate** indirect calls, RIP-relative data, multi-block, tail/unresolved jumps, and pin conflicts. |
 | MBA pass (add/sub/xor rules, D13 config shape) | Done | `1cfc37b` |
 | MBA probability fix | Done | `fa6b941` |
-| MBA visible output | **Blocked** | Gated on callee-saved activation (now a Phase 2 item, D31). Lifter threading no longer blocks it (fixed). |
+| MBA visible output | **Blocked** | The SSA *identity* path is correct, but MBA-transformed IR re-exposes backend lowering bugs (crashes; `kamy verify` catches it). Needs further hardening or a verify-and-fallback gate. |
 | Win32metadata calling-convention DB | Deferred | Trait wired + Win64Default + WinmdLookup todo!() |
-| Pressure-aware transform budgeting (D28) | Planned | Degrade pass intensity on RegisterPressure; zero-spill stands |
-| .pdata/UNWIND_INFO emission for generated prologues (moved from Phase 4, D31) | Not started | Plain functions only; SEH functions stay rejected |
-| Differential self-test harness (kamy-verify) | Not started | Original vs protected: stdout + exit code diff; the Phase 2 shipping gate |
+| Pressure-aware transform budgeting (D28) | Partial | Intensity knob on the MBA pass landed (`run_with_intensity`); the retry-at-lower-intensity ladder is not wired. |
+| .pdata/UNWIND_INFO emission for generated prologues (D31) | ✅ Done | `.kamyxd` section + UNWIND_INFO describing the push/align prologue; body frame-alloc codes are Phase 3. |
+| Differential self-test harness (kamy-verify) | ✅ Done | `kamy verify --original X --protected Y`: exit + stdout diff over N seeded runs. The Phase 2 shipping gate. |
 
 ### Known bugs
 

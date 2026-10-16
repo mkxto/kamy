@@ -6,7 +6,7 @@ use kamy_core::ir::{CallingConvLookup, IrFunction};
 use kamy_core::{Function, Module, RejectionReason, Rva, SectionFlags};
 use kamy_disasm::function_instructions;
 use kamy_pe::{BytePatch, DirectoryUpdate, NewSection, PeEdits, PeFile};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const ENDBR64: [u8; 4] = [0xF3, 0x0F, 0x1E, 0xFA];
 const INT3: u8 = 0xCC;
@@ -25,6 +25,7 @@ pub struct Options {
     pub code_section: String,
     pub pdata_section: String,
     pub table_section: String,
+    pub xdata_section: String,
 }
 
 impl Default for Options {
@@ -33,6 +34,7 @@ impl Default for Options {
             code_section: ".kamy".into(),
             pdata_section: ".kamypd".into(),
             table_section: ".kamytb".into(),
+            xdata_section: ".kamyxd".into(),
         }
     }
 }
@@ -42,10 +44,17 @@ pub struct Report {
     pub rejected: Vec<(Rva, RejectionReason)>,
 }
 
+#[derive(Clone)]
+struct PrologueShape {
+    pushed: Vec<iced_x86::Register>,
+    aligned: bool,
+}
+
 struct Moved {
     entry: Rva,
     new_rva: u32,
     new_len: u32,
+    unwind: Option<Vec<u8>>,
 }
 
 /// Relocation-only path (Phase 1).
@@ -57,7 +66,10 @@ pub fn protect(
 ) -> Result<(Vec<u8>, Report), LinkError> {
     protect_inner(pe, module, functions, opts, |module, func, base, new_va| {
         let instrs = function_instructions(module, func);
-        relocate(&instrs, base + u64::from(new_va)).map_err(LinkError::from)
+        Ok((
+            relocate(&instrs, base + u64::from(new_va)).map_err(LinkError::from)?,
+            None,
+        ))
     })
 }
 
@@ -83,10 +95,10 @@ pub fn protect_with_transforms(
         |module, func, base, new_rva| {
             let new_va = base + u64::from(new_rva);
             match ssa_body(module, func, cc, transform, base, new_va) {
-                Ok(body) => Ok(body),
+                Ok((body, shape)) => Ok((body, Some(shape))),
                 Err(_) => {
                     let instrs = function_instructions(module, func);
-                    relocate(&instrs, new_va).map_err(LinkError::from)
+                    Ok((relocate(&instrs, new_va).map_err(LinkError::from)?, None))
                 }
             }
         },
@@ -100,23 +112,36 @@ fn ssa_body(
     transform: &mut dyn FnMut(&mut IrFunction),
     base: u64,
     new_va: u64,
-) -> Result<Vec<u8>, LinkError> {
+) -> Result<(Vec<u8>, PrologueShape), LinkError> {
     let mut result = kamy_lift::lift_function(module, func, cc);
+    if result.unsupported {
+        return Err(LinkError::Codegen(kamy_codegen::CodegenError::Encode(
+            "unsupported construct".into(),
+        )));
+    }
     kamy_lift::ssa::construct_ssa(&mut result);
     transform(&mut result.func);
     kamy_transforms::optimize(&mut result.func);
 
-    // Callee-saved activation deferred to Phase 4 (needs RSP alignment
-    // handling + UNWIND_INFO reconstruction). RSP pinning is active.
-    let alloc =
-        kamy_codegen::allocate_registers(&result.func, &[], &result.rsp_chain).map_err(|_| {
-            LinkError::Codegen(kamy_codegen::CodegenError::Encode(
-                "register pressure".into(),
-            ))
-        })?;
+    let alloc = kamy_codegen::allocate_registers(
+        &result.func,
+        &kamy_codegen::CALLEE_SAVED_GPRS,
+        &result.rsp_chain,
+        &result.reg_pins,
+    )
+    .map_err(|_| {
+        LinkError::Codegen(kamy_codegen::CodegenError::Encode(
+            "register pressure".into(),
+        ))
+    })?;
 
-    let instrs = kamy_codegen::select_instructions(&result.func, &alloc, base, new_va, &[]);
-    relocate(&instrs, new_va).map_err(LinkError::from)
+    let used = kamy_codegen::callee_saved_used(&alloc);
+    let instrs = kamy_codegen::select_instructions(&result.func, &alloc, base, new_va, &used);
+    let shape = PrologueShape {
+        aligned: used.len() % 2 == 1,
+        pushed: used,
+    };
+    Ok((relocate(&instrs, new_va).map_err(LinkError::from)?, shape))
 }
 
 #[allow(dead_code)]
@@ -147,7 +172,12 @@ fn protect_inner(
     module: &Module,
     functions: &[Function],
     opts: &Options,
-    mut produce_body: impl FnMut(&Module, &Function, u64, u32) -> Result<Vec<u8>, LinkError>,
+    mut produce_body: impl FnMut(
+        &Module,
+        &Function,
+        u64,
+        u32,
+    ) -> Result<(Vec<u8>, Option<PrologueShape>), LinkError>,
 ) -> Result<(Vec<u8>, Report), LinkError> {
     let base = module.image_base;
     let table_base_rva = pe.next_section_rva().get();
@@ -191,7 +221,7 @@ fn protect_inner(
                 let new_rva = code_rva + code.len() as u32;
                 let new_va = base + u64::from(new_rva);
 
-                let body = if cand.switches.is_empty() {
+                let (body, shape) = if cand.switches.is_empty() {
                     match produce_body(module, func, base, new_rva) {
                         Ok(b) => b,
                         Err(_) => {
@@ -202,6 +232,8 @@ fn protect_inner(
                         }
                     }
                 } else {
+                    // Switch dispatch preserves original prologue bytes verbatim,
+                    // so it keeps its original UNWIND_INFO (relocation-shipped).
                     match build_switch_body(
                         module,
                         func,
@@ -211,7 +243,7 @@ fn protect_inner(
                         &mut tables,
                         &cand.switches,
                     ) {
-                        Ok(b) => b,
+                        Ok(b) => (b, None),
                         Err(()) => {
                             report
                                 .rejected
@@ -237,10 +269,15 @@ fn protect_inner(
                     });
                 }
                 report.moved.push(cand.entry);
+                // SSA-lowered funcs get FRESH UNWIND_INFO for the generated
+                // push/align prologue (null blob when no reg was pushed);
+                // relocation-shipped funcs keep their original UNWIND_INFO RVA.
+                let unwind = shape.map(|s| kamy_pe::build_unwind_info(&s.pushed, s.aligned));
                 moved.push(Moved {
                     entry: cand.entry,
                     new_rva,
                     new_len: body.len() as u32,
+                    unwind,
                 });
                 pending_patches.extend(patches);
             }
@@ -278,13 +315,37 @@ fn protect_inner(
         },
         data: code,
     });
+    // Section order after code: .kamyxd (UNWIND_INFO blobs) then .pdata, so the
+    // DWORD-aligned blobs sit between the code and the exception table.
+    let mut xdata: Vec<u8> = Vec::new();
+    let mut unwind_offsets: BTreeMap<u32, u32> = BTreeMap::new();
+    for m in &moved {
+        if let Some(blob) = &m.unwind {
+            unwind_offsets.insert(m.entry.get(), xdata.len() as u32);
+            xdata.extend_from_slice(blob);
+        }
+    }
+    let xdata_rva = align_up(code_rva + code_len, sect_align);
+    if !xdata.is_empty() {
+        new_sections.push(NewSection {
+            name: opts.xdata_section.clone(),
+            rva: Rva::new(xdata_rva),
+            flags: SectionFlags {
+                read: true,
+                write: false,
+                execute: false,
+            },
+            data: xdata.clone(),
+        });
+    }
+
     let mut directories = Vec::new();
 
     if !runtime_fns.is_empty() {
         let moved_by_entry: HashMap<u32, &Moved> =
             moved.iter().map(|m| (m.entry.get(), m)).collect();
-        let pdata = rebuild_pdata(&runtime_fns, &moved_by_entry);
-        let pdata_rva = align_up(code_rva + code_len, pe.section_alignment());
+        let pdata = rebuild_pdata(&runtime_fns, &moved_by_entry, xdata_rva, &unwind_offsets);
+        let pdata_rva = align_up(xdata_rva + xdata.len() as u32, pe.section_alignment());
         let size = pdata.len() as u32;
         new_sections.push(NewSection {
             name: opts.pdata_section.clone(),
@@ -480,14 +541,35 @@ fn entry_patch(base: u64, entry: u32, new_rva: u32, endbr: bool) -> Vec<u8> {
 fn rebuild_pdata(
     runtime_fns: &[kamy_pe::RuntimeFunction],
     moved: &HashMap<u32, &Moved>,
+    xdata_rva: u32,
+    unwind_offsets: &BTreeMap<u32, u32>,
 ) -> Vec<u8> {
+    let original_begins: HashSet<u32> = runtime_fns.iter().map(|rf| rf.begin.get()).collect();
     let mut entries: Vec<(u32, u32, u32)> = runtime_fns
         .iter()
         .map(|rf| match moved.get(&rf.begin.get()) {
-            Some(m) => (m.new_rva, m.new_rva + m.new_len, rf.unwind.get()),
+            // SSA-lowered: point at the fresh blob; relocation-shipped
+            // (no offset recorded): keep the original UNWIND_INFO RVA.
+            Some(m) => {
+                let unwind = match unwind_offsets.get(&m.entry.get()) {
+                    Some(off) => xdata_rva + off,
+                    None => rf.unwind.get(),
+                };
+                (m.new_rva, m.new_rva + m.new_len, unwind)
+            }
             None => (rf.begin.get(), rf.end.get(), rf.unwind.get()),
         })
         .collect();
+
+    // SSA-moved funcs with no original runtime_function need a fresh entry.
+    for (&entry, &off) in unwind_offsets {
+        if original_begins.contains(&entry) {
+            continue;
+        }
+        let m = moved[&entry];
+        entries.push((m.new_rva, m.new_rva + m.new_len, xdata_rva + off));
+    }
+
     entries.sort_by_key(|&(begin, _, _)| begin);
 
     let mut out = Vec::with_capacity(entries.len() * 12);
@@ -576,5 +658,30 @@ mod tests {
         let new_table_va = 0x1_4005_0000u64;
         let new_target_va = base - 0x1000;
         assert!(encode_entry(base, new_table_va, true, new_target_va).is_err());
+    }
+
+    #[test]
+    fn rebuild_pdata_appends_entry_for_ssa_moved_leaf() {
+        let entry = 0x1000u32;
+        let m = Moved {
+            entry: Rva::new(entry),
+            new_rva: 0x5000,
+            new_len: 0x40,
+            unwind: Some(vec![0x01, 0, 0, 0]),
+        };
+        let mut moved: HashMap<u32, &Moved> = HashMap::new();
+        moved.insert(entry, &m);
+        let mut unwind_offsets: BTreeMap<u32, u32> = BTreeMap::new();
+        unwind_offsets.insert(entry, 0x8);
+        let xdata_rva = 0x9000u32;
+
+        let out = rebuild_pdata(&[], &moved, xdata_rva, &unwind_offsets);
+        assert_eq!(out.len(), 12);
+        let begin = u32::from_le_bytes(out[0..4].try_into().unwrap());
+        let end = u32::from_le_bytes(out[4..8].try_into().unwrap());
+        let unwind = u32::from_le_bytes(out[8..12].try_into().unwrap());
+        assert_eq!(begin, 0x5000);
+        assert_eq!(end, 0x5040);
+        assert_eq!(unwind, xdata_rva + 0x8);
     }
 }

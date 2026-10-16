@@ -43,42 +43,62 @@ pub(crate) fn lift_pop(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState)
 }
 
 pub(crate) fn lift_call(
-    insn: &Instruction,
+    _insn: &Instruction,
     target: u64,
     b: &mut IrBuilder,
     s: &mut LiftState,
     cc: &dyn CallingConvLookup,
 ) {
-    let orig_rsp = s.get_gpr(Gpr::Rsp);
-
-    let eight = b.emit(IrOp::Const(8), &[], IrType::I64);
-    let push_rsp = b.emit(IrOp::Sub, &[orig_rsp, eight], IrType::I64);
-    s.set_gpr(Gpr::Rsp, push_rsp);
-    let ret_addr = b.emit(IrOp::Const(insn.next_ip()), &[], IrType::I64);
-    b.emit_void(IrOp::Store, &[push_rsp, ret_addr]);
-
     let sig = cc.lookup(target);
 
     let mut arg_vals = Vec::new();
-    if let Some(ref sig) = sig {
+    if let Some(sig) = &sig {
         for phys in &sig.args {
-            arg_vals.push(match phys {
+            let v = match phys {
                 PhysReg::Gpr(g) => s.get_gpr(*g),
                 PhysReg::Xmm(x) => s.get_xmm(*x),
                 PhysReg::Flag(f) => s.get_flag(*f),
-            });
+            };
+            // The value must sit in its ABI argument register at the call. Pin it
+            // there, or copy first when it is already bound elsewhere (another arg
+            // register, an RSP-chain value, or a prior pin).
+            let arg = if matches!(phys, PhysReg::Flag(_)) || s.reg_pins.get(&v) == Some(phys) {
+                v
+            } else if s.reg_pins.contains_key(&v) || s.rsp_chain.contains(&v) {
+                let ty = if matches!(phys, PhysReg::Xmm(_)) {
+                    IrType::I128
+                } else {
+                    IrType::I64
+                };
+                let c = b.emit(IrOp::Copy, &[v], ty);
+                s.reg_pins.insert(c, *phys);
+                c
+            } else {
+                s.reg_pins.insert(v, *phys);
+                v
+            };
+            arg_vals.push(arg);
         }
     }
 
+    // A balanced CALL/RET leaves RSP unchanged: the hardware CALL pushes the
+    // return address and the callee's RET pops it. Materializing that push made
+    // the pre-call RSP a second chain value live across the call, which the
+    // allocator cannot keep in RSP alongside the push slot (it spilled RSP to a
+    // GPR, corrupting the frame).
     let call_ret = b.emit(IrOp::Call { target }, &arg_vals, IrType::I64);
 
-    s.set_gpr(Gpr::Rsp, orig_rsp);
-
-    if let Some(ref sig) = sig {
+    if let Some(sig) = &sig {
         if let Some(ret_reg) = sig.ret {
             match ret_reg {
-                PhysReg::Gpr(g) => s.set_gpr(g, call_ret),
-                PhysReg::Xmm(x) => s.set_xmm(x, call_ret),
+                PhysReg::Gpr(g) => {
+                    s.set_gpr(g, call_ret);
+                    s.reg_pins.insert(call_ret, PhysReg::Gpr(g));
+                }
+                PhysReg::Xmm(x) => {
+                    s.set_xmm(x, call_ret);
+                    s.reg_pins.insert(call_ret, PhysReg::Xmm(x));
+                }
                 PhysReg::Flag(_) => {}
             }
         }
@@ -109,27 +129,22 @@ pub(crate) fn lift_call(
 }
 
 pub(crate) fn lift_ret(b: &mut IrBuilder, s: &mut LiftState) {
-    let rsp = s.get_gpr(Gpr::Rsp);
-    let _ret_addr = b.emit(IrOp::Load, &[rsp], IrType::I64);
-    let eight = b.emit(IrOp::Const(8), &[], IrType::I64);
-    let new_rsp = b.emit(IrOp::Add, &[rsp, eight], IrType::I64);
-    s.set_gpr(Gpr::Rsp, new_rsp);
-
-    // Mark live-out registers as used so DCE preserves return value + callee-saved.
-    b.emit_void(IrOp::Use, &[s.get_gpr(Gpr::Rax)]);
+    // The hardware RET pops the return address and adds 8 to RSP; modeling that
+    // here double-counts the adjustment and makes RET read past the saved
+    // return address.
+    //
+    // Return value goes in RAX: pin it there, or copy first when it is already
+    // bound to another physical register (e.g. an argument passed straight
+    // through, or an RSP-chain value). RSP live-out keeps the frame teardown.
+    let rax_value = s.get_gpr(Gpr::Rax);
+    let ret_val = if s.reg_pins.contains_key(&rax_value) || s.rsp_chain.contains(&rax_value) {
+        b.emit(IrOp::Copy, &[rax_value], IrType::I64)
+    } else {
+        rax_value
+    };
+    s.reg_pins.insert(ret_val, PhysReg::Gpr(Gpr::Rax));
+    b.emit_void(IrOp::Use, &[ret_val]);
     b.emit_void(IrOp::Use, &[s.get_gpr(Gpr::Rsp)]);
-    for &g in &[
-        Gpr::Rbx,
-        Gpr::Rbp,
-        Gpr::Rsi,
-        Gpr::Rdi,
-        Gpr::R12,
-        Gpr::R13,
-        Gpr::R14,
-        Gpr::R15,
-    ] {
-        b.emit_void(IrOp::Use, &[s.get_gpr(g)]);
-    }
 }
 
 pub(crate) fn lift_cmovcc(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {

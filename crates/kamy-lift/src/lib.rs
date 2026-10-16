@@ -26,6 +26,8 @@ pub struct LiftResult {
     pub block_entry: Vec<[ValueId; 38]>,
     pub block_exit: Vec<[ValueId; 38]>,
     pub rsp_chain: std::collections::HashSet<ValueId>,
+    pub reg_pins: std::collections::HashMap<ValueId, kamy_core::ir::PhysReg>,
+    pub unsupported: bool,
 }
 
 pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLookup) -> LiftResult {
@@ -65,6 +67,9 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
     let mut block_entry = Vec::with_capacity(n);
     let mut block_exit = Vec::with_capacity(n);
     let mut rsp_chain = std::collections::HashSet::new();
+    let mut reg_pins: std::collections::HashMap<ValueId, kamy_core::ir::PhysReg> =
+        std::collections::HashMap::new();
+    let mut unsupported = false;
 
     let mut builder = IrBuilder::new(&mut ir_func, BlockId(0));
 
@@ -134,6 +139,25 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
         }
         block_exit.push(lift_state.snapshot());
         rsp_chain.extend(&lift_state.rsp_chain);
+        // Entry-block undefs are the true live-ins; non-entry undefs are SSA
+        // placeholders construct_ssa rewrites away, so their pins become dead
+        // keys. Call-return and ret-value pins may occur in any block.
+        reg_pins.extend(&lift_state.reg_pins);
+        unsupported |= lift_state.unsupported;
+    }
+    if ordered_bbs.len() > 1 {
+        // Multi-block control flow (branch target resolution, phi lowering) is not
+        // yet lowered soundly; relocate verbatim until it is.
+        unsupported = true;
+    }
+    if ir_func
+        .blocks
+        .iter()
+        .any(|b| matches!(b.term, IrTerminator::Unreachable))
+    {
+        // An unresolved terminator (tail-call jmp, indirect/switch jump) leaves
+        // control flow unlowered; relocate verbatim.
+        unsupported = true;
     }
 
     LiftResult {
@@ -141,6 +165,8 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
         block_entry,
         block_exit,
         rsp_chain,
+        reg_pins,
+        unsupported,
     }
 }
 
@@ -151,18 +177,24 @@ fn dispatch(
     state: &mut LiftState,
     cc: &dyn CallingConvLookup,
 ) -> Option<ValueId> {
+    if insn.is_ip_rel_memory_operand() {
+        // RIP-relative data access folds to an absolute constant here, which is
+        // not position-independent (breaks under ASLR). Relocate verbatim.
+        state.unsupported = true;
+    }
     match insn.flow_control() {
         FlowControl::Return => {
             control::lift_ret(builder, state);
             return None;
         }
         FlowControl::Call | FlowControl::IndirectCall => {
-            let target = if insn.op_kind(0) == OpKind::NearBranch64 {
-                insn.near_branch_target()
+            if insn.op_kind(0) == OpKind::NearBranch64 {
+                control::lift_call(insn, insn.near_branch_target(), builder, state, cc);
             } else {
-                0
-            };
-            control::lift_call(insn, target, builder, state, cc);
+                // Indirect call (`call reg`/`call [mem]`): the direct-target Call
+                // op cannot express it, so relocate the whole function verbatim.
+                state.unsupported = true;
+            }
             return None;
         }
         FlowControl::ConditionalBranch => {

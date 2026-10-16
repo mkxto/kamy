@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use kamy_core::ir::{Gpr, IrType, ValueId, X86Flag, XmmReg};
+use kamy_core::ir::{Gpr, IrType, PhysReg, ValueId, X86Flag, XmmReg};
 
 use crate::IrOp;
 use crate::builder::IrBuilder;
@@ -10,6 +10,8 @@ pub(crate) struct LiftState {
     xmms: [ValueId; 16],
     flags: [ValueId; 6],
     pub(crate) rsp_chain: HashSet<ValueId>,
+    pub(crate) reg_pins: HashMap<ValueId, PhysReg>,
+    pub(crate) unsupported: bool,
 }
 
 impl LiftState {
@@ -18,14 +20,21 @@ impl LiftState {
         let mut xmms = [ValueId(0); 16];
         let mut flags = [ValueId(0); 6];
         let mut rsp_chain = HashSet::new();
+        let mut reg_pins = HashMap::new();
         for (i, g) in gprs.iter_mut().enumerate() {
             *g = builder.emit(IrOp::Undef, &[], IrType::I64);
             if i == Gpr::Rsp.index() {
                 rsp_chain.insert(*g);
+            } else {
+                // Live-in GPRs (incoming args, caller-preserved callee-saved)
+                // sit in their physical register at entry; pin so regalloc reads
+                // them there instead of an arbitrary register. RSP: rsp_chain.
+                reg_pins.insert(*g, PhysReg::Gpr(Gpr::ALL[i]));
             }
         }
-        for x in &mut xmms {
+        for (i, x) in xmms.iter_mut().enumerate() {
             *x = builder.emit(IrOp::Undef, &[], IrType::I128);
+            reg_pins.insert(*x, PhysReg::Xmm(XmmReg::ALL[i]));
         }
         for f in &mut flags {
             *f = builder.emit(IrOp::Undef, &[], IrType::I8);
@@ -35,6 +44,8 @@ impl LiftState {
             xmms,
             flags,
             rsp_chain,
+            reg_pins,
+            unsupported: false,
         }
     }
 
