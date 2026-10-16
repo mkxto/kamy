@@ -633,6 +633,56 @@ For parallelism determinism: per-function sub-seeds derived from `hash(global_se
 
 ---
 
+### D28 — Coverage Robustness: Depth-Adaptive Transforms (Zero-Spill Stands)
+
+**Decision:** Single engine stays (D1). The 100%-coverage goal ("every selected function works", e.g. all of kernel32) is met by adapting transform intensity to the register budget, **not** by adding a spill path.
+
+Per-function ladder:
+1. Requested passes at full intensity; if regalloc fails `RegisterPressure`, retry at reduced intensity (fewer MBA iterations, no CFF intermediates) — deterministic per D26 sub-seed.
+2. If even identity lowering doesn't fit → relocation fallback, reported via D22.
+
+**Reasoning:** measured on target.exe (2026-10-16): 95/169 functions reach regalloc with the callee-saved pool; the remaining 70 exceed 15 GPRs under zero-spill. D5's bar exists because spill frames break disassembler stack analysis — a product-quality constraint. Depth adaptation keeps every output disassembler-clean while still protecting pressure-heavy functions at reduced depth, which is strictly better than either spilling or rejecting.
+
+**Implications:**
+- Callee-saved activation (Phase 4) is the first rung: widens the pool from 8 volatile to 15 GPRs + XMM6-15.
+- XMM registers must fully participate in allocation (D5 implication).
+- Passes need an intensity parameter so the retry ladder can degrade deterministically.
+- Encode bugs (XMM5 mem-operand) fixed independently.
+
+---
+
+### D29 — Trampoline Stub Obfuscation
+
+**Decision:** Thunk stubs get deterministic per-function flavor diversification + junk fill in scrubbed body bytes; direct-call re-pointing eliminates stubs entirely where all callers are symbolized with confidence.
+
+- Flavor set (per-function choice from a D26 sub-seed; must fit the original function size; `E9 rel32` stays the 5-byte floor / NoThunkSpace boundary):
+  - `E9 rel32` — plain near jump (floor)
+  - `FF 25 00000000 + qword target` — RIP-indirect through a pointer
+  - `B8 imm32 + FF E0` / `49 BB imm64 + 41 FF E3` — mov-reg + jmp-reg
+- Scrubbed original-body bytes get junk/dead padding instead of int3-only.
+- When every direct caller of a moved function is itself moved or re-pointable with confidence, re-point the calls and drop the stub — the best-hidden stub is no stub. Below confidence threshold the stub stays (graceful degradation, never correctness-dependent).
+- Encrypted/validated dispatch tables are deferred to the runtime (D30): `jmp [rip+x]` with the pointer materialized by init code.
+
+**Reasoning:** ground truth (RE of CodeDefender `HelloWorld-Injected.exe`, 2026-10-16): the demo ships verbatim `E9 rel32` detours on every protected entry ("no obfuscation applied for ease of analysis"). Even the commercial model leaves plain stubs when the knob is off — stub stealth is a cheap differentiator implemented at thunk-emission time, orthogonal to D2 correctness.
+
+---
+
+### D30 — Runtime Section, EP Hijack & Plugin SDK (enriches D17)
+
+**Decision:** Adopt the CodeDefender runtime/injection model: kamy ships a runtime component inside the protected binary, and the plugin SDK (D17 "v2+") takes the CodeDefender SDK shape.
+
+Ground truth (RE of `HelloWorld-Injected.exe`, `.belabs` sections, base 0x140000000; codedefender-io/plugins README):
+- **EP hijack:** `AddressOfEntryPoint` redirected to a generated stub that walks an init-callback table (bounds in RW section), `__fastfail`s on nonzero status, then tail-calls the original CRT entry (`[[clang::musttail]]` in their SDK).
+- **Runtime sections:** RX code + RW mutable state + R rodata (their split @0x7000/0x8000/0x9000). Helpers: PEB InLoadOrderModuleList walk + export hashing (lazy_importer-style manual import resolution), cpuid/xgetbv feature init (codegen-variant dispatch), fastfail/RtlCaptureContext integrity reporter.
+- **Plugin SDK:** user C/C++ compiled with LLVM-MSVC against SDK headers; `init_table_start/end` linker symbols register init functions; the linker ingests the resulting COFF. This is D17's "linker accepts external symbol definitions and code chunks" made concrete.
+
+**Implications:**
+- kamy-link needs COFF object ingestion (sections, symbols, COMDAT, relocations).
+- Config: plugin object list per profile; init ordering deterministic.
+- EP hijack must preserve TLS callback ordering and CET compatibility (ties into Phase 4).
+- Their old-`.pdata`→`.text` repurposing is space reclamation (D2 option 2) — evidence the commercial tool reclaims section space; stays deferred for us.
+- Open external RE threads: confirm `sub_140007000` (import resolver vs anti-tamper); enumerate the full trampoline set (5 verified: 0x1000, 0x1070, 0x10c0, 0x17c8, 0x1d54); inspect init callbacks at `.rdata` 0x27f0.
+
 ## Decision Summary
 
 | # | Decision | Choice |
@@ -664,6 +714,9 @@ For parallelism determinism: per-function sub-seeds derived from `hash(global_se
 | D25 | Test corpus | Adopt aftermathlabs/bintests |
 | D26 | PRNG | Configurable seed, deterministic ChaCha8Rng |
 | D27 | /GL handling | Detect and warn, fall back to split-on-calls |
+| D28 | Coverage robustness | Depth-adaptive transforms; zero-spill stands |
+| D29 | Stub stealth | Flavor diversification + junk fill + direct-call re-pointing |
+| D30 | Runtime & plugin SDK | CodeDefender model: EP hijack, init table, COFF plugins (D17 enriched) |
 
 ---
 

@@ -101,6 +101,7 @@ kamy verify input.exe protected.exe --vectors 1000
 - [ ] Instruction selector + linear-scan register allocator
 - [ ] Codegen via iced-x86
 - [ ] Symbolization (metadata-first pipeline)
+- [ ] Pressure-aware transform budgeting (D28) — degrade pass intensity on RegisterPressure; zero-spill stands, no spill path
 - [x] Linker: thunk placement + new section layout + PE rebuild (relocation path via iced-x86 BlockEncoder)
 - [x] Differential self-test (no-transform round-trip) — verified on a real exe; conservative function selection (D22 rejections) for indirect-branch/SEH/reloc cases
 
@@ -119,6 +120,7 @@ Remaining isel gaps: 4 XMM5 memory-operand encode failures, zero-spill pressure.
 - [ ] LoopEncodeSemantics
 - [ ] Per-function config profiles
 - [ ] Jump table recovery & retargeting
+- [ ] Trampoline stub obfuscation (D29) — flavor diversification, junk fill, direct-call re-pointing
 
 ### Phase 4 — SEH & CET
 - [ ] Callee-saved activation (regalloc pool + isel push/pop + UNWIND_INFO) — gates shipping SSA-lowered functions and visible MBA
@@ -142,6 +144,13 @@ Remaining isel gaps: 4 XMM5 memory-operand encode failures, zero-spill pressure.
 - [ ] CI integration (GitHub Actions, Azure DevOps)
 - [ ] ELF (x86-64) support
 - [ ] ARM64 support
+
+### Phase 7 — Runtime & Plugin SDK (D30)
+- [ ] EP hijack + init-callback table (fastfail on failure, tail-call original entry)
+- [ ] Runtime sections (RX/RW/R split) inside the protected image
+- [ ] Runtime helpers: lazy import resolution (PEB walk), cpuid/xgetbv feature dispatch, integrity reporter
+- [ ] Plugin SDK: COFF object ingestion in kamy-link, init-table symbol contract (D17)
+- [ ] TLS callback ordering + CET compatibility for the EP stub
 
 ## Key Dependencies
 

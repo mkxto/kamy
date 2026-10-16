@@ -40,6 +40,7 @@ Living document. Updated as work lands.
 | MBA probability fix | Done | `fa6b941` |
 | MBA visible output | **Blocked** | Gated on callee-saved activation (Phase 4). Lifter threading no longer blocks it (fixed). |
 | Win32metadata calling-convention DB | Deferred | Trait wired + Win64Default + WinmdLookup todo!() |
+| Pressure-aware transform budgeting (D28) | Planned | Degrade pass intensity on RegisterPressure; zero-spill stands |
 
 ### Known bugs
 
@@ -69,6 +70,8 @@ Living document. Updated as work lands.
 | Per-function config profiles + symbol matching | Not started |
 | Jump table recovery & retargeting (D24) | Not started |
 
+| Trampoline stub obfuscation (D29: flavor diversification + junk fill + direct-call re-pointing) | Not started |
+
 ## Phase 4 — SEH & CET
 
 | Item | Status |
@@ -88,6 +91,25 @@ known-bits abstract domain, cost-gated expression simplifier.
 
 Not started. Coverage reporting, API server, CI integration, ELF, ARM64.
 
+## Phase 7 — Runtime & Plugin SDK (D30)
+
+Not started. EP hijack + init-callback table, runtime sections (RX/RW/R),
+lazy imports / feature dispatch / integrity helpers, plugin COFF ingestion,
+TLS/CET-safe entry stub.
+
+---
+
+## Ground truth — CodeDefender RE (2026-10-16)
+
+Source: RE of `HelloWorld-Injected.exe` (codedefender-io/plugins) — the model we replicate.
+
+- Trampolines confirmed: plain `E9 rel32` detours at original entries (D2 validated).
+- Packer layout: `.belabs` RX/RW/R sections; EP hijack 0x1320→0x152d with init-callback table; old `.pdata` repurposed as code, fresh `.pdata` appended.
+- SDK: LLVM-MSVC toolchain, init-table linker symbols, lazy_importer — recorded as D30.
+
+Open external threads: confirm `sub_140007000` purpose (import resolver vs anti-tamper);
+enumerate the full trampoline set (5 verified: 0x1000, 0x1070, 0x10c0, 0x17c8, 0x1d54);
+inspect the init callbacks at `.rdata` 0x27f0.
 ---
 
 ## Test corpus
