@@ -4,6 +4,7 @@ mod branch;
 mod cfg;
 mod discover;
 mod instrs;
+mod jumptable;
 
 pub use branch::branch_target;
 pub use cfg::recover_function;

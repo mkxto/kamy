@@ -83,7 +83,38 @@ pub(crate) fn recover_impl(
     }
 
     let blocks = build_blocks(&instrs, &leaders);
-    (Function { entry, blocks }, calls)
+    let mut func = Function { entry, blocks };
+    recover_switches(module, &mut func, limit);
+    (func, calls)
+}
+
+/// D24 layer 2: for each unresolved `jmp reg` block, try to recover its jump
+/// table (research.md §10.5) and replace the terminator with `Switch`.
+fn recover_switches(module: &Module, func: &mut Function, limit: u32) {
+    let has_reg_indirect = func
+        .blocks
+        .iter()
+        .any(|b| matches!(b.terminator, Terminator::Indirect { slot: None }));
+    if !has_reg_indirect {
+        return;
+    }
+    let lo = func.entry.get();
+    let section_end = module
+        .section_at(func.entry)
+        .map_or(u32::MAX, |s| s.rva.get().saturating_add(s.virtual_size));
+    let hi = limit.min(section_end);
+
+    let insns = crate::instrs::function_instructions(module, func);
+    let Some((jmp_end, targets)) = crate::jumptable::detect_switch(module, &insns, lo, hi) else {
+        return;
+    };
+    for b in &mut func.blocks {
+        if b.end.get() == jmp_end && matches!(b.terminator, Terminator::Indirect { slot: None }) {
+            b.terminator = Terminator::Switch {
+                targets: targets.clone(),
+            };
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

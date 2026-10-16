@@ -34,6 +34,16 @@ pub enum Terminator {
     Indirect {
         slot: Option<Rva>,
     },
+    /// Recovered jump table (D24 layer 2): `targets` are the distinct case
+    /// destinations resolved from the dispatch table (use-def DAG + VF2 match,
+    /// bound-checked entry count, in-range cross-check). Case bodies are not
+    /// materialized as blocks here — that is only needed to move the function,
+    /// which stays rejected until table retargeting exists — so this carries no
+    /// block successors. A `jmp reg` that matches no table pattern stays
+    /// `Indirect { slot: None }`.
+    Switch {
+        targets: Vec<Rva>,
+    },
     /// Decode failed or control left the known address space.
     Unknown,
 }

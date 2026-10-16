@@ -281,7 +281,7 @@ fn classify(
         .unwrap_or(entry.get());
     let size = end.saturating_sub(entry.get());
 
-    use kamy_core::Terminator::{Indirect, Unknown};
+    use kamy_core::Terminator::{Indirect, Switch, Unknown};
     for b in &func.blocks {
         match &b.terminator {
             // D24 layer 0: `jmp [rip+slot]` is statically resolvable, not a
@@ -294,6 +294,9 @@ fn classify(
                 }
                 return Err(Some(RejectionReason::ResolvableIndirect));
             }
+            // D24 layer 2: table recovered, but moving needs retargeting which
+            // is not implemented — stay in place, not an unresolvable branch.
+            Switch { .. } => return Err(Some(RejectionReason::RecoverableSwitch)),
             Indirect { slot: None } => return Err(Some(RejectionReason::BadIndirectBranch)),
             Unknown => return Err(Some(RejectionReason::LiftFailure)),
             _ => {}
