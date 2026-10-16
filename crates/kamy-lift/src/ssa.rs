@@ -50,7 +50,7 @@ pub fn construct_ssa(result: &mut LiftResult) {
                 preds[taken.0 as usize].push(bi);
                 preds[not_taken.0 as usize].push(bi);
             }
-            IrTerminator::Ret | IrTerminator::Unreachable => {}
+            IrTerminator::Ret | IrTerminator::Tail { .. } | IrTerminator::Unreachable => {}
         }
     }
 
@@ -131,7 +131,7 @@ fn succ_indices(block: &IrBlock) -> Vec<usize> {
         IrTerminator::Branch {
             taken, not_taken, ..
         } => vec![taken.0 as usize, not_taken.0 as usize],
-        IrTerminator::Ret | IrTerminator::Unreachable => vec![],
+        IrTerminator::Ret | IrTerminator::Tail { .. } | IrTerminator::Unreachable => vec![],
     }
 }
 

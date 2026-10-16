@@ -238,6 +238,47 @@ pub(crate) fn lift_ret(b: &mut IrBuilder, s: &mut LiftState) {
     b.emit_void(IrOp::Use, &[s.get_gpr(Gpr::Rsp)]);
 }
 
+pub(crate) fn lift_tail_call(
+    target: u64,
+    b: &mut IrBuilder,
+    s: &mut LiftState,
+    cc: &dyn CallingConvLookup,
+) {
+    // A direct tail jmp: the callee reads its ABI argument registers and, on its
+    // own RET, returns to our caller. Keep the argument values live in their ABI
+    // registers across the jump (mirroring a call's pinning) and keep RSP live so
+    // the frame teardown survives DCE.
+    if let Some(sig) = cc.lookup(target) {
+        for phys in &sig.args {
+            if matches!(phys, PhysReg::Flag(_)) {
+                continue;
+            }
+            let v = match phys {
+                PhysReg::Gpr(g) => s.get_gpr(*g),
+                PhysReg::Xmm(x) => s.get_xmm(*x),
+                PhysReg::Flag(f) => s.get_flag(*f),
+            };
+            let arg = if s.reg_pins.get(&v) == Some(phys) {
+                v
+            } else if s.reg_pins.contains_key(&v) || s.rsp_chain.contains(&v) {
+                let ty = if matches!(phys, PhysReg::Xmm(_)) {
+                    IrType::I128
+                } else {
+                    IrType::I64
+                };
+                let c = b.emit(IrOp::Copy, &[v], ty);
+                s.reg_pins.insert(c, *phys);
+                c
+            } else {
+                s.reg_pins.insert(v, *phys);
+                v
+            };
+            b.emit_void(IrOp::Use, &[arg]);
+        }
+    }
+    b.emit_void(IrOp::Use, &[s.get_gpr(Gpr::Rsp)]);
+}
+
 pub(crate) fn lift_cmovcc(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
     let cc = insn.condition_code();
     let cond = decode_condition(cc, b, s);

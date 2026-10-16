@@ -292,7 +292,7 @@ fn block_order(func: &IrFunction) -> Vec<BlockId> {
                 stack.push(*not_taken);
                 stack.push(*taken);
             }
-            IrTerminator::Ret | IrTerminator::Unreachable => {}
+            IrTerminator::Ret | IrTerminator::Tail { .. } | IrTerminator::Unreachable => {}
         }
     }
     order
@@ -404,7 +404,7 @@ pub fn select_instructions(
             select_inst(func, alloc, inst, &block_labels, &mut out);
         }
 
-        if matches!(block.term, IrTerminator::Ret) {
+        if matches!(block.term, IrTerminator::Ret | IrTerminator::Tail { .. }) {
             if odd_pushes {
                 out.push(Instruction::with2(Code::Add_rm64_imm8, Register::RSP, 8i32).unwrap());
             }
@@ -934,6 +934,9 @@ fn select_terminator(
         IrTerminator::Ret => {
             out.push(Instruction::with(Code::Retnq));
         }
+        IrTerminator::Tail { target } => {
+            out.push(Instruction::with_branch(Code::Jmp_rel32_64, *target).unwrap());
+        }
         IrTerminator::Jump(target) => {
             // Single successor: no critical edge, emit the phi copies inline.
             if let Some(copies) = alloc.edge_copies.get(&(pid, *target)) {
@@ -1228,5 +1231,73 @@ mod tests {
                 "rip-relative lea must resolve to the original absolute VA"
             );
         }
+    }
+
+    #[test]
+    fn tail_terminator_lowers_to_jmp_after_epilogue() {
+        const TARGET: u64 = 0x1_4000_7000;
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let v0 = func.alloc_value();
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![Inst {
+                dest: Some(v0),
+                op: IrOp::Const(1),
+                args: vec![],
+                ty: IrType::I64,
+            }],
+            term: IrTerminator::Tail { target: TARGET },
+        });
+
+        let mut assignments = HashMap::new();
+        assignments.insert(v0, PhysReg::Gpr(Gpr::Rbx));
+        let alloc = RegAllocation {
+            assignments,
+            copies: vec![],
+            edge_copies: HashMap::new(),
+        };
+
+        // One callee-saved push is odd, so a realign shim is added; the frame must
+        // be torn down (realign add + pop) before the tail jmp, and no ret emitted.
+        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[Register::RBX]);
+        let mnem: Vec<iced_x86::Mnemonic> = instrs.iter().map(|i| i.mnemonic()).collect();
+        assert!(
+            !mnem.contains(&iced_x86::Mnemonic::Ret),
+            "a tail call must not emit ret: {mnem:?}"
+        );
+        let add_idx = mnem
+            .iter()
+            .position(|m| *m == iced_x86::Mnemonic::Add)
+            .expect("realign add present");
+        let pop_idx = mnem
+            .iter()
+            .position(|m| *m == iced_x86::Mnemonic::Pop)
+            .expect("callee-saved pop present");
+        let jmp_idx = mnem
+            .iter()
+            .rposition(|m| *m == iced_x86::Mnemonic::Jmp)
+            .expect("tail jmp present");
+        assert!(
+            add_idx < pop_idx && pop_idx < jmp_idx,
+            "frame teardown must precede the tail jmp: {mnem:?}"
+        );
+
+        // The tail jmp targets the callee's absolute VA, independent of placement.
+        let bytes = crate::relocate(&instrs, 0x1_4000_2000).expect("tail jmp resolves");
+        let mut dec = Decoder::with_ip(64, &bytes, 0x1_4000_2000, DecoderOptions::NONE);
+        let jmp = dec
+            .iter()
+            .find(|i| i.mnemonic() == iced_x86::Mnemonic::Jmp)
+            .expect("jmp decoded");
+        assert_eq!(
+            jmp.near_branch_target(),
+            TARGET,
+            "tail jmp must resolve to the callee VA"
+        );
     }
 }

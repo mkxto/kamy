@@ -25,6 +25,9 @@ pub enum IrTerminator {
         taken: BlockId,
         not_taken: BlockId,
     },
+    Tail {
+        target: u64,
+    },
     Unreachable,
 }
 

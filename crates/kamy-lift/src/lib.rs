@@ -107,7 +107,9 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
                 if let Some(&bid) = rva_to_block.get(&target.get()) {
                     builder.set_terminator(IrTerminator::Jump(bid));
                 } else {
-                    builder.set_terminator(IrTerminator::Unreachable);
+                    let target_va = module.image_base + u64::from(target.get());
+                    control::lift_tail_call(target_va, &mut builder, &mut lift_state, cc);
+                    builder.set_terminator(IrTerminator::Tail { target: target_va });
                 }
             }
             Terminator::Branch { taken, not_taken } => {

@@ -123,7 +123,7 @@ fn block_order(func: &IrFunction) -> Vec<BlockId> {
                 stack.push(*not_taken);
                 stack.push(*taken);
             }
-            IrTerminator::Ret | IrTerminator::Unreachable => {}
+            IrTerminator::Ret | IrTerminator::Tail { .. } | IrTerminator::Unreachable => {}
         }
     }
     order
@@ -416,7 +416,7 @@ fn successors(term: &IrTerminator) -> Vec<BlockId> {
         IrTerminator::Branch {
             taken, not_taken, ..
         } => vec![*taken, *not_taken],
-        IrTerminator::Ret | IrTerminator::Unreachable => vec![],
+        IrTerminator::Ret | IrTerminator::Tail { .. } | IrTerminator::Unreachable => vec![],
     }
 }
 
