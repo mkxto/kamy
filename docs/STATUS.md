@@ -34,11 +34,11 @@ Living document. Updated as work lands.
 | Relocating linker (thunks, .kamy section, .pdata rebuild, scrub) | Done | `b29b83b` |
 | SSA linker path (lift→ssa→opt→regalloc→isel→encode + fallback) | Done | `13196a1` |
 | No-transform relocation round-trip (169 functions, verified) | ✅ Proven | `b29b83b` |
-| No-transform SSA round-trip (shipped config) | ✅ ~22/fixture, verified | SSA now lowers real functions correctly: `sw`/`target`/`sw2`/`sw3` reproduce exact accumulators and `kamy verify` PASS (1000 runs). Ships single-block, position-independent, resolved-control-flow functions; everything else relocates (reject-on-ambiguity). |
-| SSA backend ABI correctness (D31 prerequisite) | ✅ Done | The backend had never emitted correct code (the 95/169 figure was reachability, not correctness). Fixed: entry/arg/return register pinning, RSP chain (no materialized call-push/ret-adjust, no eviction), call-clobber → callee-saved, two-address aliasing, sound conflict handler, isel↔regalloc point numbering. **Conservative gates relocate** indirect calls, RIP-relative data, multi-block, tail/unresolved jumps, and pin conflicts. |
+| No-transform SSA round-trip (shipped config) | ✅ ~85/fixture, verified | Multi-block (phi destruction + branch resolution), RIP-relative data (position-independent `lea`), and indirect calls (`call reg`/`[mem]`/IAT) now lower correctly. `sw`/`sw2`/`sw3`/`target` reproduce exact accumulators, `kamy verify` PASS (300 runs), output deterministic. kernel32.dll: **362/1276 via SSA** with a consistent rebuilt exception table (1608/1608 RUNTIME_FUNCTIONs valid, 362 fresh `.kamyxd` UNWIND_INFO). |
+| SSA backend ABI + control-flow correctness (D31) | ✅ Done | The backend had never emitted correct code. Fixed across `08ff18c`/`23a792e`/`cd61f2a`: multi-block phi destruction (sequentialized edge copies + critical-edge landing blocks) and branch resolution (sentinel block IPs so iced `BlockEncoder` links intra-function jumps); subtract-comparison flags lower to `cmp a,b` (was `test a,a`); I8 flag values get distinct registers (was hard-pinned to RAX, so compound conditions clobbered each other); deterministic interval ordering; non-pinned values avoid any register pinned by an overlapping interval (replacing an unsound mid-life eviction copy that clobbered live values such as the frame pointer); RIP-relative data; indirect calls; `CallIndirect` as a DCE root. **Residual conservative relocations (sound, D22):** self-recursive functions (lowered frame too large — needs D5 stack-frame reconstruction), functions consuming add/shift-based flags (need a scratch to recompute), unmodeled (NativeInline) RIP-relative instructions, tail-call / indirect / switch `Unknown` terminators, and genuine >15-register pressure (D5 zero-spill, reducible with the D14 cc DB). |
 | MBA pass (add/sub/xor rules, D13 config shape) | Done | `1cfc37b` |
 | MBA probability fix | Done | `fa6b941` |
-| MBA visible output | **Blocked** | The SSA *identity* path is correct, but MBA-transformed IR re-exposes backend lowering bugs (crashes; `kamy verify` catches it). Needs further hardening or a verify-and-fallback gate. |
+| MBA visible output | **Blocked** | The identity path is correct and the backend now lowers far more (multi-block / rip-rel / indirect calls), but MBA's expanded IR still trips residual backend edge cases (deterministic crash; `kamy verify` catches it). Needs further backend hardening or a per-function verify-and-fallback gate. |
 | Win32metadata calling-convention DB | Deferred | Trait wired + Win64Default + WinmdLookup todo!() |
 | Pressure-aware transform budgeting (D28) | Partial | Intensity knob on the MBA pass landed (`run_with_intensity`); the retry-at-lower-intensity ladder is not wired. |
 | .pdata/UNWIND_INFO emission for generated prologues (D31) | ✅ Done | `.kamyxd` section + UNWIND_INFO describing the push/align prologue; body frame-alloc codes are Phase 3. |
@@ -134,8 +134,8 @@ inspect the init callbacks at `.rdata` 0x27f0.
 |------|--------|
 | Unit tests (across 7 crates, incl. SSA threading) | ✅ All pass |
 | Relocation round-trip (target.exe, 169 functions) | ✅ Verified (exit=7, ASLR-stable) |
-| SSA identity round-trip (target.exe) | ⚠️ exit=7 via relocation fallback (callee-saved disabled); engine reaches 95/169 regalloc-ready with pool |
-| kernel32.dll analysis (2588 functions, 29717 blocks) | ✅ Verified (headers cross-checked) |
+| SSA identity round-trip (sw/sw2/sw3/target.exe) | ✅ Verified | Exact accumulators + `kamy verify` PASS; ~85 functions/binary lowered via SSA (multi-block, rip-rel, indirect calls), rest relocate. |
+| kernel32.dll SSA round-trip (2588 functions) | ✅ Verified (static) | Rebuilds via SSA (362 lowered); re-parses as valid PE, exports preserved, exception table consistent (1608/1608 RUNTIME_FUNCTIONs). DLL — not executed. |
 | aftermathlabs/bintests corpus (D25) | Not adopted |
 | backengineering/bintests `misc/jtables` — jump-table corpus (research.md §10.5) | Not adopted |
 
