@@ -7,6 +7,14 @@ use kamy_core::ir::{
 
 use crate::regalloc::{RegAllocation, RegCopy};
 
+// Synthetic branch-target labels: unique, non-zero IPs placed far above any real
+// image VA. iced's BlockEncoder links a branch to an in-block instruction by
+// matching the instruction's ip(); stamping each block's first instruction with
+// its label lets intra-function branches resolve while real external targets
+// (direct calls, tail-call VAs) never collide with these sentinels.
+const LABEL_BASE: u64 = 0x7FFF_0000_0000;
+const LANDING_BASE: u64 = 0x7FFF_8000_0000;
+
 fn gpr_register(gpr: Gpr, ty: IrType) -> Register {
     match (gpr, ty) {
         (Gpr::Rax, IrType::I64) => Register::RAX,
@@ -199,6 +207,46 @@ fn test_code(ty: IrType) -> Code {
     }
 }
 
+fn cmp_code(ty: IrType) -> Code {
+    match ty {
+        IrType::I64 | IrType::I128 => Code::Cmp_rm64_r64,
+        IrType::I32 => Code::Cmp_rm32_r32,
+        IrType::I16 => Code::Cmp_rm16_r16,
+        IrType::I8 => Code::Cmp_rm8_r8,
+    }
+}
+
+/// Emit the x86 instruction that sets the flags a flag op reads. `IsZero`/
+/// `IsNeg`/`Parity` reflect the real result value (`test r,r`); the subtract
+/// comparison flags are the flags of `a - b` (`cmp a,b`). Add- and shift-based
+/// flag ops reach codegen only via a branch/materialization and are rejected
+/// before this point (their flags are not reconstructible without a scratch).
+fn emit_flag_compare(
+    func: &IrFunction,
+    alloc: &RegAllocation,
+    producer: &kamy_core::ir::Inst,
+    out: &mut Vec<Instruction>,
+) {
+    match &producer.op {
+        IrOp::IsZero | IrOp::IsNeg | IrOp::Parity => {
+            if let Some(&arg) = producer.args.first() {
+                let ty = value_type(func, arg);
+                let reg = reg_of(alloc, arg, ty);
+                out.push(Instruction::with2(test_code(ty), reg, reg).unwrap());
+            }
+        }
+        IrOp::BorrowSub | IrOp::OverflowSub | IrOp::AuxBorrowSub => {
+            let a = producer.args[0];
+            let b = producer.args[1];
+            let ty = value_type(func, a);
+            let ra = reg_of(alloc, a, ty);
+            let rb = reg_of(alloc, b, ty);
+            out.push(Instruction::with2(cmp_code(ty), ra, rb).unwrap());
+        }
+        _ => {}
+    }
+}
+
 fn load_code(ty: IrType) -> Code {
     match ty {
         IrType::I64 | IrType::I128 => Code::Mov_r64_rm64,
@@ -307,16 +355,14 @@ pub fn select_instructions(
     func: &IrFunction,
     alloc: &RegAllocation,
     _image_base: u64,
-    entry_va: u64,
+    _entry_va: u64,
     callee_saved_used: &[Register],
 ) -> Vec<Instruction> {
     let order = block_order(func);
     let mut out: Vec<Instruction> = Vec::new();
     let mut block_labels: HashMap<BlockId, u64> = HashMap::new();
-
-    let va = entry_va;
     for (bi, &bid) in order.iter().enumerate() {
-        block_labels.insert(bid, va + (bi as u64) * 0x100);
+        block_labels.insert(bid, LABEL_BASE + (bi as u64) * 0x1000);
     }
 
     let mut copy_map: HashMap<usize, Vec<&RegCopy>> = HashMap::new();
@@ -334,9 +380,16 @@ pub fn select_instructions(
         out.push(Instruction::with2(Code::Sub_rm64_imm8, Register::RSP, 8i32).unwrap());
     }
 
+    // A critical edge (branch predecessor -> phi-carrying successor) gets its own
+    // landing block holding that edge's phi copies; collected here and emitted
+    // after the body so real blocks keep their fallthrough order.
+    let mut landings: Vec<(u64, BlockId, BlockId)> = Vec::new();
+    let mut next_landing: u64 = LANDING_BASE;
+
     for (bi, &bid) in order.iter().enumerate() {
         let block = func.block(bid);
         let phi_offset = block.phis.len();
+        let block_start = out.len();
 
         for (ii, inst) in block.insts.iter().enumerate() {
             // Mirror regalloc's `linear_point(bi, phi_offset + ii)` so eviction
@@ -359,7 +412,31 @@ pub fn select_instructions(
                 out.push(Instruction::with1(Code::Pop_r64, r).unwrap());
             }
         }
-        select_terminator(func, alloc, &block.term, &block_labels, &mut out);
+        select_terminator(
+            func,
+            alloc,
+            bid,
+            &block.term,
+            &block_labels,
+            &mut landings,
+            &mut next_landing,
+            &mut out,
+        );
+
+        // Every block emits at least a terminator; stamp its first instruction
+        // with the block label so branches here resolve.
+        out[block_start].set_ip(block_labels[&bid]);
+    }
+
+    for (label, pred, succ) in landings {
+        let start = out.len();
+        if let Some(copies) = alloc.edge_copies.get(&(pred, succ)) {
+            for c in copies {
+                emit_copy(&mut out, c);
+            }
+        }
+        out.push(Instruction::with_branch(Code::Jmp_rel32_64, block_labels[&succ]).unwrap());
+        out[start].set_ip(label);
     }
 
     out
@@ -607,13 +684,7 @@ fn select_inst(
                 return;
             }
             let dest_reg = reg_of(alloc, dest, IrType::I8);
-            if !inst.args.is_empty() {
-                let arg = inst.args[0];
-                let arg_ty = value_type(func, arg);
-                let arg_reg = reg_of(alloc, arg, arg_ty);
-                let tc = test_code(arg_ty);
-                out.push(Instruction::with2(tc, arg_reg, arg_reg).unwrap());
-            }
+            emit_flag_compare(func, alloc, inst, out);
             let setcc = flag_op_to_setcc(&inst.op);
             out.push(Instruction::with1(setcc, dest_reg).unwrap());
         }
@@ -809,11 +880,36 @@ fn find_flag_producer(func: &IrFunction, cond_vid: ValueId) -> Option<&kamy_core
     None
 }
 
+fn edge_target(
+    alloc: &RegAllocation,
+    pred: BlockId,
+    succ: BlockId,
+    block_labels: &HashMap<BlockId, u64>,
+    landings: &mut Vec<(u64, BlockId, BlockId)>,
+    next_landing: &mut u64,
+) -> u64 {
+    // A conditional branch always has two successors, so any phi-carrying
+    // successor is reached by a critical edge: route it through a landing block
+    // that performs the edge's phi copies in isolation.
+    if alloc.edge_copies.contains_key(&(pred, succ)) {
+        let label = *next_landing;
+        *next_landing += 0x1000;
+        landings.push((label, pred, succ));
+        label
+    } else {
+        block_labels[&succ]
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn select_terminator(
     func: &IrFunction,
     alloc: &RegAllocation,
+    pid: BlockId,
     term: &IrTerminator,
     block_labels: &HashMap<BlockId, u64>,
+    landings: &mut Vec<(u64, BlockId, BlockId)>,
+    next_landing: &mut u64,
     out: &mut Vec<Instruction>,
 ) {
     match term {
@@ -821,38 +917,32 @@ fn select_terminator(
             out.push(Instruction::with(Code::Retnq));
         }
         IrTerminator::Jump(target) => {
-            let target_va = block_labels[target];
-            out.push(Instruction::with_branch(Code::Jmp_rel32_64, target_va).unwrap());
+            // Single successor: no critical edge, emit the phi copies inline.
+            if let Some(copies) = alloc.edge_copies.get(&(pid, *target)) {
+                for c in copies {
+                    emit_copy(out, c);
+                }
+            }
+            out.push(Instruction::with_branch(Code::Jmp_rel32_64, block_labels[target]).unwrap());
         }
         IrTerminator::Branch {
             cond,
             taken,
             not_taken,
         } => {
-            let taken_va = block_labels[taken];
-            let not_taken_va = block_labels[not_taken];
+            let taken_va = edge_target(alloc, pid, *taken, block_labels, landings, next_landing);
+            let not_taken_va =
+                edge_target(alloc, pid, *not_taken, block_labels, landings, next_landing);
 
             if let Some(producer) = find_flag_producer(func, *cond) {
                 match &producer.op {
                     IrOp::IsZero
                     | IrOp::IsNeg
                     | IrOp::Parity
-                    | IrOp::CarryAdd
-                    | IrOp::OverflowAdd
                     | IrOp::BorrowSub
                     | IrOp::OverflowSub
-                    | IrOp::AuxCarryAdd
-                    | IrOp::AuxBorrowSub
-                    | IrOp::CarryShl
-                    | IrOp::CarryShr
-                    | IrOp::CarrySar => {
-                        if !producer.args.is_empty() {
-                            let arg = producer.args[0];
-                            let arg_ty = value_type(func, arg);
-                            let arg_reg = reg_of(alloc, arg, arg_ty);
-                            let tc = test_code(arg_ty);
-                            out.push(Instruction::with2(tc, arg_reg, arg_reg).unwrap());
-                        }
+                    | IrOp::AuxBorrowSub => {
+                        emit_flag_compare(func, alloc, producer, out);
                         let jcc = flag_op_to_jcc(&producer.op);
                         out.push(Instruction::with_branch(jcc, taken_va).unwrap());
                         out.push(
@@ -927,6 +1017,7 @@ mod tests {
         let alloc = RegAllocation {
             assignments,
             copies: vec![],
+            edge_copies: HashMap::new(),
         };
 
         let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[]);
@@ -975,6 +1066,7 @@ mod tests {
         let alloc = RegAllocation {
             assignments,
             copies: vec![],
+            edge_copies: HashMap::new(),
         };
 
         let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[Register::RBX]);
@@ -998,5 +1090,71 @@ mod tests {
             .position(|i| i.mnemonic() == iced_x86::Mnemonic::Add)
             .expect("add rsp,8 present");
         assert!(add_idx < pop_idx, "add rsp,8 must precede the pop at ret");
+    }
+
+    #[test]
+    fn multiblock_branch_lowers_cmp_and_resolves() {
+        // b0: v2 = BorrowSub(v0, v1); branch v2 -> b1 : b2   (b1,b2 return)
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let v0 = func.alloc_value();
+        let v1 = func.alloc_value();
+        let v2 = func.alloc_value();
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![
+                Inst {
+                    dest: Some(v0),
+                    op: IrOp::Const(5),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(v1),
+                    op: IrOp::Const(2),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(v2),
+                    op: IrOp::BorrowSub,
+                    args: vec![v0, v1],
+                    ty: IrType::I8,
+                },
+            ],
+            term: IrTerminator::Branch {
+                cond: v2,
+                taken: BlockId(1),
+                not_taken: BlockId(2),
+            },
+        });
+        for id in [BlockId(1), BlockId(2)] {
+            func.blocks.push(IrBlock {
+                id,
+                phis: vec![],
+                insts: vec![],
+                term: IrTerminator::Ret,
+            });
+        }
+
+        let alloc = crate::regalloc::allocate_registers(
+            &func,
+            &crate::regalloc::CALLEE_SAVED_GPRS,
+            &std::collections::HashSet::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[]);
+        // Intra-function branch targets must resolve to in-block instructions.
+        crate::relocate(&instrs, 0x140001000).expect("branches resolve");
+        let mnemonics: Vec<iced_x86::Mnemonic> = instrs.iter().map(|i| i.mnemonic()).collect();
+        assert!(
+            mnemonics.contains(&iced_x86::Mnemonic::Cmp),
+            "a subtract comparison must lower to `cmp a,b`, not `test`: {mnemonics:?}"
+        );
     }
 }

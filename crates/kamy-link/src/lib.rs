@@ -42,6 +42,7 @@ impl Default for Options {
 pub struct Report {
     pub moved: Vec<Rva>,
     pub rejected: Vec<(Rva, RejectionReason)>,
+    pub ssa_lowered: usize,
 }
 
 #[derive(Clone)]
@@ -122,6 +123,21 @@ fn ssa_body(
     kamy_lift::ssa::construct_ssa(&mut result);
     transform(&mut result.func);
     kamy_transforms::optimize(&mut result.func);
+    if uses_unsupported_flags(&result.func) {
+        return Err(LinkError::Codegen(kamy_codegen::CodegenError::Encode(
+            "add/shift-based flag consumed by branch or setcc".into(),
+        )));
+    }
+    let entry_va = base + u64::from(func.entry.get());
+    if result.func.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .any(|i| matches!(i.op, kamy_core::ir::IrOp::Call { target } if target == entry_va))
+    }) {
+        return Err(LinkError::Codegen(kamy_codegen::CodegenError::Encode(
+            "self-recursive (frame reconstruction pending)".into(),
+        )));
+    }
 
     let alloc = kamy_codegen::allocate_registers(
         &result.func,
@@ -134,7 +150,6 @@ fn ssa_body(
             "register pressure".into(),
         ))
     })?;
-
     let used = kamy_codegen::callee_saved_used(&alloc);
     let instrs = kamy_codegen::select_instructions(&result.func, &alloc, base, new_va, &used);
     let shape = PrologueShape {
@@ -142,6 +157,40 @@ fn ssa_body(
         pushed: used,
     };
     Ok((relocate(&instrs, new_va).map_err(LinkError::from)?, shape))
+}
+
+/// Add- and shift-based condition flags (`add;jo`, `shl;jc`, …) cannot be
+/// reconstructed without a scratch register, so a function that actually
+/// consumes one is relocated verbatim instead of miscompiled (reject-on-
+/// ambiguity, D22). Subtract comparisons (`cmp a,b`) and result flags
+/// (`test r,r`) are lowered directly and are not rejected here.
+fn uses_unsupported_flags(func: &IrFunction) -> bool {
+    use kamy_core::ir::{IrOp, IrTerminator};
+    let mut used = HashSet::new();
+    for b in &func.blocks {
+        for i in &b.insts {
+            used.extend(i.args.iter().copied());
+        }
+        for p in &b.phis {
+            used.extend(p.args.iter().map(|(_, v)| *v));
+        }
+        if let IrTerminator::Branch { cond, .. } = &b.term {
+            used.insert(*cond);
+        }
+    }
+    func.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(
+                i.op,
+                IrOp::CarryAdd
+                    | IrOp::OverflowAdd
+                    | IrOp::AuxCarryAdd
+                    | IrOp::CarryShl
+                    | IrOp::CarryShr
+                    | IrOp::CarrySar
+            ) && i.dest.is_some_and(|d| used.contains(&d))
+        })
+    })
 }
 
 #[allow(dead_code)]
@@ -189,6 +238,7 @@ fn protect_inner(
     let mut report = Report {
         moved: Vec::new(),
         rejected: Vec::new(),
+        ssa_lowered: 0,
     };
     let mut code: Vec<u8> = Vec::new();
     let mut moved: Vec<Moved> = Vec::new();
@@ -252,6 +302,10 @@ fn protect_inner(
                         }
                     }
                 };
+
+                if shape.is_some() {
+                    report.ssa_lowered += 1;
+                }
 
                 let patch = entry_patch(base, cand.entry.get(), new_rva, cand.endbr);
                 let thunk_len = patch.len() as u32;

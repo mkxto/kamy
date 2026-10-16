@@ -169,8 +169,9 @@ fn protect_identity(input: &Path, output: &Path) -> anyhow::Result<()> {
         *by_reason.entry(reason.tag()).or_default() += 1;
     }
     eprintln!(
-        "moved {} function(s), rejected {}",
+        "moved {} function(s) ({} via SSA), rejected {}",
         report.moved.len(),
+        report.ssa_lowered,
         report.rejected.len()
     );
     for (reason, count) in by_reason {
@@ -243,8 +244,9 @@ fn protect_with_profile(input: &Path, output: &Path, profile_path: &Path) -> any
         *by_reason.entry(reason.tag()).or_default() += 1;
     }
     eprintln!(
-        "moved {} function(s), rejected {}",
+        "moved {} function(s) ({} via SSA), rejected {}",
         report.moved.len(),
+        report.ssa_lowered,
         report.rejected.len()
     );
     for (reason, count) in by_reason {

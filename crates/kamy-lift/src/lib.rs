@@ -145,11 +145,6 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
         reg_pins.extend(&lift_state.reg_pins);
         unsupported |= lift_state.unsupported;
     }
-    if ordered_bbs.len() > 1 {
-        // Multi-block control flow (branch target resolution, phi lowering) is not
-        // yet lowered soundly; relocate verbatim until it is.
-        unsupported = true;
-    }
     if ir_func
         .blocks
         .iter()

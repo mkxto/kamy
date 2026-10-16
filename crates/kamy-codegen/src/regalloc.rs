@@ -17,6 +17,7 @@ pub struct RegCopy {
 pub struct RegAllocation {
     pub assignments: HashMap<ValueId, PhysReg>,
     pub copies: Vec<RegCopy>,
+    pub edge_copies: HashMap<(BlockId, BlockId), Vec<RegCopy>>,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +137,9 @@ fn compute_live_intervals(func: &IrFunction, order: &[BlockId]) -> Vec<LiveInter
     let mut defs: HashMap<ValueId, (usize, IrType, Option<PhysReg>)> = HashMap::new();
     let mut last_use: HashMap<ValueId, usize> = HashMap::new();
     let mut call_points: Vec<usize> = Vec::new();
+    // Each phi dest is written by an edge copy at every predecessor's terminator;
+    // its register must be reserved across those points, back-edges included.
+    let mut phi_dest_edges: HashMap<ValueId, Vec<usize>> = HashMap::new();
 
     for (bi, &bid) in order.iter().enumerate() {
         let block = func.block(bid);
@@ -181,25 +185,10 @@ fn compute_live_intervals(func: &IrFunction, order: &[BlockId]) -> Vec<LiveInter
             last_use.insert(*cond, term_pt);
         }
 
-        match &block.term {
-            IrTerminator::Jump(t) | IrTerminator::Branch { taken: t, .. } => {
-                let target = func.block(*t);
-                for phi in &target.phis {
-                    for (pred, val) in &phi.args {
-                        if *pred == bid {
-                            last_use
-                                .entry(*val)
-                                .and_modify(|e| *e = (*e).max(term_pt))
-                                .or_insert(term_pt);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        if let IrTerminator::Branch { not_taken, .. } = &block.term {
-            let target = func.block(*not_taken);
+        for succ in successors(&block.term) {
+            let target = func.block(succ);
             for phi in &target.phis {
+                phi_dest_edges.entry(phi.dest).or_default().push(term_pt);
                 for (pred, val) in &phi.args {
                     if *pred == bid {
                         last_use
@@ -210,6 +199,18 @@ fn compute_live_intervals(func: &IrFunction, order: &[BlockId]) -> Vec<LiveInter
                 }
             }
         }
+    }
+
+    for (dest, pts) in &phi_dest_edges {
+        let minp = *pts.iter().min().unwrap();
+        let maxp = *pts.iter().max().unwrap();
+        if let Some(d) = defs.get_mut(dest) {
+            d.0 = d.0.min(minp);
+        }
+        last_use
+            .entry(*dest)
+            .and_modify(|e| *e = (*e).max(maxp))
+            .or_insert(maxp);
     }
 
     let mut intervals: Vec<LiveInterval> = defs
@@ -230,7 +231,7 @@ fn compute_live_intervals(func: &IrFunction, order: &[BlockId]) -> Vec<LiveInter
         })
         .collect();
 
-    intervals.sort_by_key(|iv| iv.start);
+    intervals.sort_by_key(|iv| (iv.start, iv.value.0));
     intervals
 }
 
@@ -296,15 +297,6 @@ pub fn allocate_registers(
                 true
             }
         });
-
-        if iv.ty == IrType::I8 {
-            if let Some(pinned) = iv.pinned {
-                assignments.insert(iv.value, pinned);
-            } else {
-                assignments.insert(iv.value, PhysReg::Gpr(Gpr::Rax));
-            }
-            continue;
-        }
 
         let needs_xmm = iv.ty == IrType::I128;
 
@@ -412,11 +404,131 @@ pub fn allocate_registers(
             active.push((iv.clone(), reg));
         }
     }
+    let edge_copies = compute_edge_copies(func, &order, &intervals, &assignments)?;
 
     Ok(RegAllocation {
         assignments,
         copies,
+        edge_copies,
     })
+}
+
+fn successors(term: &IrTerminator) -> Vec<BlockId> {
+    match term {
+        IrTerminator::Jump(t) => vec![*t],
+        IrTerminator::Branch {
+            taken, not_taken, ..
+        } => vec![*taken, *not_taken],
+        IrTerminator::Ret | IrTerminator::Unreachable => vec![],
+    }
+}
+
+/// SSA destruction: for every edge `pred -> succ` whose successor carries phis,
+/// build the parallel register copy (succ phi dest <- that pred's phi arg) and
+/// sequentialize it. A residual copy cycle is broken with a volatile register
+/// free at the predecessor's terminator; if none is free the function is
+/// rejected (D5: never spill to the stack).
+fn compute_edge_copies(
+    func: &IrFunction,
+    order: &[BlockId],
+    intervals: &[LiveInterval],
+    assignments: &HashMap<ValueId, PhysReg>,
+) -> Result<HashMap<(BlockId, BlockId), Vec<RegCopy>>, RejectionReason> {
+    let mut order_index: HashMap<BlockId, usize> = HashMap::new();
+    for (i, &b) in order.iter().enumerate() {
+        order_index.insert(b, i);
+    }
+    let mut result: HashMap<(BlockId, BlockId), Vec<RegCopy>> = HashMap::new();
+    for &pb in order {
+        let pred = func.block(pb);
+        let pidx = order_index[&pb];
+        let pterm = linear_point(pidx, pred.phis.len() + pred.insts.len());
+        for sb in successors(&pred.term) {
+            let succ = func.block(sb);
+            if succ.phis.is_empty() {
+                continue;
+            }
+            let mut pairs: Vec<(PhysReg, PhysReg, IrType)> = Vec::new();
+            for phi in &succ.phis {
+                let Some((_, src_val)) = phi.args.iter().find(|(pr, _)| *pr == pb) else {
+                    continue;
+                };
+                let dst = assignments[&phi.dest];
+                let src = assignments[src_val];
+                pairs.push((dst, src, phi.ty));
+            }
+            let busy: HashSet<PhysReg> = intervals
+                .iter()
+                .filter(|iv| iv.start <= pterm && pterm <= iv.end)
+                .filter_map(|iv| assignments.get(&iv.value).copied())
+                .collect();
+            let edge_regs: HashSet<PhysReg> = pairs.iter().flat_map(|(d, s, _)| [*d, *s]).collect();
+            let mut free_gpr: Vec<PhysReg> = VOLATILE_GPRS
+                .iter()
+                .map(|g| PhysReg::Gpr(*g))
+                .filter(|r| !busy.contains(r) && !edge_regs.contains(r))
+                .collect();
+            let mut free_xmm: Vec<PhysReg> = VOLATILE_XMMS
+                .iter()
+                .map(|x| PhysReg::Xmm(*x))
+                .filter(|r| !busy.contains(r) && !edge_regs.contains(r))
+                .collect();
+            let seq = sequence_copies(&pairs, &mut free_gpr, &mut free_xmm)
+                .ok_or(RejectionReason::RegisterPressure)?;
+            if !seq.is_empty() {
+                result.insert((pb, sb), seq);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Sequentialize a parallel register copy. Each destination is written once, so
+/// the move graph is chains and simple cycles: emit a move whose destination no
+/// pending move still reads, and break a residual cycle by parking one register
+/// in a free scratch. Returns `None` when a cycle needs a scratch and none is
+/// free.
+fn sequence_copies(
+    pairs: &[(PhysReg, PhysReg, IrType)],
+    free_gpr: &mut Vec<PhysReg>,
+    free_xmm: &mut Vec<PhysReg>,
+) -> Option<Vec<RegCopy>> {
+    let mut moves: Vec<(PhysReg, PhysReg, IrType)> =
+        pairs.iter().copied().filter(|(d, s, _)| d != s).collect();
+    let mut out: Vec<RegCopy> = Vec::new();
+    while !moves.is_empty() {
+        if let Some(i) = moves
+            .iter()
+            .position(|(d, _, _)| !moves.iter().any(|(_, s, _)| s == d))
+        {
+            let (to, from, ty) = moves.remove(i);
+            out.push(RegCopy {
+                point: 0,
+                from,
+                to,
+                ty,
+            });
+        } else {
+            let d = moves[0].0;
+            let ty = moves[0].2;
+            let scratch = match d {
+                PhysReg::Xmm(_) => free_xmm.pop(),
+                _ => free_gpr.pop(),
+            }?;
+            out.push(RegCopy {
+                point: 0,
+                from: d,
+                to: scratch,
+                ty,
+            });
+            for m in moves.iter_mut() {
+                if m.1 == d {
+                    m.1 = scratch;
+                }
+            }
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -519,6 +631,7 @@ mod tests {
         let alloc = RegAllocation {
             assignments,
             copies: vec![],
+            edge_copies: HashMap::new(),
         };
         assert_eq!(
             callee_saved_used(&alloc),
