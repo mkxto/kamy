@@ -14,6 +14,9 @@ enum EndKind {
     /// edge. Terminates the block without absorbing the callee's body.
     TailJump(u32),
     Indirect(Option<Rva>),
+    /// A trap (`ud2`, `int`) or a call to a known-noreturn import: control does
+    /// not fall through, so the block ends here without a successor.
+    NoReturn,
     Branch {
         taken: u32,
         not_taken: u32,
@@ -26,8 +29,13 @@ struct InstrRecord {
     kind: EndKind,
 }
 
-pub fn recover_function(module: &Module, entry: Rva, function_starts: &BTreeSet<u32>) -> Function {
-    recover_impl(module, entry, function_starts).0
+pub fn recover_function(
+    module: &Module,
+    entry: Rva,
+    function_starts: &BTreeSet<u32>,
+    noreturn_slots: &BTreeSet<u32>,
+) -> Function {
+    recover_impl(module, entry, function_starts, noreturn_slots).0
 }
 
 /// Recover one function and report the direct call targets seen while decoding
@@ -40,6 +48,7 @@ pub(crate) fn recover_impl(
     module: &Module,
     entry: Rva,
     function_starts: &BTreeSet<u32>,
+    noreturn_slots: &BTreeSet<u32>,
 ) -> (Function, Vec<Rva>) {
     let mut instrs: BTreeMap<u32, InstrRecord> = BTreeMap::new();
     let mut leaders: BTreeSet<u32> = BTreeSet::new();
@@ -68,6 +77,7 @@ pub(crate) fn recover_impl(
             &mut calls,
             &mut seen_calls,
             function_starts,
+            noreturn_slots,
             limit,
         );
     }
@@ -87,6 +97,7 @@ fn decode_run(
     calls: &mut Vec<Rva>,
     seen_calls: &mut BTreeSet<u32>,
     function_starts: &BTreeSet<u32>,
+    noreturn_slots: &BTreeSet<u32>,
     limit: u32,
 ) {
     if start >= limit || instrs.contains_key(&start) {
@@ -131,6 +142,7 @@ fn decode_run(
             seen_calls,
             entry,
             function_starts,
+            noreturn_slots,
         );
         let successors: Vec<u32> = match &kind {
             EndKind::Jump(target) => vec![*target],
@@ -155,6 +167,7 @@ fn decode_run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn classify(
     module: &Module,
     instr: &Instruction,
@@ -163,6 +176,7 @@ fn classify(
     seen_calls: &mut BTreeSet<u32>,
     entry: u32,
     function_starts: &BTreeSet<u32>,
+    noreturn_slots: &BTreeSet<u32>,
 ) -> EndKind {
     match instr.flow_control() {
         FlowControl::Next => EndKind::Normal,
@@ -172,7 +186,12 @@ fn classify(
                     calls.push(target);
                 }
             }
-            EndKind::Normal
+            // A call through a known-noreturn import slot does not return;
+            // decoding the fallthrough would misread the next function's bytes.
+            match static_slot(module, instr) {
+                Some(slot) if noreturn_slots.contains(&slot.get()) => EndKind::NoReturn,
+                _ => EndKind::Normal,
+            }
         }
         FlowControl::ConditionalBranch => {
             let taken = branch_target(instr).and_then(|va| to_in_exec_rva(module, va));
@@ -203,9 +222,12 @@ fn classify(
         FlowControl::Return => EndKind::Return,
         FlowControl::Interrupt => match instr.mnemonic() {
             Mnemonic::Iret | Mnemonic::Iretd | Mnemonic::Iretq => EndKind::Return,
-            _ => EndKind::Normal,
+            // `int3` may be a resumable breakpoint; other software interrupts
+            // (`int 0x29` fastfail, etc.) do not return.
+            Mnemonic::Int3 => EndKind::Normal,
+            _ => EndKind::NoReturn,
         },
-        FlowControl::Exception => EndKind::Unknown,
+        FlowControl::Exception => EndKind::NoReturn,
         FlowControl::XbeginXabortXend => EndKind::Normal,
     }
 }
@@ -258,6 +280,7 @@ fn build_blocks(instrs: &BTreeMap<u32, InstrRecord>, leaders: &BTreeSet<u32>) ->
                     break (Terminator::Unknown, Rva::new(next), Vec::new());
                 }
                 EndKind::Return => break (Terminator::Return, Rva::new(rec.end), Vec::new()),
+                EndKind::NoReturn => break (Terminator::Return, Rva::new(rec.end), Vec::new()),
                 EndKind::TailJump(target) => {
                     break (
                         Terminator::Jump(Rva::new(*target)),

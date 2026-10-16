@@ -89,7 +89,12 @@ mod tests {
             0x0F, 0x85, 0x06, 0x00, 0x00, 0x00, 0x48, 0x31, 0xC0, 0xC3, 0x90, 0x90, 0xC3,
         ];
         let module = exec_module(data);
-        let function = recover_function(&module, Rva::new(TEXT_RVA), &BTreeSet::new());
+        let function = recover_function(
+            &module,
+            Rva::new(TEXT_RVA),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
 
         assert!(function.blocks.len() >= 2);
         let entry_block = function
@@ -117,6 +122,7 @@ mod tests {
             &exec_module(vec![0xFF, 0x25, 0xFA, 0x04, 0x00, 0x00]),
             Rva::new(TEXT_RVA),
             &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(
             rip_rel.blocks[0].terminator,
@@ -129,6 +135,7 @@ mod tests {
         let reg = recover_function(
             &exec_module(vec![0xFF, 0xE0]),
             Rva::new(TEXT_RVA),
+            &BTreeSet::new(),
             &BTreeSet::new(),
         );
         assert_eq!(
@@ -158,6 +165,36 @@ mod tests {
     }
 
     #[test]
+    fn trap_ends_function_without_overdecode() {
+        // 0x1000: 0F 0B        ud2  (noreturn trap)
+        // 0x1002: E8 00000000  call +0  (must NOT be decoded into this function)
+        let module = exec_module(vec![0x0F, 0x0B, 0xE8, 0x00, 0x00, 0x00, 0x00]);
+        let f = recover_function(
+            &module,
+            Rva::new(TEXT_RVA),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(f.blocks.len(), 1);
+        assert_eq!(f.blocks[0].terminator, Terminator::Return);
+        assert_eq!(f.blocks[0].end, Rva::new(0x1002));
+    }
+
+    #[test]
+    fn noreturn_import_call_ends_block() {
+        // 0x1000: FF 15 FA040000  call qword [rip+0x4fa] -> slot 0x1500
+        // 0x1006: E8 00000000     call +0  (must NOT be decoded)
+        let module = exec_module(vec![
+            0xFF, 0x15, 0xFA, 0x04, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        let noreturn = BTreeSet::from([0x1500u32]);
+        let f = recover_function(&module, Rva::new(TEXT_RVA), &BTreeSet::new(), &noreturn);
+        assert_eq!(f.blocks.len(), 1);
+        assert_eq!(f.blocks[0].terminator, Terminator::Return);
+        assert_eq!(f.blocks[0].end, Rva::new(0x1006));
+    }
+
+    #[test]
     fn discover_follows_call() {
         // 0x1000: E8 0A000000  call +0x0A  -> 0x100F
         // 0x1005: C3           ret
@@ -180,7 +217,12 @@ mod tests {
     fn malformed_bytes_do_not_panic() {
         // 0xFF alone is an incomplete/invalid encoding; decode must degrade to Unknown.
         let module = exec_module(vec![0xFF]);
-        let function = recover_function(&module, Rva::new(TEXT_RVA), &BTreeSet::new());
+        let function = recover_function(
+            &module,
+            Rva::new(TEXT_RVA),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
         assert_eq!(function.entry, Rva::new(TEXT_RVA));
         assert!(matches!(
             function.blocks.first().map(|b| &b.terminator),
