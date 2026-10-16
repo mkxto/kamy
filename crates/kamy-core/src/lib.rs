@@ -13,7 +13,7 @@ mod reloc;
 mod symbol;
 
 pub use addr::Rva;
-pub use cfg::{BasicBlock, Function, Terminator};
+pub use cfg::{BasicBlock, Function, SwitchTable, Terminator};
 pub use module::{Machine, Module, Section, SectionFlags};
 pub use reject::RejectionReason;
 pub use reloc::{RelocKind, Relocation};

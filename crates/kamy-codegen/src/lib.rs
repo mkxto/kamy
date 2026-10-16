@@ -38,6 +38,26 @@ pub fn relocate(instrs: &[Instruction], new_va: u64) -> Result<Vec<u8>, CodegenE
     Ok(result.code_buffer)
 }
 
+/// Re-encode `instrs` at `new_va` and return the code plus each input
+/// instruction's new offset relative to `new_va`.
+///
+/// An offset of `u32::MAX` means BlockEncoder rewrote that instruction (e.g. a
+/// short branch widened) and it has no 1:1 position; a caller building an
+/// address map MUST treat `u32::MAX` as a mapping failure.
+pub fn relocate_with_offsets(
+    instrs: &[Instruction],
+    new_va: u64,
+) -> Result<(Vec<u8>, Vec<u32>), CodegenError> {
+    let block = InstructionBlock::new(instrs, new_va);
+    let result = BlockEncoder::encode(
+        64,
+        block,
+        BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+    )
+    .map_err(|e| CodegenError::Encode(e.to_string()))?;
+    Ok((result.code_buffer, result.new_instruction_offsets))
+}
+
 /// Emit a jump thunk from `site_va` to `target_va`:
 /// 5-byte `E9 rel32` when the displacement fits in i32, else the 14-byte
 /// `FF 25 00000000` + `dq target_va` rip-indirect form.
@@ -126,5 +146,38 @@ mod tests {
         assert_eq!(out.len(), 14);
         assert_eq!(&out[..2], &[0xFF, 0x25]);
         assert_eq!(&out[6..], &0x1_0000_0000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn relocate_with_offsets_retargets_dispatch() {
+        let bytes = [
+            0x83, 0xE1, 0x03, // and ecx,3
+            0x48, 0x8D, 0x15, 0xF6, 0x0F, 0x00, 0x00, // lea rdx,[rip+0xff6]
+            0x48, 0x63, 0x0C, 0x8A, // movsxd rcx,[rdx+rcx*4]
+            0x48, 0x01, 0xD1, // add rcx,rdx
+            0xFF, 0xE1, // jmp rcx
+        ];
+        let mut instrs = decode(&bytes, 0x1_4000_1000);
+        assert_eq!(instrs.len(), 5);
+        assert_eq!(instrs[1].mnemonic(), Mnemonic::Lea);
+
+        let new_va = 0x1_4020_0000;
+        let new_table_va = new_va + 0x4000;
+        instrs[1].set_memory_displacement64(new_table_va);
+
+        let (code, offs) = relocate_with_offsets(&instrs, new_va).unwrap();
+        assert_eq!(offs.len(), 5);
+        assert!(offs.iter().all(|&o| o != u32::MAX));
+        assert!(offs.windows(2).all(|w| w[0] <= w[1]));
+
+        let mut decoder = Decoder::with_ip(
+            64,
+            &code[offs[1] as usize..],
+            new_va + offs[1] as u64,
+            DecoderOptions::NONE,
+        );
+        let lea = decoder.decode();
+        assert_eq!(lea.mnemonic(), Mnemonic::Lea);
+        assert_eq!(lea.memory_displacement64(), new_table_va);
     }
 }

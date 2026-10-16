@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
-use kamy_core::{BasicBlock, Function, Module, Rva, Terminator};
+use kamy_core::{BasicBlock, Function, Module, Rva, SwitchTable, Terminator};
 
 use crate::branch::branch_target;
 use crate::to_in_exec_rva;
@@ -64,57 +64,114 @@ pub(crate) fn recover_impl(
         .copied()
         .unwrap_or(u32::MAX);
 
+    // Drain the worklist, decoding each pending run into fresh blocks. Reused
+    // for the initial pass and every switch fixpoint round below.
+    let drain = |instrs: &mut BTreeMap<u32, InstrRecord>,
+                 leaders: &mut BTreeSet<u32>,
+                 worklist: &mut Vec<u32>,
+                 calls: &mut Vec<Rva>,
+                 seen_calls: &mut BTreeSet<u32>| {
+        while let Some(start) = worklist.pop() {
+            decode_run(
+                module,
+                entry.get(),
+                start,
+                instrs,
+                leaders,
+                worklist,
+                calls,
+                seen_calls,
+                function_starts,
+                noreturn_slots,
+                limit,
+            );
+        }
+    };
+
     leaders.insert(entry.get());
     let mut worklist = vec![entry.get()];
-    while let Some(start) = worklist.pop() {
-        decode_run(
-            module,
-            entry.get(),
-            start,
-            &mut instrs,
-            &mut leaders,
-            &mut worklist,
-            &mut calls,
-            &mut seen_calls,
-            function_starts,
-            noreturn_slots,
-            limit,
-        );
+    drain(
+        &mut instrs,
+        &mut leaders,
+        &mut worklist,
+        &mut calls,
+        &mut seen_calls,
+    );
+
+    // D24 layer 2: recover jump tables (research.md §10.5) and materialize their
+    // case bodies as real blocks. Newly decoded bodies can expose further
+    // dispatches, so iterate to a fixpoint (capped) seeding each distinct case.
+    let mut resolved: BTreeMap<u32, SwitchTable> = BTreeMap::new();
+    let needs_switch = build_blocks(&instrs, &leaders)
+        .iter()
+        .any(|b| matches!(b.terminator, Terminator::Indirect { slot: None }));
+    if needs_switch {
+        let lo = entry.get();
+        let section_end = module
+            .section_at(entry)
+            .map_or(u32::MAX, |s| s.rva.get().saturating_add(s.virtual_size));
+        let hi = limit.min(section_end);
+        for _ in 0..16 {
+            let tmp = Function {
+                entry,
+                blocks: build_blocks(&instrs, &leaders),
+            };
+            let insns = crate::instrs::function_instructions(module, &tmp);
+            let mut new_dispatch = false;
+            for (jmp_end, table) in crate::jumptable::detect_switch(module, &insns, lo, hi) {
+                if resolved.contains_key(&jmp_end) {
+                    continue;
+                }
+                new_dispatch = true;
+                let mut distinct = BTreeSet::new();
+                for t in &table.entries {
+                    let r = t.get();
+                    // Never seed past the function boundary (§10.2 runaway bound).
+                    if r >= limit || !distinct.insert(r) {
+                        continue;
+                    }
+                    leaders.insert(r);
+                    if !instrs.contains_key(&r) {
+                        worklist.push(r);
+                    }
+                }
+                resolved.insert(jmp_end, table);
+            }
+            if !new_dispatch {
+                break;
+            }
+            drain(
+                &mut instrs,
+                &mut leaders,
+                &mut worklist,
+                &mut calls,
+                &mut seen_calls,
+            );
+        }
     }
 
     let blocks = build_blocks(&instrs, &leaders);
     let mut func = Function { entry, blocks };
-    recover_switches(module, &mut func, limit);
-    (func, calls)
-}
-
-/// D24 layer 2: for each unresolved `jmp reg` block, try to recover its jump
-/// table (research.md §10.5) and replace the terminator with `Switch`.
-fn recover_switches(module: &Module, func: &mut Function, limit: u32) {
-    let has_reg_indirect = func
-        .blocks
-        .iter()
-        .any(|b| matches!(b.terminator, Terminator::Indirect { slot: None }));
-    if !has_reg_indirect {
-        return;
-    }
-    let lo = func.entry.get();
-    let section_end = module
-        .section_at(func.entry)
-        .map_or(u32::MAX, |s| s.rva.get().saturating_add(s.virtual_size));
-    let hi = limit.min(section_end);
-
-    let insns = crate::instrs::function_instructions(module, func);
-    let Some((jmp_end, targets)) = crate::jumptable::detect_switch(module, &insns, lo, hi) else {
-        return;
-    };
-    for b in &mut func.blocks {
-        if b.end.get() == jmp_end && matches!(b.terminator, Terminator::Indirect { slot: None }) {
-            b.terminator = Terminator::Switch {
-                targets: targets.clone(),
-            };
+    for (jmp_end, table) in &resolved {
+        for b in &mut func.blocks {
+            if b.end.get() == *jmp_end
+                && matches!(b.terminator, Terminator::Indirect { slot: None })
+            {
+                let mut successors = Vec::new();
+                let mut seen = BTreeSet::new();
+                for t in &table.entries {
+                    if seen.insert(t.get()) {
+                        successors.push(*t);
+                    }
+                }
+                b.successors = successors;
+                b.terminator = Terminator::Switch {
+                    table: table.clone(),
+                };
+            }
         }
     }
+    (func, calls)
 }
 
 #[allow(clippy::too_many_arguments)]

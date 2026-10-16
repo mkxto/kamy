@@ -212,17 +212,19 @@ fn bound_count(instrs: &[Instruction], index: Register) -> Option<u64> {
     None
 }
 
-/// Attempt to recover a jump table from the function body `[lo, hi)`. Returns
-/// the exclusive end RVA of the dispatching `jmp reg` and the distinct case
-/// targets, or `None` when no confident, in-range, bounded match exists.
+/// Recover every confident jump table in the function body `[lo, hi)`. Each
+/// result pairs the exclusive end RVA of the dispatching `jmp reg` with the
+/// recovered `SwitchTable`; the Vec is empty when nothing recovers. Ambiguous
+/// or out-of-range matches are skipped individually — a guess is never emitted.
 pub(crate) fn detect_switch(
     module: &Module,
     instrs: &[Instruction],
     lo: u32,
     hi: u32,
-) -> Option<(u32, Vec<Rva>)> {
+) -> Vec<(u32, kamy_core::SwitchTable)> {
+    let mut out: Vec<(u32, kamy_core::SwitchTable)> = Vec::new();
     if !instrs.iter().any(is_indirect_reg_jmp) {
-        return None;
+        return out;
     }
     let dag = build_dag(instrs);
     let (pat, [p_lea, p_load, _p_add, p_jmp]) = template();
@@ -231,7 +233,9 @@ pub(crate) fn detect_switch(
     let mut em = |_: &(), _: &()| true;
     let pat_ref = &pat;
     let dag_ref = &dag.g;
-    let iters = subgraph_isomorphisms_iter(&pat_ref, &dag_ref, &mut nm, &mut em)?;
+    let Some(iters) = subgraph_isomorphisms_iter(&pat_ref, &dag_ref, &mut nm, &mut em) else {
+        return out;
+    };
 
     for map in iters {
         let lea = &instrs[dag.iidx[map[p_lea]]];
@@ -243,6 +247,7 @@ pub(crate) fn detect_switch(
         let base_va = lea.memory_displacement64();
         let table_va = base_va.wrapping_add(load.memory_displacement64());
         let signed = load.mnemonic() == Mnemonic::Movsxd;
+        let base_is_image = !signed;
         let Some(index) = gpr64(load.memory_index()) else {
             continue;
         };
@@ -250,6 +255,12 @@ pub(crate) fn detect_switch(
             continue;
         };
         if count == 0 || count > MAX_ENTRIES {
+            continue;
+        }
+
+        // MSVC module-base entries are measured from the image base; a base that
+        // is not the image base is ambiguous, so recover nothing for it.
+        if base_is_image && base_va != module.image_base {
             continue;
         }
 
@@ -262,13 +273,15 @@ pub(crate) fn detect_switch(
         let Some(data) = module.bytes_at(Rva::new(table_rva)) else {
             continue;
         };
-        let need = (count as usize).checked_mul(4)?;
+        let Some(need) = (count as usize).checked_mul(4) else {
+            continue;
+        };
         if data.len() < need {
             continue;
         }
 
-        let mut targets = Vec::with_capacity(count as usize);
-        let mut seen = std::collections::BTreeSet::new();
+        // Every slot in table order, duplicates preserved (`len == count`).
+        let mut entries = Vec::with_capacity(count as usize);
         let mut ok = true;
         for k in 0..count as usize {
             let o = k * 4;
@@ -290,18 +303,35 @@ pub(crate) fn detect_switch(
                 ok = false;
                 break;
             }
-            if seen.insert(tgt_rva) {
-                targets.push(Rva::new(tgt_rva));
-            }
+            entries.push(Rva::new(tgt_rva));
         }
-        if !ok || targets.is_empty() {
+        if !ok {
             continue;
         }
 
         let jmp_end = (jmp.ip() - module.image_base) as u32 + jmp.len() as u32;
-        return Some((jmp_end, targets));
+        // A dispatch may match several isomorphisms; keep the first valid table.
+        if out.iter().any(|(end, _)| *end == jmp_end) {
+            continue;
+        }
+
+        // LLVM retargets the `lea`; MSVC retargets the table load.
+        let dispatch = if base_is_image { load } else { lea };
+        let dispatch_rva = Rva::new((dispatch.ip() - module.image_base) as u32);
+
+        out.push((
+            jmp_end,
+            kamy_core::SwitchTable {
+                dispatch_rva,
+                table_rva: Rva::new(table_rva),
+                base_va,
+                base_is_image,
+                count: count as u32,
+                entries,
+            },
+        ));
     }
-    None
+    out
 }
 
 #[cfg(test)]
@@ -358,10 +388,15 @@ mod tests {
             0x48, 0x01, 0xD1, 0xFF, 0xE1,
         ];
         let m = module_with_table(0x2000, TABLE.to_vec());
-        let (jmp_end, targets) = detect_switch(&m, &decode(&code), 0x1000, 0x1100).unwrap();
-        assert_eq!(jmp_end, 0x1013);
-        let mut got: Vec<u32> = targets.iter().map(|r| r.get()).collect();
+        let tables = detect_switch(&m, &decode(&code), 0x1000, 0x1100);
+        assert_eq!(tables.len(), 1);
+        let (jmp_end, table) = &tables[0];
+        assert_eq!(*jmp_end, 0x1013);
+        assert_eq!(table.entries.len() as u32, table.count);
+        assert!(!table.base_is_image);
+        let mut got: Vec<u32> = table.entries.iter().map(|r| r.get()).collect();
         got.sort_unstable();
+        got.dedup();
         assert_eq!(got, EXPECT);
     }
 
@@ -373,10 +408,39 @@ mod tests {
             0x48, 0x01, 0xD1, 0xFF, 0xE1,
         ];
         let m = module_with_table(0x2000, TABLE.to_vec());
-        let (_, targets) = detect_switch(&m, &decode(&code), 0x1000, 0x1100).unwrap();
-        let mut got: Vec<u32> = targets.iter().map(|r| r.get()).collect();
+        let tables = detect_switch(&m, &decode(&code), 0x1000, 0x1100);
+        assert_eq!(tables.len(), 1);
+        let (_, table) = &tables[0];
+        assert_eq!(table.entries.len() as u32, table.count);
+        assert!(!table.base_is_image);
+        let mut got: Vec<u32> = table.entries.iter().map(|r| r.get()).collect();
         got.sort_unstable();
+        got.dedup();
         assert_eq!(got, EXPECT);
+    }
+
+    #[test]
+    fn preserves_duplicate_entries() {
+        // same mask-bounded dispatch; table slots repeat two targets: t0,t1,t0,t1
+        let code = [
+            0x83, 0xE1, 0x03, 0x48, 0x8D, 0x15, 0xF6, 0x0F, 0x00, 0x00, 0x48, 0x63, 0x0C, 0x8A,
+            0x48, 0x01, 0xD1, 0xFF, 0xE1,
+        ];
+        let dup = vec![
+            0x13, 0xF0, 0xFF, 0xFF, 0x18, 0xF0, 0xFF, 0xFF, 0x13, 0xF0, 0xFF, 0xFF, 0x18, 0xF0,
+            0xFF, 0xFF,
+        ];
+        let m = module_with_table(0x2000, dup);
+        let tables = detect_switch(&m, &decode(&code), 0x1000, 0x1100);
+        assert_eq!(tables.len(), 1);
+        let (_, table) = &tables[0];
+        assert_eq!(table.count, 4);
+        let got: Vec<u32> = table.entries.iter().map(|r| r.get()).collect();
+        assert_eq!(got, [0x1013, 0x1018, 0x1013, 0x1018]);
+        let mut distinct = got.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct, [0x1013, 0x1018]);
     }
 
     #[test]
@@ -387,7 +451,7 @@ mod tests {
             0xFF, 0xE1,
         ];
         let m = module_with_table(0x2000, TABLE.to_vec());
-        assert!(detect_switch(&m, &decode(&code), 0x1000, 0x1100).is_none());
+        assert!(detect_switch(&m, &decode(&code), 0x1000, 0x1100).is_empty());
     }
 
     #[test]
@@ -398,6 +462,6 @@ mod tests {
             0x48, 0x01, 0xD1, 0xFF, 0xE1,
         ];
         let m = module_with_table(0x2000, TABLE.to_vec());
-        assert!(detect_switch(&m, &decode(&code), 0x1000, 0x1010).is_none());
+        assert!(detect_switch(&m, &decode(&code), 0x1000, 0x1010).is_empty());
     }
 }
