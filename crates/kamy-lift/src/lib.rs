@@ -128,7 +128,7 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
                     builder.set_terminator(IrTerminator::Unreachable);
                 }
             }
-            Terminator::Indirect | Terminator::Unknown => {
+            Terminator::Indirect { .. } | Terminator::Unknown => {
                 builder.set_terminator(IrTerminator::Unreachable);
             }
         }

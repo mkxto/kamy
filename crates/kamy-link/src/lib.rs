@@ -151,6 +151,8 @@ fn protect_inner(
     let base = module.image_base;
     let code_rva = pe.next_section_rva().get();
     let runtime_fns = pe.runtime_functions();
+    let import_slots: std::collections::HashSet<u32> =
+        pe.import_slots().iter().map(|r| r.get()).collect();
 
     let mut report = Report {
         moved: Vec::new(),
@@ -164,7 +166,7 @@ fn protect_inner(
     ordered.sort_by_key(|f| f.entry.get());
 
     for func in ordered {
-        match classify(module, func, &runtime_fns) {
+        match classify(module, func, &runtime_fns, &import_slots) {
             Ok(cand) => {
                 pad_to_align(&mut code, FUNCTION_ALIGN);
                 let new_rva = code_rva + code.len() as u32;
@@ -265,6 +267,7 @@ fn classify(
     module: &Module,
     func: &Function,
     runtime_fns: &[kamy_pe::RuntimeFunction],
+    import_slots: &std::collections::HashSet<u32>,
 ) -> Result<Candidate, Option<RejectionReason>> {
     let entry = func.entry;
     if !module.is_executable(entry) {
@@ -280,8 +283,18 @@ fn classify(
 
     use kamy_core::Terminator::{Indirect, Unknown};
     for b in &func.blocks {
-        match b.terminator {
-            Indirect => return Err(Some(RejectionReason::BadIndirectBranch)),
+        match &b.terminator {
+            // D24 layer 0: `jmp [rip+slot]` is statically resolvable, not a
+            // computed branch. An IAT slot is an import/forwarder thunk — never
+            // a protection target, so skip it. Any other in-image slot is a
+            // recoverable tail-call pending direct-ification.
+            Indirect { slot: Some(s) } => {
+                if import_slots.contains(&s.get()) {
+                    return Err(None);
+                }
+                return Err(Some(RejectionReason::ResolvableIndirect));
+            }
+            Indirect { slot: None } => return Err(Some(RejectionReason::BadIndirectBranch)),
             Unknown => return Err(Some(RejectionReason::LiftFailure)),
             _ => {}
         }

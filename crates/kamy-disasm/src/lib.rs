@@ -110,6 +110,28 @@ mod tests {
     }
 
     #[test]
+    fn indirect_slot_classification() {
+        // 0x1000: FF 25 FA 04 00 00   jmp qword [rip+0x4fa] -> slot VA base+0x1500
+        let rip_rel = recover_function(
+            &exec_module(vec![0xFF, 0x25, 0xFA, 0x04, 0x00, 0x00]),
+            Rva::new(TEXT_RVA),
+        );
+        assert_eq!(
+            rip_rel.blocks[0].terminator,
+            Terminator::Indirect {
+                slot: Some(Rva::new(0x1500))
+            }
+        );
+
+        // 0x1000: FF E0   jmp rax -> register dispatch, no static slot
+        let reg = recover_function(&exec_module(vec![0xFF, 0xE0]), Rva::new(TEXT_RVA));
+        assert_eq!(
+            reg.blocks[0].terminator,
+            Terminator::Indirect { slot: None }
+        );
+    }
+
+    #[test]
     fn discover_follows_call() {
         // 0x1000: E8 0A000000  call +0x0A  -> 0x100F
         // 0x1005: C3           ret

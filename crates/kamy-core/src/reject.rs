@@ -8,8 +8,14 @@ use std::fmt;
 pub enum RejectionReason {
     /// Original function too small to host a thunk (< 5 bytes).
     NoThunkSpace,
-    /// Unresolvable indirect jump that matched no known jump-table pattern.
+    /// Unresolvable indirect jump: register or table-indexed dispatch that
+    /// matched no known jump-table pattern.
     BadIndirectBranch,
+    /// Indirect jump through a statically-known in-image pointer slot
+    /// (`jmp qword [rip+disp]`). Recoverable, but the direct-ification rewrite
+    /// is not yet implemented (D24 layer 0). Import/forwarder thunks are
+    /// skipped, not rejected under this reason.
+    ResolvableIndirect,
     /// Instruction the lifter can neither model nor safely pass through verbatim.
     UnsupportedInstruction,
     /// Lifter error such as malformed code or data-in-code confusion.
@@ -32,6 +38,7 @@ impl RejectionReason {
         match self {
             Self::NoThunkSpace => "NoThunkSpace",
             Self::BadIndirectBranch => "BadIndirectBranch",
+            Self::ResolvableIndirect => "ResolvableIndirect",
             Self::UnsupportedInstruction => "UnsupportedInstruction",
             Self::LiftFailure => "LiftFailure",
             Self::SehComplex => "SEHComplex",

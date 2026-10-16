@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use kamy_core::{BasicBlock, Function, Module, Rva, Terminator};
 
 use crate::branch::branch_target;
@@ -10,7 +10,7 @@ enum EndKind {
     Normal,
     Return,
     Jump(u32),
-    Indirect,
+    Indirect(Option<Rva>),
     Branch { taken: u32, not_taken: u32 },
     Unknown,
 }
@@ -149,7 +149,7 @@ fn classify(
                 None => EndKind::Unknown,
             }
         }
-        FlowControl::IndirectBranch => EndKind::Indirect,
+        FlowControl::IndirectBranch => EndKind::Indirect(static_slot(module, instr)),
         FlowControl::Return => EndKind::Return,
         FlowControl::Interrupt => match instr.mnemonic() {
             Mnemonic::Iret | Mnemonic::Iretd | Mnemonic::Iretq => EndKind::Return,
@@ -158,6 +158,26 @@ fn classify(
         FlowControl::Exception => EndKind::Unknown,
         FlowControl::XbeginXabortXend => EndKind::Normal,
     }
+}
+
+/// Resolve `jmp qword [rip+disp]` / `jmp qword [abs]` to its fixed pointer-slot
+/// RVA (D24 layer 0). Returns `None` for register dispatch, base-register or
+/// table-indexed memory operands, and slots that fall outside the image — those
+/// carry no statically known pointer. iced folds a RIP-relative displacement
+/// into the absolute target, so `memory_displacement64` is the slot VA.
+fn static_slot(module: &Module, instr: &Instruction) -> Option<Rva> {
+    if instr.op0_kind() != OpKind::Memory || instr.memory_index() != Register::None {
+        return None;
+    }
+    match instr.memory_base() {
+        Register::RIP | Register::None => {}
+        _ => return None,
+    }
+    let rva = instr
+        .memory_displacement64()
+        .checked_sub(module.image_base)?;
+    let rva = Rva::new(u32::try_from(rva).ok()?);
+    module.section_at(rva).map(|_| rva)
 }
 
 fn build_blocks(instrs: &BTreeMap<u32, InstrRecord>, leaders: &BTreeSet<u32>) -> Vec<BasicBlock> {
@@ -188,7 +208,13 @@ fn build_blocks(instrs: &BTreeMap<u32, InstrRecord>, leaders: &BTreeSet<u32>) ->
                     break (Terminator::Unknown, Rva::new(next), Vec::new());
                 }
                 EndKind::Return => break (Terminator::Return, Rva::new(rec.end), Vec::new()),
-                EndKind::Indirect => break (Terminator::Indirect, Rva::new(rec.end), Vec::new()),
+                EndKind::Indirect(slot) => {
+                    break (
+                        Terminator::Indirect { slot: *slot },
+                        Rva::new(rec.end),
+                        Vec::new(),
+                    );
+                }
                 EndKind::Jump(target) => {
                     break (
                         Terminator::Jump(Rva::new(*target)),

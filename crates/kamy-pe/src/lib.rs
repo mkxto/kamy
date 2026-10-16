@@ -240,6 +240,12 @@ impl PeFile {
             .collect()
     }
 
+    /// IAT slot RVAs for every imported symbol — the targets of import and
+    /// forwarder `jmp qword [rip+iat]` thunks (D24 layer 0 classification).
+    pub fn import_slots(&self) -> Vec<Rva> {
+        self.imports.iter().map(|i| Rva::new(i.iat_rva)).collect()
+    }
+
     /// Data-directory index of the exception (`.pdata`) table.
     pub const EXCEPTION_DIRECTORY: usize = DIR_EXCEPTION;
 

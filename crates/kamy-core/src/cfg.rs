@@ -25,8 +25,15 @@ pub enum Terminator {
         not_taken: Rva,
     },
     Return,
-    /// Computed branch not resolved during discovery (e.g. a jump table).
-    Indirect,
+    /// Computed branch not resolved during discovery.
+    ///
+    /// `slot` is `Some(rva)` for `jmp qword [rip+disp]` / `jmp qword [abs]` —
+    /// the fixed pointer-slot RVA, statically known (import thunk or in-image
+    /// function pointer, D24 layer 0). `None` for register or table-indexed
+    /// dispatch, which carries no static slot.
+    Indirect {
+        slot: Option<Rva>,
+    },
     /// Decode failed or control left the known address space.
     Unknown,
 }
