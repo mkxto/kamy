@@ -69,11 +69,13 @@ Living document. Updated as work lands.
    ranges — and treat `jmp` to a known start as a tail call. Measured: kernel32
    max span 478 KiB → 17.7 KiB (oversized >16 KiB: 17 → 1), target.exe 84 KiB →
    2.9 KiB (19 → 0); `moved` rose (kernel32 1214 → 1271, target 169 → 197) as
-   mis-`SEHComplex` functions reclassified. Residual: a handful of phantom
-   call-seeds still land inside real code (target 2, kernel32 1); eliminating
-   them needs noreturn tracking (post-noreturn-call bytes decoded as fallthrough
-   now truncate to a `LiftFailure` reject instead of corrupting). See
-   research.md §10.2.
+   mis-`SEHComplex` functions reclassified. Noreturn tracking followed: a trap
+   (`ud2`, `int`) or a call through a known-noreturn import slot now ends the
+   block, so over-decoded fallthrough no longer truncates to `LiftFailure`
+   (target 94 → 71, kernel32 20 → 17; `moved` 197 → 202 / 1271 → 1274). Residual:
+   2–3 phantom call-seeds still land inside real code via data-in-code, not
+   over-decode — a local-noreturn fixpoint / data-in-code handling is the
+   remaining lever. See research.md §10.2.
 
 ## Phase 3 — SEH & CET (D31: correctness before obfuscation)
 
@@ -141,10 +143,10 @@ inspect the init callbacks at `.rdata` 0x27f0.
 
 | Binary | Moved | Rejected | Rate | Top rejection |
 |--------|-------|----------|------|---------------|
-| target.exe (Rust) | 197 | 152 | 56.4% | LiftFailure (94) |
-| kernel32.dll | 1271 | 438 | 74.4% | SEHComplex (396) |
+| target.exe (Rust) | 202 | 147 | 57.9% | LiftFailure (71) |
+| kernel32.dll | 1274 | 435 | 74.5% | SEHComplex (396) |
 
-Two correctness fixes landed since the §10 study.
+Three correctness fixes landed since the §10 study.
 
 **D24 layer 0** (`jmp [rip+slot]` classification): kernel32 `BadIndirectBranch`
 922 → **9** (genuine register/indexed dispatch only) plus `ResolvableIndirect`
@@ -153,14 +155,16 @@ thunks are **skipped** (not protection targets). target.exe `BadIndirectBranch`
 114 → **30**; `jmp [__imp_…]` import thunks skipped (exact IAT-slot membership
 is finer than §10.2's coarse ".rdata window" bucket).
 
-**Runaway-recovery fix** (known bug #6): bounding recovery at the next
-`.pdata`/export/entry start removed the 478 KiB phantom spans, so `moved` rose
-(kernel32 1214 → 1271, target 169 → 197) as functions previously mis-flagged
-`SEHComplex` reclassified; post-noreturn fallthrough now truncates to a
-conservative `LiftFailure` instead of swallowing the next function. target.exe
-round-trip still reproduces `acc=0x97a61ac866cf61c7` (exit 7) after both fixes.
+**Runaway-recovery + noreturn fix** (known bug #6): bounding recovery at the next
+`.pdata`/export/entry start removed the 478 KiB phantom spans, and traps
+(`ud2`/`int`) plus known-noreturn import calls now end the block. `moved` rose
+(kernel32 1214 → 1274, target 169 → 202) as functions previously mis-flagged
+`SEHComplex` reclassified and over-decoded tails stopped truncating to
+`LiftFailure` (target 94 → 71, kernel32 20 → 17). target.exe round-trip still
+reproduces `acc=0x97a61ac866cf61c7` (exit 7) after all three fixes.
 
-Remaining D24 order: residual phantom call-seeds / noreturn tracking → layer 2
-(use-def DAG + petgraph VF2) for the residual `BadIndirectBranch`.
+Remaining D24 order: residual data-in-code phantom seeds / local-noreturn
+fixpoint → layer 2 (use-def DAG + petgraph VF2) for the residual
+`BadIndirectBranch`.
 
 Jump table recovery (D24) is the #1 coverage improvement.

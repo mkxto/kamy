@@ -368,9 +368,12 @@ counts and falsely tripping `SEHComplex`. Fix: bound each function's recovery at
 the next `.pdata`/export/entry start (these partition x64 code into
 non-overlapping ranges) and treat `jmp` to a known start as a tail call. Spans
 collapsed (kernel32 478 KiB → 17.7 KiB, target 84 KiB → 2.9 KiB) and `moved`
-rose (kernel32 1214 → 1271, target 169 → 197). A residual handful of phantom
-call-seeds still land inside real code; removing them needs noreturn tracking
-(post-noreturn bytes currently truncate to a conservative `LiftFailure`).
+rose (kernel32 1214 → 1271, target 169 → 197). Noreturn tracking followed: a
+trap (`ud2`, `int`) or a call through a known-noreturn import slot ends the
+block, so over-decoded fallthrough no longer truncates to `LiftFailure` (target
+94 → 71, kernel32 20 → 17; `moved` 197 → 202 / 1271 → 1274). The residual 2–3
+phantom seeds reach real code via data-in-code, not over-decode — a
+local-noreturn fixpoint / data-in-code pass is the remaining lever.
 
 ### 10.3 The canonical recoverable shape (both compilers)
 
@@ -407,8 +410,10 @@ bounds) and register-value analysis for masked forms.
    target.exe static-pointers). `moved` set correct on both.
 2. **Fix runaway recovery / phantom seeds in discovery** — **DONE** (dominant
    mechanism). Recovery is bounded at the next `.pdata`/export/entry start (see
-   §10.2); the 478 KiB phantom spans are gone and `moved` rose. Residual phantom
-   call-seeds inside real code need noreturn tracking (follow-up).
+   §10.2); the 478 KiB phantom spans are gone, traps and known-noreturn import
+   calls end blocks (`LiftFailure` target 94 → 71, kernel32 20 → 17), and
+   `moved` rose (target 169 → 202, kernel32 1214 → 1274). Residual 2–3
+   data-in-code phantom seeds remain; a local-noreturn fixpoint is the follow-up.
 3. **Layer 2 — canonical switch pattern** with entry-count + .pdata
    bounds cross-check, reject on ambiguity (D24 unchanged).
 4. **Layer 3 — masked-table register analysis** (narrow; only real user is
