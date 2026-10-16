@@ -419,15 +419,28 @@ bounds) and register-value analysis for masked forms.
    count from the index bound (`cmp imm`+1 or mask `2^k`; unbounded → reject),
    parses the table (table-relative i32 deltas for LLVM, module-base RVAs for
    MSVC), and cross-checks every target against the recovered function range.
-   On a match the block becomes `Terminator::Switch { targets }` and the linker
-   reports `RecoverableSwitch`. Measured: `BadIndirectBranch` kernel32 9 → 6,
+   On a match the block becomes `Terminator::Switch { table }` (ordered entries,
+   addressing form, dispatch instruction) and recovery materializes the case
+   bodies as blocks. Measured: `BadIndirectBranch` kernel32 9 → 6,
    target.exe 30 → 19; switch fixture recovers 16/16 cases exactly. The `and`
    mask (layer 3) variant is handled by the same bound logic (count `2^k`), so
    no separate layer 3 pass is needed yet.
-   **Phase B — re-emit/retarget (NOT done):** moving a switch needs the table
-   recomputed for the new layout and the dispatch redirected to it (§10.5
-   L458-461, BLARE2's documented gap). Until then switch functions stay in place
-   and `moved` does not rise.
+   **Phase B — re-emit/retarget (DONE).** The linker re-emits each table into a
+   read-only `.kamytb` section placed before the moved code (new table VA known
+   pre-relocation) and retargets the dispatch operand — LLVM `lea`→new table VA,
+   MSVC `mov` disp→new table RVA — overriding `BlockEncoder`'s RIP fixup via
+   `set_memory_displacement64`. Entries are recomputed from an original→new
+   address map built from `BlockEncoder`'s returned instruction offsets (LLVM
+   signed i32 delta, MSVC image RVA); any unmapped target, rewritten
+   instruction, or i32 overflow keeps the function rejected (reject-on-ambiguity,
+   closing BLARE2's documented gap, §10.5 L458-461). Runtime-verified: `sw.prot`
+   exit 34, target round-trip `acc=0x97a61ac866cf61c7` exit 7; kernel32 MSVC form
+   (incl. one function with four tables) rebuilds with consistent `.pdata`.
+   `RecoverableSwitch` → 0, but `moved` rises only modestly (target 202→203,
+   kernel32 1274→1276, `sw` +2) because most recovered-switch functions carry
+   orthogonal **out-of-scope** blockers: SEH unwind (`SEHComplex`, D31), a
+   noreturn/data-in-code tail leaving an `Unknown` block (`LiftFailure`, the
+   §10.2 residual), or a genuine second register dispatch (`BadIndirectBranch`).
 
 Dynamic vtable tail-calls remain honest rejections — protecting them is
 runtime-tier (Phase 7) territory, not static recovery.

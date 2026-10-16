@@ -95,7 +95,7 @@ Living document. Updated as work lands.
 | MutationEngine | Not started |
 | LoopEncodeSemantics | Not started (underspecified — needs design) |
 | Per-function config profiles + symbol matching | Not started |
-| Jump table recovery & retargeting (D24) | Layers 0 + 2-detection done | Layer 0: `jmp [rip+slot]` classified at discovery; link skips import thunks, reports in-image static-ptr as `ResolvableIndirect`. Layer 2: per-function use-def DAG + petgraph VF2 (research.md §10.5) recovers the dispatch table (bound-or-reject, in-range cross-check) and tags `Terminator::Switch`; link reports `RecoverableSwitch`. Measured: `BadIndirectBranch` kernel32 922→6, target.exe 114→19; recovered switches kernel32 3, target.exe 11 (fixture: 16/16 cases exact). **Not done — Phase B:** re-emit/retarget a moved table (BLARE2's documented gap, §10.5 L458-461), so switch functions stay in place (not moved) |
+| Jump table recovery & retargeting (D24) | Layers 0 + 2 (detect + **retarget**) done | Layer 0: `jmp [rip+slot]` classified at discovery; link skips import thunks, reports in-image static-ptr as `ResolvableIndirect`. Layer 2 detect: per-function use-def DAG + petgraph VF2 (research.md §10.5) recovers the table (bound-or-reject, in-range cross-check) and tags `Terminator::Switch`. **Phase B (retarget):** recovery materializes case bodies as blocks; the linker re-emits each table into a read-only `.kamytb` section and retargets the dispatch (LLVM `lea`→new table VA; MSVC `mov` disp→new table RVA), overriding `BlockEncoder`'s RIP fixup via an original→new address map from the encoder's instruction offsets. Runtime-verified: the `sw` fixture dispatch moves and `sw.prot` prints `acc=0xade56742d39ef7e2` (exit 34); target round-trip `acc=0x97a61ac866cf61c7` (exit 7); kernel32 MSVC form (incl. a 4-table function) rebuilds. `RecoverableSwitch`→0. Coverage rises modestly (target 202→203, kernel32 1274→1276, `sw` +2) because most recovered-switch functions carry orthogonal **out-of-scope** blockers — SEH unwind (`SEHComplex`, D31), noreturn/data-in-code tails (`LiftFailure`, §10.2 residual), or a genuine second register dispatch (`BadIndirectBranch`). |
 | Trampoline stub obfuscation (D29: flavor diversification + junk fill + direct-call re-pointing) | Not started |
 
 ## Phase 5 — Advanced Passes
@@ -143,8 +143,8 @@ inspect the init callbacks at `.rdata` 0x27f0.
 
 | Binary | Moved | Rejected | Rate | Top rejection |
 |--------|-------|----------|------|---------------|
-| target.exe (Rust) | 202 | 147 | 57.9% | LiftFailure (71) |
-| kernel32.dll | 1274 | 435 | 74.5% | SEHComplex (396) |
+| target.exe (Rust) | 203 | 146 | 58.2% | LiftFailure (77) |
+| kernel32.dll | 1276 | 433 | 74.7% | SEHComplex (396) |
 
 Three correctness fixes landed since the §10 study.
 
@@ -163,20 +163,32 @@ is finer than §10.2's coarse ".rdata window" bucket).
 `LiftFailure` (target 94 → 71, kernel32 20 → 17). target.exe round-trip still
 reproduces `acc=0x97a61ac866cf61c7` (exit 7) after all three fixes.
 
-**D24 layer 2 detection** (use-def DAG + petgraph VF2, research.md §10.5):
-recovers the dispatch table and tags `Terminator::Switch`; the linker reports
-`RecoverableSwitch` instead of `BadIndirectBranch`. `BadIndirectBranch` dropped
-further (kernel32 9 → **6**, target.exe 30 → **19**); recovered switches
-(kernel32 3, target.exe 11) are reclassified, not moved. On the runnable switch
-fixture all 16 cases are recovered exactly, and the protected fixture still
-reproduces `acc=0xade56742d39ef7e2` (exit 34). Reclassification is
-non-destructive: switch functions are rejected (not moved), so a mismatch could
-only mislabel a reject reason, never produce a wrong binary. `moved` is
-unchanged — coverage does not rise without Phase B.
+**D24 layer 2 (detect + retarget)** (use-def DAG + petgraph VF2, research.md
+§10.5): recovery matches the dispatch, derives the bounded entry count, parses
+the ordered table (duplicates preserved), and **materializes the case bodies as
+blocks** so a switch function relocates as one unit. `BadIndirectBranch` dropped
+(kernel32 9 → **6**, target.exe 30 → **19**). On the runnable fixture all 16
+cases recover exactly and `sw.prot` reproduces `acc=0xade56742d39ef7e2` (exit 34).
 
-**Not done — layer 2 Phase B (retarget):** moving a switch function needs the
-table re-emitted with recomputed deltas/RVAs and the dispatch `lea` redirected
-to the new table (overriding `BlockEncoder`'s RIP fixup), plus an
-original→new RVA map and runtime verification across all cases. This is the gap
-BLARE2 does not document (§10.5 L458-461); until it lands, switch functions stay
-in place and D24 does not improve `moved`.
+**Phase B — retarget (landed).** The linker re-emits each recovered table into a
+read-only `.kamytb` section laid out *before* the moved code (so the new table
+VA is known pre-relocation) and redirects the dispatch operand — LLVM `lea` →
+new table VA, MSVC `mov` displacement → new table RVA — overriding
+`BlockEncoder`'s RIP auto-fixup. Entries are recomputed per form (LLVM signed
+i32 delta `new_target_va - new_table_va`; MSVC `new_target_rva`) from an
+original→new address map built out of `BlockEncoder`'s returned instruction
+offsets; any unmapped target, rewritten-instruction offset, or i32 overflow
+keeps the function rejected (`RecoverableSwitch`, reject-on-ambiguity, D24/§10.5).
+Runtime-verified: both round-trips reproduce their accumulators (`sw` exit 34,
+target `acc=0x97a61ac866cf61c7` exit 7); the kernel32 MSVC form (including a
+single function carrying four tables) rebuilds and re-parses with a consistent
+`.pdata` (not executed here — DLL).
+
+`RecoverableSwitch` is now **0** on all three binaries, but `moved` rises only
+modestly (target 202 → **203**, kernel32 1274 → **1276**, `sw` +2 including the
+fixture dispatch). Only recovered-switch functions with no other blocker move;
+the rest reject under their *true* reason, each **out of scope for Phase B**: SEH
+unwind info (`SEHComplex`, needs D31 UNWIND reconstruction), a noreturn/
+data-in-code tail that leaves an `Unknown` block (`LiftFailure`, the §10.2
+local-noreturn residual), or a genuine second register dispatch
+(`BadIndirectBranch`). Lifting those is future work, not a retarget defect.

@@ -1,13 +1,12 @@
 //! Relocating linker: move selected functions into a new section, leave a thunk
 //! at each original entry, scrub the vacated body, and rebuild the PE.
 
-use std::collections::HashMap;
-
-use kamy_codegen::{relocate, thunk};
+use kamy_codegen::{relocate, relocate_with_offsets, thunk};
 use kamy_core::ir::{CallingConvLookup, IrFunction};
 use kamy_core::{Function, Module, RejectionReason, Rva, SectionFlags};
 use kamy_disasm::function_instructions;
 use kamy_pe::{BytePatch, DirectoryUpdate, NewSection, PeEdits, PeFile};
+use std::collections::HashMap;
 
 const ENDBR64: [u8; 4] = [0xF3, 0x0F, 0x1E, 0xFA];
 const INT3: u8 = 0xCC;
@@ -25,6 +24,7 @@ pub enum LinkError {
 pub struct Options {
     pub code_section: String,
     pub pdata_section: String,
+    pub table_section: String,
 }
 
 impl Default for Options {
@@ -32,6 +32,7 @@ impl Default for Options {
         Self {
             code_section: ".kamy".into(),
             pdata_section: ".kamypd".into(),
+            table_section: ".kamytb".into(),
         }
     }
 }
@@ -149,7 +150,8 @@ fn protect_inner(
     mut produce_body: impl FnMut(&Module, &Function, u64, u32) -> Result<Vec<u8>, LinkError>,
 ) -> Result<(Vec<u8>, Report), LinkError> {
     let base = module.image_base;
-    let code_rva = pe.next_section_rva().get();
+    let table_base_rva = pe.next_section_rva().get();
+    let sect_align = pe.section_alignment();
     let runtime_fns = pe.runtime_functions();
     let import_slots: std::collections::HashSet<u32> =
         pe.import_slots().iter().map(|r| r.get()).collect();
@@ -165,19 +167,57 @@ fn protect_inner(
     let mut ordered: Vec<&Function> = functions.iter().collect();
     ordered.sort_by_key(|f| f.entry.get());
 
+    // Pass 1: size the table section so the code base is fixed before any body
+    // is relocated — switch dispatches must point at the final table VAs.
+    let mut total_tables: u32 = 0;
+    for func in &ordered {
+        if let Ok(cand) = classify(module, func, &runtime_fns, &import_slots) {
+            for t in &cand.switches {
+                total_tables = total_tables.saturating_add(t.count.saturating_mul(4));
+            }
+        }
+    }
+    let code_rva = if total_tables > 0 {
+        align_up(table_base_rva.saturating_add(total_tables), sect_align)
+    } else {
+        table_base_rva
+    };
+    let mut tables: Vec<u8> = Vec::with_capacity(total_tables as usize);
+
     for func in ordered {
         match classify(module, func, &runtime_fns, &import_slots) {
             Ok(cand) => {
                 pad_to_align(&mut code, FUNCTION_ALIGN);
                 let new_rva = code_rva + code.len() as u32;
+                let new_va = base + u64::from(new_rva);
 
-                let body = match produce_body(module, func, base, new_rva) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        report
-                            .rejected
-                            .push((func.entry, RejectionReason::CodegenFailure));
-                        continue;
+                let body = if cand.switches.is_empty() {
+                    match produce_body(module, func, base, new_rva) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            report
+                                .rejected
+                                .push((func.entry, RejectionReason::CodegenFailure));
+                            continue;
+                        }
+                    }
+                } else {
+                    match build_switch_body(
+                        module,
+                        func,
+                        base,
+                        new_va,
+                        table_base_rva,
+                        &mut tables,
+                        &cand.switches,
+                    ) {
+                        Ok(b) => b,
+                        Err(()) => {
+                            report
+                                .rejected
+                                .push((func.entry, RejectionReason::RecoverableSwitch));
+                            continue;
+                        }
                     }
                 };
 
@@ -214,7 +254,21 @@ fn protect_inner(
     }
 
     let code_len = code.len() as u32;
-    let mut new_sections = vec![NewSection {
+    let mut new_sections: Vec<NewSection> = Vec::new();
+    if total_tables > 0 {
+        debug_assert_eq!(tables.len() as u32, total_tables);
+        new_sections.push(NewSection {
+            name: opts.table_section.clone(),
+            rva: Rva::new(table_base_rva),
+            flags: SectionFlags {
+                read: true,
+                write: false,
+                execute: false,
+            },
+            data: tables,
+        });
+    }
+    new_sections.push(NewSection {
         name: opts.code_section.clone(),
         rva: Rva::new(code_rva),
         flags: SectionFlags {
@@ -223,7 +277,7 @@ fn protect_inner(
             execute: true,
         },
         data: code,
-    }];
+    });
     let mut directories = Vec::new();
 
     if !runtime_fns.is_empty() {
@@ -261,6 +315,7 @@ struct Candidate {
     entry: Rva,
     end: u32,
     endbr: bool,
+    switches: Vec<kamy_core::SwitchTable>,
 }
 
 fn classify(
@@ -282,6 +337,7 @@ fn classify(
     let size = end.saturating_sub(entry.get());
 
     use kamy_core::Terminator::{Indirect, Switch, Unknown};
+    let mut switches = Vec::new();
     for b in &func.blocks {
         match &b.terminator {
             // D24 layer 0: `jmp [rip+slot]` is statically resolvable, not a
@@ -294,9 +350,9 @@ fn classify(
                 }
                 return Err(Some(RejectionReason::ResolvableIndirect));
             }
-            // D24 layer 2: table recovered, but moving needs retargeting which
-            // is not implemented — stay in place, not an unresolvable branch.
-            Switch { .. } => return Err(Some(RejectionReason::RecoverableSwitch)),
+            // D24 layer 2: table recovered — re-emit it and retarget the
+            // dispatch when the function moves (build_switch_body).
+            Switch { table } => switches.push(table.clone()),
             Indirect { slot: None } => return Err(Some(RejectionReason::BadIndirectBranch)),
             Unknown => return Err(Some(RejectionReason::LiftFailure)),
             _ => {}
@@ -328,7 +384,85 @@ fn classify(
         return Err(Some(RejectionReason::NoThunkSpace));
     }
 
-    Ok(Candidate { entry, end, endbr })
+    Ok(Candidate {
+        entry,
+        end,
+        endbr,
+        switches,
+    })
+}
+
+/// Encode one relocated table entry. LLVM table-relative: signed i32 delta from
+/// the new table VA. MSVC module-base: the target's new RVA. Err on i32 overflow
+/// or a target below the image base (reject-on-ambiguity, never emit a guess).
+fn encode_entry(
+    base: u64,
+    new_table_va: u64,
+    base_is_image: bool,
+    new_target_va: u64,
+) -> Result<[u8; 4], ()> {
+    if base_is_image {
+        let rva = u32::try_from(new_target_va.checked_sub(base).ok_or(())?).map_err(|_| ())?;
+        Ok(rva.to_le_bytes())
+    } else {
+        let delta = i32::try_from(new_target_va as i64 - new_table_va as i64).map_err(|_| ())?;
+        Ok(delta.to_le_bytes())
+    }
+}
+
+/// Relocate a switch function to `new_va`, retargeting each dispatch to a fresh
+/// table appended to `tables` (based at image `base + table_base_rva`). Returns
+/// the relocated body; the tables buffer is filled in place. Err (reject) if any
+/// dispatch instruction is missing, any case target has no stable new address,
+/// or an entry overflows — the caller then keeps the function in place.
+fn build_switch_body(
+    module: &Module,
+    func: &Function,
+    base: u64,
+    new_va: u64,
+    table_base_rva: u32,
+    tables: &mut Vec<u8>,
+    switches: &[kamy_core::SwitchTable],
+) -> Result<Vec<u8>, ()> {
+    let mut instrs = function_instructions(module, func);
+    // Reserve each table's slot and retarget its dispatch BEFORE relocating.
+    let mut plans: Vec<(usize, u64, &kamy_core::SwitchTable)> = Vec::new();
+    for t in switches {
+        let start = tables.len();
+        tables.extend(std::iter::repeat_n(0u8, t.count as usize * 4));
+        let table_rva = table_base_rva + start as u32;
+        let new_table_va = base + u64::from(table_rva);
+        let disp = if t.base_is_image {
+            u64::from(table_rva)
+        } else {
+            new_table_va
+        };
+        let ins = instrs
+            .iter_mut()
+            .find(|i| (i.ip().wrapping_sub(base)) as u32 == t.dispatch_rva.get())
+            .ok_or(())?;
+        ins.set_memory_displacement64(disp);
+        plans.push((start, new_table_va, t));
+    }
+    let (code, offsets) = relocate_with_offsets(&instrs, new_va).map_err(|_| ())?;
+    let mut map: HashMap<u32, u64> = HashMap::new();
+    for (i, ins) in instrs.iter().enumerate() {
+        if offsets[i] != u32::MAX {
+            map.insert(
+                (ins.ip().wrapping_sub(base)) as u32,
+                new_va + u64::from(offsets[i]),
+            );
+        }
+    }
+    for (start, new_table_va, t) in plans {
+        for (k, entry) in t.entries.iter().enumerate() {
+            let new_target_va = *map.get(&entry.get()).ok_or(())?;
+            let bytes = encode_entry(base, new_table_va, t.base_is_image, new_target_va)?;
+            let o = start + k * 4;
+            tables[o..o + 4].copy_from_slice(&bytes);
+        }
+    }
+    Ok(code)
 }
 
 fn entry_patch(base: u64, entry: u32, new_rva: u32, endbr: bool) -> Vec<u8> {
@@ -390,5 +524,57 @@ fn pad_to_align(buf: &mut Vec<u8>, align: u32) {
     let rem = buf.len() % align as usize;
     if rem != 0 {
         buf.extend(std::iter::repeat_n(INT3, align as usize - rem));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn llvm_entries_round_trip_to_new_targets() {
+        let base = 0x1_4000_0000u64;
+        let new_table_va = 0x1_4005_0000u64;
+        for new_target_va in [0x1_4004_8000u64, 0x1_4006_1230u64] {
+            let bytes = encode_entry(base, new_table_va, false, new_target_va).unwrap();
+            let delta = i32::from_le_bytes(bytes);
+            assert_eq!((new_table_va as i64 + delta as i64) as u64, new_target_va);
+        }
+    }
+
+    #[test]
+    fn llvm_equal_targets_encode_equal() {
+        let base = 0x1_4000_0000u64;
+        let new_table_va = 0x1_4005_0000u64;
+        let target = 0x1_4004_8000u64;
+        let a = encode_entry(base, new_table_va, false, target).unwrap();
+        let b = encode_entry(base, new_table_va, false, target).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn msvc_entries_round_trip_to_new_targets() {
+        let base = 0x1_4000_0000u64;
+        let new_table_va = 0x1_4005_0000u64;
+        let new_target_va = 0x1_4006_1230u64;
+        let bytes = encode_entry(base, new_table_va, true, new_target_va).unwrap();
+        let rva = u32::from_le_bytes(bytes);
+        assert_eq!(base + u64::from(rva), new_target_va);
+    }
+
+    #[test]
+    fn llvm_delta_overflow_rejects() {
+        let base = 0x1_4000_0000u64;
+        let new_table_va = 0x1_4000_0000u64;
+        let new_target_va = new_table_va + (i32::MAX as u64) + 2;
+        assert!(encode_entry(base, new_table_va, false, new_target_va).is_err());
+    }
+
+    #[test]
+    fn msvc_target_below_base_rejects() {
+        let base = 0x1_4000_0000u64;
+        let new_table_va = 0x1_4005_0000u64;
+        let new_target_va = base - 0x1000;
+        assert!(encode_entry(base, new_table_va, true, new_target_va).is_err());
     }
 }
