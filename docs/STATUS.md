@@ -60,6 +60,12 @@ Living document. Updated as work lands.
    Call could be folded into the Call node. Optimization, not correctness.
 5. **Over-approximated call args.** Win64Default passes 4 args for every call.
    Resolved by Win32metadata DB (D14) or PDB symbol lookup.
+6. **Phantom discovery seeds.** Unaligned "functions" (target.exe 0xa4dc,
+   0xb0b4, …; kernel32 0x40c1, 0x4391, 0x5bcf) sharing identical blocks with real
+   functions — call-like decoding seeds functions inside other functions' code.
+   Inflates function + rejection counts. Possible contributor: missing noreturn
+   tracking (BLARE2's documented failure mode). Fix before any coverage metric is
+   trusted; see research.md §10.2.
 
 ## Phase 3 — SEH & CET (D31: correctness before obfuscation)
 
@@ -79,7 +85,7 @@ Living document. Updated as work lands.
 | MutationEngine | Not started |
 | LoopEncodeSemantics | Not started (underspecified — needs design) |
 | Per-function config profiles + symbol matching | Not started |
-| Jump table recovery & retargeting (D24) | Not started |
+| Jump table recovery & retargeting (D24) | Studied | Design settled by research.md §10: layer 0 IAT/static-ptr classification → phantom-seed fix → layer 2 use-def DAG + petgraph VF2. Re-emit/retarget is our own gap (BLARE2 doesn't document it) |
 | Trampoline stub obfuscation (D29: flavor diversification + junk fill + direct-call re-pointing) | Not started |
 
 ## Phase 5 — Advanced Passes
@@ -110,7 +116,7 @@ Source: RE of `HelloWorld-Injected.exe` (codedefender-io/plugins) — the model 
 Open external threads: confirm `sub_140007000` purpose (import resolver vs anti-tamper);
 enumerate the full trampoline set (5 verified: 0x1000, 0x1070, 0x10c0, 0x17c8, 0x1d54);
 inspect the init callbacks at `.rdata` 0x27f0.
----
+
 
 ## Test corpus
 
@@ -121,6 +127,7 @@ inspect the init callbacks at `.rdata` 0x27f0.
 | SSA identity round-trip (target.exe) | ⚠️ exit=7 via relocation fallback (callee-saved disabled); engine reaches 95/169 regalloc-ready with pool |
 | kernel32.dll analysis (2588 functions, 29717 blocks) | ✅ Verified (headers cross-checked) |
 | aftermathlabs/bintests corpus (D25) | Not adopted |
+| backengineering/bintests `misc/jtables` — jump-table corpus (research.md §10.5) | Not adopted |
 
 ## Rejection rates
 
@@ -128,5 +135,14 @@ inspect the init callbacks at `.rdata` 0x27f0.
 |--------|-------|----------|------|---------------|
 | target.exe (Rust) | 169 | 217 | 43.8% | BadIndirectBranch (114) |
 | kernel32.dll | 1214 | 1374 | 46.9% | BadIndirectBranch (922) |
+
+Measured decomposition (jump-table study, research.md §10): kernel32's 922
+`BadIndirectBranch` = 843 export forwarders (`jmp [rel IAT]`, 6–7 bytes, not
+protection targets) + 67 internal static-pointer jumps (resolvable) + 12 real
+register-dispatch functions (11 switch tables recoverable, 4 `jmp reg` dynamic).
+target.exe's 114 = 59 static-pointer + 51 RVA-table blocks (recoverable) +
+38 dynamic vtable tail-calls (honest rejections) + phantom-seed inflation.
+Layer 0 (classify `jmp [rel X]` via IAT-range test, BLARE2-confirmed) + phantom-seed
+fix + layer 2 (use-def DAG + petgraph VF2) are the D24 implementation order.
 
 Jump table recovery (D24) is the #1 coverage improvement.

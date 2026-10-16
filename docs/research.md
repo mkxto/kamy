@@ -327,3 +327,121 @@ From the devirt posts, these are documented concretization footholds:
 - Alive2 (PLDI'21): https://github.com/AliveToolkit/alive2
 - Binary Lifter Validation (PLDI'20): found 29 bugs in McSema
 - SBR Survey (CSUR'19): https://dl.acm.org/doi/abs/10.1145/3316415
+
+## 10. Jump-Table Empirical Study (2026-10-16)
+
+Classification of every `Terminator::Indirect` block in our two reference binaries
+(tooling: throwaway iced decoder over discovered CFGs; numbers are measured, not
+estimated). Motivation: `BadIndirectBranch` is the #1 rejection reason — 52% of
+rejects on target.exe, 67% on kernel32 — and D24's layering had never been
+validated against real binaries.
+
+### 10.1 kernel32.dll — the "rejection problem" is mostly forwarder accounting
+
+925 indirect blocks across 922 functions:
+
+| Class | Count | Nature | D24 disposition |
+|-------|-------|--------|-----------------|
+| Export forwarder stubs | 843 blocks | 6–7-byte functions, `jmp qword [rel IAT]`; kernel32 has a literal `fothk` section, targets land in the `.rdata` IAT window (RVA 0x89000–0x8C000) | **Not protection targets.** Classify-and-skip; never count as rejection |
+| Internal static-pointer jumps | 67 blocks | Same `jmp qword [rel X]` shape inside real functions (tail-calls through data pointers) | Resolve pointer statically; rewrite 6-byte indirect jmp as 5-byte `jmp rel32` (fits in place, 1 byte pad) |
+| RVA-relative switch tables | 11 blocks / 12 funcs | Canonical MSVC shape (below) | Layer 2 pattern match; recover + retarget |
+| Bare `jmp reg` dispatch | 4 blocks | Computed control flow, no static table | Genuinely dynamic → stay rejected (correct D22 behavior) |
+
+Per-function: 910 of 922 are static-jump-only; only 12 functions contain real
+register-dispatch. Conclusion: on this binary "jump-table recovery" is 99%
+**classification**, not table decoding.
+
+### 10.2 target.exe (Rust/LLVM) — real tables dominate, plus a discovery bug
+
+148 indirect blocks across 114 functions (no exports; all internal):
+
+| Class | Count | Nature | D24 disposition |
+|-------|-------|--------|-----------------|
+| Static-pointer jumps | 59 blocks | `jmp qword [rel X]`, X in `.rdata` (vtable slots / GOT-like dispatch) | Same as kernel32: static resolve + direct-ify |
+| RVA-relative switch tables | 51 blocks | `movsxd rX,[base+idx*4]; add rX,base; jmp rX`, plus an `and`-masked no-bounds-check variant (`and r8d,3`) | Layer 2 (+ layer 3 for masked forms) |
+| Dynamic tail dispatch | 38 blocks | `mov r9,[rcx+0x18]; mov rcx,rax; jmp r9` vtable tail-calls, register thunks | Genuinely dynamic → reject |
+
+**Discovery artifact:** unaligned "functions" (0xa4dc, 0xb0b4, …) sharing
+identical blocks with real functions — phantom seeds from call-like decoding.
+These inflate both the function count and the rejection count and must be
+deduplicated before any coverage number is meaningful.
+
+### 10.3 The canonical recoverable shape (both compilers)
+
+```asm
+; MSVC (kernel32)                      ; Rust/LLVM (target.exe)
+lea rdx,[rel IMG+off]                  lea r15,[rel IMG+off]   ; or mov r15,base
+mov ecx,[rdx+rax*4+TABLE]              and r8d,3               ; optional mask
+add rcx,rdx                           movsxd r8,[r15+r8*4]
+jmp rcx                               add r8,r15
+                                       jmp r8
+```
+
+Entries are 4-byte RVA offsets (not absolute pointers) — confirmed: **no
+.reloc entries cover them** (kernel32: 528 relocs, none in the table ranges).
+D24 layer 1 (relocations as ground truth) is therefore mostly empty in
+practice; the operative layers are pattern matching (count from bounds-check
+immediate +1, cross-check every entry lands inside the function's .pdata
+bounds) and register-value analysis for masked forms.
+
+### 10.4 Re-weighted D24 implementation order
+
+1. **Layer 0 — classify static `jmp [rel X]`** (biggest win, near-zero risk):
+   resolve X's initializer; IAT target → forwarder/imports (skip, or direct
+   jump to moved target); in-image function pointer → direct-ify in place.
+   Expected: kernel32 `BadIndirectBranch` 922 → ~12; target.exe 114 → ~50.
+2. **Fix phantom seeds in discovery** (unaligned call-target seeds inside
+   existing .pdata ranges) — otherwise coverage numbers lie.
+3. **Layer 2 — canonical switch pattern** with entry-count + .pdata
+   bounds cross-check, reject on ambiguity (D24 unchanged).
+4. **Layer 3 — masked-table register analysis** (narrow; only real user is
+   the `and`-mask variant).
+
+Dynamic vtable tail-calls remain honest rejections — protecting them is
+runtime-tier (Phase 7) territory, not static recovery.
+
+### 10.5 Cross-validation — BLARE2 (CodeDefender) technique report
+
+Source: "Technical Challenges of Indirect Control Flow",
+https://codedefender.io/blog/2024/07/02 (Jul 2, 2024; their rewriting engine
+B.L.A.R.E., in Rust). Their documented variants map 1:1 onto the shapes measured
+in §10.1–10.3:
+
+| BLARE2 variant | Our measurement |
+|---------------|------------------|
+| LLVM 64-bit, table-relative int32 deltas (`lea tbl; movsxd; add; jmp reg`) | target.exe 51 blocks (Rust/LLVM) |
+| MSVC 64-bit, module-base RVAs (`lea base; mov ecx,[base+idx*4+off]; add; jmp`) | kernel32 11 blocks |
+| MSVC multi-level: byte index table + adjacent RVA target table (sparse switches) | **not yet observed in our binaries — catalog anyway** |
+| 32-bit: absolute entries, fully reloc-backed | out of scope (x64 only); confirms layer 1 is a 32-bit-only mechanism |
+| `call/jmp [mem]` resolving into the **IAT range** = import, never a switch | kernel32 843 forwarders + 67 internal IAT jumps — formalizes our "layer 0" |
+
+Their mechanism (validated in production: Chrome >97%, Unreal 99%, Windows
+components >95% rewrite coverage — *with* reject-on-ambiguity, i.e. even BLARE2
+does not claim 100% on system binaries):
+
+- **Matching engine: use-def DAG + VF2 subgraph isomorphism** (`petgraph`
+  `subgraph_isomorphisms_iter`), not text patterns. Node comparison collapses
+  mov/sign-extended-mov variants, ignores constants and RIP-relative operands,
+  and ignores register identity (allocator variance). New variants are macro-added.
+- **Entry count from the bound**: `cmp imm; ja default` immediate + 1; `CMP`
+  normalized as `SUB` in the DAG so only "a bound exists" matters.
+- **Unbounded tables → reject.** Adjacent tables are common, so guess-and-check
+  ("catastrophic results after obfuscation"); Rust unbounded `match` tables are
+  their dominant unrecoverable class. Our `and r8d,3` masked form is *implicitly
+  bounded* (count = 2^k) and stays recoverable.
+- **noreturn tracking upstream**: mis-advancing past noreturn calls makes the
+  disassembler decode table data as code — a plausible contributor to our
+  phantom-seed artifact (§10.2). They gate noreturn on "all terminators are
+  interrupts/known-noreturn calls" after a retpoline false positive.
+- **Documented gap**: the post covers detection/parsing only — **no re-emit or
+  retarget algorithm** for a moved table. That design burden is ours: after a
+  function moves, its table must be copied/re-encoded (deltas or RVAs
+  recomputed for the new layout) and the dispatch re-emitted to match.
+- **Test corpus**: jump-table-specific corpus at
+  `github.com/backengineering/bintests/tree/master/misc/jtables` (distinct from
+  the aftermathlabs corpus adopted in D25) — adopt as the D24 conformance set.
+
+Layer 2's implementation choice is therefore settled by prior art: a small
+use-def DAG per variant + `petgraph` VF2 (passes dependency gates C1/C2),
+with the cmp-derived (or mask-derived) bound as the entry count and .pdata
+cross-checks (§10.4) as our own additional ground truth.
