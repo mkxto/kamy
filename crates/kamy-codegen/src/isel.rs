@@ -492,6 +492,19 @@ fn select_inst(
             }
         }
 
+        IrOp::RipAddr(target) => {
+            let dest = inst.dest.unwrap();
+            let dest_reg = reg_of(alloc, dest, IrType::I64);
+            let mut lea = Instruction::with2(
+                Code::Lea_r64_m,
+                dest_reg,
+                MemoryOperand::with_base(Register::RIP),
+            )
+            .unwrap();
+            lea.set_memory_displacement64(*target);
+            out.push(lea);
+        }
+
         IrOp::Copy => {
             let dest = inst.dest.unwrap();
             let src = inst.args[0];
@@ -1156,5 +1169,59 @@ mod tests {
             mnemonics.contains(&iced_x86::Mnemonic::Cmp),
             "a subtract comparison must lower to `cmp a,b`, not `test`: {mnemonics:?}"
         );
+    }
+
+    #[test]
+    fn rip_addr_lowers_to_position_independent_lea() {
+        const TARGET: u64 = 0x1_4000_5000;
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let v0 = func.alloc_value();
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![
+                Inst {
+                    dest: Some(v0),
+                    op: IrOp::RipAddr(TARGET),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: None,
+                    op: IrOp::Use,
+                    args: vec![v0],
+                    ty: IrType::I64,
+                },
+            ],
+            term: IrTerminator::Ret,
+        });
+        let alloc = crate::regalloc::allocate_registers(
+            &func,
+            &crate::regalloc::CALLEE_SAVED_GPRS,
+            &std::collections::HashSet::new(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x1_4000_2000, &[]);
+        // Encode at two different VAs; both must still resolve to the same absolute
+        // target (position independence).
+        for new_va in [0x1_4000_2000u64, 0x1_4000_9000u64] {
+            let bytes = crate::relocate(&instrs, new_va).unwrap();
+            let mut dec = Decoder::with_ip(64, &bytes, new_va, DecoderOptions::NONE);
+            let lea = dec
+                .iter()
+                .find(|i| i.mnemonic() == iced_x86::Mnemonic::Lea)
+                .expect("lea emitted");
+            assert!(lea.is_ip_rel_memory_operand(), "lea must be rip-relative");
+            assert_eq!(
+                lea.memory_displacement64(),
+                TARGET,
+                "rip-relative lea must resolve to the original absolute VA"
+            );
+        }
     }
 }

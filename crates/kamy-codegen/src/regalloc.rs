@@ -251,6 +251,15 @@ pub fn allocate_registers(
         }
     }
 
+    // Physical registers reserved by pinned intervals, with their ranges. A
+    // non-pinned value must not occupy one while its own range overlaps: a later
+    // pin would otherwise have to move it mid-life, which the single-assignment
+    // lowering cannot express.
+    let pins: Vec<(PhysReg, usize, usize)> = intervals
+        .iter()
+        .filter_map(|iv| iv.pinned.map(|p| (p, iv.start, iv.end)))
+        .collect();
+
     let mut avail_gprs: Vec<Gpr> = VOLATILE_GPRS.to_vec();
     let mut avail_xmms: Vec<XmmReg> = VOLATILE_XMMS.to_vec();
 
@@ -271,7 +280,7 @@ pub fn allocate_registers(
     }
 
     let mut assignments: HashMap<ValueId, PhysReg> = HashMap::new();
-    let mut copies: Vec<RegCopy> = Vec::new();
+    let copies: Vec<RegCopy> = Vec::new();
     let mut active: Vec<(LiveInterval, PhysReg)> = Vec::new();
     let mut free_gprs: Vec<Gpr> = avail_gprs.clone();
     let mut free_xmms: Vec<XmmReg> = avail_xmms.clone();
@@ -328,36 +337,11 @@ pub fn allocate_registers(
                     // function relocates verbatim instead of miscompiling.
                     return Err(RejectionReason::RegisterPressure);
                 } else {
-                    // Evict the non-pinned temp to a register no live interval holds.
-                    let busy: HashSet<PhysReg> = active.iter().map(|(_, r)| *r).collect();
-                    let alt = if needs_xmm {
-                        free_xmms
-                            .iter()
-                            .position(|x| !busy.contains(&PhysReg::Xmm(*x)))
-                            .map(|p| PhysReg::Xmm(free_xmms.remove(p)))
-                    } else {
-                        free_gprs
-                            .iter()
-                            .position(|g| !busy.contains(&PhysReg::Gpr(*g)))
-                            .map(|p| PhysReg::Gpr(free_gprs.remove(p)))
-                    };
-                    match alt {
-                        Some(alt_reg) => {
-                            copies.push(RegCopy {
-                                point: iv.start,
-                                from: pinned,
-                                to: alt_reg,
-                                ty: conf.ty,
-                            });
-                            active.iter_mut().for_each(|(a, r)| {
-                                if a.value == conf.value {
-                                    *r = alt_reg;
-                                }
-                            });
-                            *assignments.get_mut(&conf.value).unwrap() = alt_reg;
-                        }
-                        None => return Err(RejectionReason::RegisterPressure),
-                    }
+                    // A non-pinned value never sits in a register pinned by an
+                    // overlapping interval (enforced by the forbidden-set filter in
+                    // the unpinned path), so moving it here would be unsound under
+                    // the single-assignment lowering: reject instead.
+                    return Err(RejectionReason::RegisterPressure);
                 }
             } else {
                 match pinned {
@@ -370,29 +354,42 @@ pub fn allocate_registers(
             assignments.insert(iv.value, pinned);
             active.push((iv.clone(), pinned));
         } else {
+            let forbidden: HashSet<PhysReg> = pins
+                .iter()
+                .filter(|(_, s, e)| *s < iv.end && iv.start < *e)
+                .map(|(r, _, _)| *r)
+                .collect();
             let reg = if needs_xmm {
                 if iv.crosses_call {
                     // No callee-saved XMM pool: an XMM value cannot survive a call.
                     return Err(RejectionReason::RegisterPressure);
                 }
-                free_xmms
-                    .pop()
-                    .map(PhysReg::Xmm)
-                    .ok_or(RejectionReason::RegisterPressure)?
+                match free_xmms
+                    .iter()
+                    .position(|x| !forbidden.contains(&PhysReg::Xmm(*x)))
+                {
+                    Some(p) => PhysReg::Xmm(free_xmms.remove(p)),
+                    None => return Err(RejectionReason::RegisterPressure),
+                }
             } else {
                 let pos = if iv.crosses_call {
                     // Must survive the call → callee-saved GPR only.
-                    free_gprs.iter().position(|g| is_callee_saved_gpr(*g))
+                    free_gprs.iter().position(|g| {
+                        is_callee_saved_gpr(*g) && !forbidden.contains(&PhysReg::Gpr(*g))
+                    })
                 } else {
                     // Prefer a volatile so callee-saved stay free for crossers;
-                    // fall back to callee-saved when no volatile is free.
-                    free_gprs.iter().position(|g| !is_callee_saved_gpr(*g)).or(
-                        if free_gprs.is_empty() {
-                            None
-                        } else {
-                            Some(free_gprs.len() - 1)
-                        },
-                    )
+                    // fall back to any free register the pins leave available.
+                    free_gprs
+                        .iter()
+                        .position(|g| {
+                            !is_callee_saved_gpr(*g) && !forbidden.contains(&PhysReg::Gpr(*g))
+                        })
+                        .or_else(|| {
+                            free_gprs
+                                .iter()
+                                .position(|g| !forbidden.contains(&PhysReg::Gpr(*g)))
+                        })
                 };
                 match pos {
                     Some(p) => PhysReg::Gpr(free_gprs.remove(p)),
@@ -636,6 +633,61 @@ mod tests {
         assert_eq!(
             callee_saved_used(&alloc),
             vec![iced_x86::Register::RBX, iced_x86::Register::R13]
+        );
+    }
+
+    #[test]
+    fn nonpinned_value_avoids_overlapping_pinned_register() {
+        // v0 is live across the point where v1 is pinned to R9 (both feed v2).
+        // v0 must not also take R9 — otherwise the later pin would force an
+        // unsound mid-life register move.
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let v0 = func.alloc_value();
+        let v1 = func.alloc_value();
+        let v2 = func.alloc_value();
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![
+                Inst {
+                    dest: Some(v0),
+                    op: IrOp::Const(1),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(v1),
+                    op: IrOp::Const(2),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(v2),
+                    op: IrOp::Add,
+                    args: vec![v0, v1],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: None,
+                    op: IrOp::Use,
+                    args: vec![v2],
+                    ty: IrType::I64,
+                },
+            ],
+            term: IrTerminator::Ret,
+        });
+        let mut pins = HashMap::new();
+        pins.insert(v1, PhysReg::Gpr(Gpr::R9));
+        let alloc = allocate_registers(&func, &CALLEE_SAVED_GPRS, &HashSet::new(), &pins).unwrap();
+        assert_eq!(alloc.assignments[&v1], PhysReg::Gpr(Gpr::R9));
+        assert_ne!(alloc.assignments[&v0], PhysReg::Gpr(Gpr::R9));
+        assert!(
+            alloc.copies.is_empty(),
+            "no mid-life register move should be emitted"
         );
     }
 }

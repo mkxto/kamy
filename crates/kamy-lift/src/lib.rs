@@ -172,11 +172,6 @@ fn dispatch(
     state: &mut LiftState,
     cc: &dyn CallingConvLookup,
 ) -> Option<ValueId> {
-    if insn.is_ip_rel_memory_operand() {
-        // RIP-relative data access folds to an absolute constant here, which is
-        // not position-independent (breaks under ASLR). Relocate verbatim.
-        state.unsupported = true;
-    }
     match insn.flow_control() {
         FlowControl::Return => {
             control::lift_ret(builder, state);
@@ -410,7 +405,11 @@ pub(crate) fn compute_mem_addr(insn: &Instruction, b: &mut IrBuilder, s: &LiftSt
     let base_reg = insn.memory_base();
 
     if base_reg == Register::RIP {
-        return b.emit(IrOp::Const(insn.memory_displacement64()), &[], IrType::I64);
+        return b.emit(
+            IrOp::RipAddr(insn.memory_displacement64()),
+            &[],
+            IrType::I64,
+        );
     }
 
     let index_reg = insn.memory_index();

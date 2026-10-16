@@ -11,6 +11,10 @@ pub struct NativeInst {
 pub enum IrOp {
     // --- constants ---
     Const(u64),
+    /// Absolute VA of a RIP-relative data reference; lowered to a
+    /// position-independent `lea reg, [rip+disp]` whose displacement the encoder
+    /// recomputes for the relocated code.
+    RipAddr(u64),
     Undef,
 
     // --- data flow ---
@@ -83,5 +87,7 @@ pub enum IrOp {
     // --- live-out marker (DCE root, no codegen output) ---
     Use,
     // --- call ---
-    Call { target: u64 },
+    Call {
+        target: u64,
+    },
 }

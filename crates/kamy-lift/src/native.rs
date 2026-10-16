@@ -29,6 +29,11 @@ pub(crate) fn native_inline_fallback(
     builder: &mut IrBuilder,
     state: &mut LiftState,
 ) {
+    if insn.is_ip_rel_memory_operand() {
+        // A RIP-relative operand on an unmodeled instruction would be re-emitted
+        // with its original displacement and resolve to the wrong VA once moved.
+        state.unsupported = true;
+    }
     let mut factory = InstructionInfoFactory::new();
     let info = factory.info(insn);
 
