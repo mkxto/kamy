@@ -28,6 +28,7 @@ mod tests {
     use super::*;
     use iced_x86::{Decoder, DecoderOptions, Instruction};
     use kamy_core::{Machine, Section, SectionFlags, Terminator};
+    use std::collections::BTreeSet;
 
     const BASE: u64 = 0x1_4000_0000;
     const TEXT_RVA: u32 = 0x1000;
@@ -88,7 +89,7 @@ mod tests {
             0x0F, 0x85, 0x06, 0x00, 0x00, 0x00, 0x48, 0x31, 0xC0, 0xC3, 0x90, 0x90, 0xC3,
         ];
         let module = exec_module(data);
-        let function = recover_function(&module, Rva::new(TEXT_RVA));
+        let function = recover_function(&module, Rva::new(TEXT_RVA), &BTreeSet::new());
 
         assert!(function.blocks.len() >= 2);
         let entry_block = function
@@ -115,6 +116,7 @@ mod tests {
         let rip_rel = recover_function(
             &exec_module(vec![0xFF, 0x25, 0xFA, 0x04, 0x00, 0x00]),
             Rva::new(TEXT_RVA),
+            &BTreeSet::new(),
         );
         assert_eq!(
             rip_rel.blocks[0].terminator,
@@ -124,11 +126,35 @@ mod tests {
         );
 
         // 0x1000: FF E0   jmp rax -> register dispatch, no static slot
-        let reg = recover_function(&exec_module(vec![0xFF, 0xE0]), Rva::new(TEXT_RVA));
+        let reg = recover_function(
+            &exec_module(vec![0xFF, 0xE0]),
+            Rva::new(TEXT_RVA),
+            &BTreeSet::new(),
+        );
         assert_eq!(
             reg.blocks[0].terminator,
             Terminator::Indirect { slot: None }
         );
+    }
+
+    #[test]
+    fn tailcall_jmp_does_not_absorb_callee() {
+        // 0x1000: E9 03000000   jmp 0x1008   (tail call to a known function start)
+        // 0x1008: 48 31 C0      xor rax,rax  (function B)
+        // 0x100B: C3            ret
+        let module = exec_module(vec![0xE9, 0x03, 0x00, 0x00, 0x00, 0x48, 0x31, 0xC0, 0xC3]);
+        let functions = discover_functions(&module, &[Rva::new(0x1000), Rva::new(0x1008)]);
+        assert_eq!(functions.len(), 2);
+
+        let a = functions
+            .iter()
+            .find(|f| f.entry == Rva::new(0x1000))
+            .unwrap();
+        assert_eq!(a.blocks.len(), 1);
+        assert_eq!(a.blocks[0].terminator, Terminator::Jump(Rva::new(0x1008)));
+        assert!(a.blocks[0].successors.is_empty());
+        // A stops at the jmp (end 0x1005) instead of swallowing B's body.
+        assert_eq!(a.blocks.iter().map(|b| b.end.get()).max(), Some(0x1005));
     }
 
     #[test]
@@ -154,7 +180,7 @@ mod tests {
     fn malformed_bytes_do_not_panic() {
         // 0xFF alone is an incomplete/invalid encoding; decode must degrade to Unknown.
         let module = exec_module(vec![0xFF]);
-        let function = recover_function(&module, Rva::new(TEXT_RVA));
+        let function = recover_function(&module, Rva::new(TEXT_RVA), &BTreeSet::new());
         assert_eq!(function.entry, Rva::new(TEXT_RVA));
         assert!(matches!(
             function.blocks.first().map(|b| &b.terminator),

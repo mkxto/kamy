@@ -10,8 +10,14 @@ enum EndKind {
     Normal,
     Return,
     Jump(u32),
+    /// Direct `jmp` to a known function start: a tail call, not an intra-block
+    /// edge. Terminates the block without absorbing the callee's body.
+    TailJump(u32),
     Indirect(Option<Rva>),
-    Branch { taken: u32, not_taken: u32 },
+    Branch {
+        taken: u32,
+        not_taken: u32,
+    },
     Unknown,
 }
 
@@ -20,29 +26,49 @@ struct InstrRecord {
     kind: EndKind,
 }
 
-pub fn recover_function(module: &Module, entry: Rva) -> Function {
-    recover_impl(module, entry).0
+pub fn recover_function(module: &Module, entry: Rva, function_starts: &BTreeSet<u32>) -> Function {
+    recover_impl(module, entry, function_starts).0
 }
 
 /// Recover one function and report the direct call targets seen while decoding
 /// it, so `discover_functions` can grow its worklist without decoding twice.
-pub(crate) fn recover_impl(module: &Module, entry: Rva) -> (Function, Vec<Rva>) {
+///
+/// `function_starts` are the known function entries (`.pdata`/export/entry
+/// seeds); a `jmp` to one of them is treated as a tail call so this function's
+/// recovery stops at its true boundary instead of swallowing the neighbor.
+pub(crate) fn recover_impl(
+    module: &Module,
+    entry: Rva,
+    function_starts: &BTreeSet<u32>,
+) -> (Function, Vec<Rva>) {
     let mut instrs: BTreeMap<u32, InstrRecord> = BTreeMap::new();
     let mut leaders: BTreeSet<u32> = BTreeSet::new();
     let mut calls: Vec<Rva> = Vec::new();
     let mut seen_calls: BTreeSet<u32> = BTreeSet::new();
+
+    // .pdata/export/entry starts partition x64 code into non-overlapping
+    // ranges; code at or past the next start belongs to the next function, so
+    // recovery must not run into it (prevents runaway, cross-function spans).
+    let limit = function_starts
+        .range(entry.get().saturating_add(1)..)
+        .next()
+        .copied()
+        .unwrap_or(u32::MAX);
 
     leaders.insert(entry.get());
     let mut worklist = vec![entry.get()];
     while let Some(start) = worklist.pop() {
         decode_run(
             module,
+            entry.get(),
             start,
             &mut instrs,
             &mut leaders,
             &mut worklist,
             &mut calls,
             &mut seen_calls,
+            function_starts,
+            limit,
         );
     }
 
@@ -53,14 +79,17 @@ pub(crate) fn recover_impl(module: &Module, entry: Rva) -> (Function, Vec<Rva>) 
 #[allow(clippy::too_many_arguments)]
 fn decode_run(
     module: &Module,
+    entry: u32,
     start: u32,
     instrs: &mut BTreeMap<u32, InstrRecord>,
     leaders: &mut BTreeSet<u32>,
     worklist: &mut Vec<u32>,
     calls: &mut Vec<Rva>,
     seen_calls: &mut BTreeSet<u32>,
+    function_starts: &BTreeSet<u32>,
+    limit: u32,
 ) {
-    if instrs.contains_key(&start) {
+    if start >= limit || instrs.contains_key(&start) {
         return;
     }
     let start_rva = Rva::new(start);
@@ -80,7 +109,7 @@ fn decode_run(
 
     loop {
         let cur = (decoder.ip() - module.image_base) as u32;
-        if instrs.contains_key(&cur) {
+        if cur >= limit || instrs.contains_key(&cur) {
             return;
         }
         if !decoder.can_decode() {
@@ -94,7 +123,15 @@ fn decode_run(
             return;
         };
 
-        let kind = classify(module, &instr, next, calls, seen_calls);
+        let kind = classify(
+            module,
+            &instr,
+            next,
+            calls,
+            seen_calls,
+            entry,
+            function_starts,
+        );
         let successors: Vec<u32> = match &kind {
             EndKind::Jump(target) => vec![*target],
             EndKind::Branch { taken, not_taken } => vec![*taken, *not_taken],
@@ -105,6 +142,9 @@ fn decode_run(
 
         if ends_block {
             for succ in successors {
+                if succ >= limit {
+                    continue;
+                }
                 leaders.insert(succ);
                 if !instrs.contains_key(&succ) {
                     worklist.push(succ);
@@ -121,6 +161,8 @@ fn classify(
     next: u32,
     calls: &mut Vec<Rva>,
     seen_calls: &mut BTreeSet<u32>,
+    entry: u32,
+    function_starts: &BTreeSet<u32>,
 ) -> EndKind {
     match instr.flow_control() {
         FlowControl::Next => EndKind::Normal,
@@ -145,6 +187,14 @@ fn classify(
         }
         FlowControl::UnconditionalBranch => {
             match branch_target(instr).and_then(|va| to_in_exec_rva(module, va)) {
+                Some(target)
+                    if target.get() != entry && function_starts.contains(&target.get()) =>
+                {
+                    if seen_calls.insert(target.get()) {
+                        calls.push(target);
+                    }
+                    EndKind::TailJump(target.get())
+                }
                 Some(target) => EndKind::Jump(target.get()),
                 None => EndKind::Unknown,
             }
@@ -208,6 +258,13 @@ fn build_blocks(instrs: &BTreeMap<u32, InstrRecord>, leaders: &BTreeSet<u32>) ->
                     break (Terminator::Unknown, Rva::new(next), Vec::new());
                 }
                 EndKind::Return => break (Terminator::Return, Rva::new(rec.end), Vec::new()),
+                EndKind::TailJump(target) => {
+                    break (
+                        Terminator::Jump(Rva::new(*target)),
+                        Rva::new(rec.end),
+                        Vec::new(),
+                    );
+                }
                 EndKind::Indirect(slot) => {
                     break (
                         Terminator::Indirect { slot: *slot },

@@ -10,6 +10,7 @@ pub fn discover_functions(module: &Module, seeds: &[Rva]) -> Vec<Function> {
         .copied()
         .filter(|&rva| module.is_executable(rva))
         .collect();
+    let function_starts: BTreeSet<u32> = worklist.iter().map(|r| r.get()).collect();
     let mut visited: BTreeSet<u32> = BTreeSet::new();
     let mut functions: Vec<Function> = Vec::new();
 
@@ -20,7 +21,7 @@ pub fn discover_functions(module: &Module, seeds: &[Rva]) -> Vec<Function> {
         if !module.is_executable(entry) {
             continue;
         }
-        let (function, calls) = recover_impl(module, entry);
+        let (function, calls) = recover_impl(module, entry, &function_starts);
         for target in calls {
             if !visited.contains(&target.get()) {
                 worklist.push(target);
