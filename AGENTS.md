@@ -13,8 +13,16 @@ decisions already made there.
 - `docs/architecture.md` — pipeline, IR layering, config schema.
 - `docs/research.md` — prior art and techniques.
 
-If code and a decision disagree, the decision wins; if the decision is wrong,
-raise it — do not silently diverge.
+If code and a decision disagree, the decision wins.
+
+**Strict rule — never diverge from the settled plan or research.** The approach
+recorded in `docs/` (decisions, `research.md` §-level choices such as the D24
+layer 2 use-def DAG + petgraph VF2 engine) is binding. Do not substitute a
+different design, shortcut, or "simpler for now" alternative, even if it seems
+easier or equivalent. If you genuinely believe the plan or research is wrong,
+**stop and prompt the user before diverging** — present the evidence and the
+proposed change and wait for an explicit decision. Silent divergence, or
+divergence justified only in a commit/report, is prohibited.
 
 ## Engineering principles
 
