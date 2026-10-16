@@ -28,7 +28,10 @@ impl Pass for Dce {
                 let is_root = inst.dest.is_none()
                     || matches!(
                         inst.op,
-                        IrOp::Store | IrOp::Call { .. } | IrOp::NativeInline(_)
+                        IrOp::Store
+                            | IrOp::Call { .. }
+                            | IrOp::CallIndirect
+                            | IrOp::NativeInline(_)
                     );
                 if is_root {
                     if let Some(dest) = inst.dest {

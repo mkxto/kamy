@@ -738,6 +738,11 @@ fn select_inst(
             out.push(Instruction::with_branch(Code::Call_rel32_64, *target).unwrap());
         }
 
+        IrOp::CallIndirect => {
+            let target_reg = reg_of(alloc, inst.args[0], IrType::I64);
+            out.push(Instruction::with1(Code::Call_rm64, target_reg).unwrap());
+        }
+
         IrOp::NativeInline(native) => {
             let mut decoder = Decoder::new(64, &native.bytes, DecoderOptions::NONE);
             for instr in &mut decoder {

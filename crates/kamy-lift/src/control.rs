@@ -1,5 +1,5 @@
 use iced_x86::{Instruction, OpKind};
-use kamy_core::ir::{CallingConvLookup, Gpr, IrOp, IrType, PhysReg, X86Flag};
+use kamy_core::ir::{CallingConvLookup, Gpr, IrOp, IrType, PhysReg, ValueId, X86Flag};
 
 use crate::builder::IrBuilder;
 use crate::cond::decode_condition;
@@ -106,6 +106,97 @@ pub(crate) fn lift_call(
         for phys in &sig.clobbers {
             let already_set = sig.ret == Some(*phys);
             if already_set {
+                continue;
+            }
+            match phys {
+                PhysReg::Gpr(g) => {
+                    let v = b.emit(IrOp::Undef, &[], IrType::I64);
+                    s.set_gpr(*g, v);
+                }
+                PhysReg::Xmm(x) => {
+                    let v = b.emit(IrOp::Undef, &[], IrType::I128);
+                    s.set_xmm(*x, v);
+                }
+                PhysReg::Flag(_) => {}
+            }
+        }
+    }
+
+    for f in X86Flag::ALL {
+        let v = b.emit(IrOp::Undef, &[], IrType::I8);
+        s.set_flag(f, v);
+    }
+}
+
+pub(crate) fn lift_call_indirect(
+    target_val: ValueId,
+    b: &mut IrBuilder,
+    s: &mut LiftState,
+    cc: &dyn CallingConvLookup,
+) {
+    // Indirect calls carry no resolvable target address, so assume the Win64
+    // default ABI; over-approximating the argument set is safe, never unsound.
+    let sig = cc.lookup(0);
+
+    let mut arg_vals = Vec::new();
+    if let Some(sig) = &sig {
+        for phys in &sig.args {
+            let v = match phys {
+                PhysReg::Gpr(g) => s.get_gpr(*g),
+                PhysReg::Xmm(x) => s.get_xmm(*x),
+                PhysReg::Flag(f) => s.get_flag(*f),
+            };
+            let arg = if matches!(phys, PhysReg::Flag(_)) || s.reg_pins.get(&v) == Some(phys) {
+                v
+            } else if s.reg_pins.contains_key(&v) || s.rsp_chain.contains(&v) {
+                let ty = if matches!(phys, PhysReg::Xmm(_)) {
+                    IrType::I128
+                } else {
+                    IrType::I64
+                };
+                let c = b.emit(IrOp::Copy, &[v], ty);
+                s.reg_pins.insert(c, *phys);
+                c
+            } else {
+                s.reg_pins.insert(v, *phys);
+                v
+            };
+            arg_vals.push(arg);
+        }
+    }
+
+    // The call reads the target after the argument setup, so park it in R11 —
+    // volatile, never a Win64 argument register. Copy first if already bound.
+    let target = if s.reg_pins.contains_key(&target_val) || s.rsp_chain.contains(&target_val) {
+        let c = b.emit(IrOp::Copy, &[target_val], IrType::I64);
+        s.reg_pins.insert(c, PhysReg::Gpr(Gpr::R11));
+        c
+    } else {
+        s.reg_pins.insert(target_val, PhysReg::Gpr(Gpr::R11));
+        target_val
+    };
+
+    let mut call_args = Vec::with_capacity(arg_vals.len() + 1);
+    call_args.push(target);
+    call_args.extend(arg_vals);
+    let call_ret = b.emit(IrOp::CallIndirect, &call_args, IrType::I64);
+
+    if let Some(sig) = &sig {
+        if let Some(ret_reg) = sig.ret {
+            match ret_reg {
+                PhysReg::Gpr(g) => {
+                    s.set_gpr(g, call_ret);
+                    s.reg_pins.insert(call_ret, PhysReg::Gpr(g));
+                }
+                PhysReg::Xmm(x) => {
+                    s.set_xmm(x, call_ret);
+                    s.reg_pins.insert(call_ret, PhysReg::Xmm(x));
+                }
+                PhysReg::Flag(_) => {}
+            }
+        }
+        for phys in &sig.clobbers {
+            if sig.ret == Some(*phys) {
                 continue;
             }
             match phys {

@@ -153,7 +153,7 @@ fn compute_live_intervals(func: &IrFunction, order: &[BlockId]) -> Vec<LiveInter
 
         for (ii, inst) in block.insts.iter().enumerate() {
             let pt = linear_point(bi, phi_offset + ii);
-            if matches!(inst.op, IrOp::Call { .. }) {
+            if matches!(inst.op, IrOp::Call { .. } | IrOp::CallIndirect) {
                 call_points.push(pt);
             }
             if let Some(dest) = inst.dest {
@@ -450,8 +450,11 @@ fn compute_edge_copies(
                 let Some((_, src_val)) = phi.args.iter().find(|(pr, _)| *pr == pb) else {
                     continue;
                 };
-                let dst = assignments[&phi.dest];
-                let src = assignments[src_val];
+                let (Some(&dst), Some(&src)) =
+                    (assignments.get(&phi.dest), assignments.get(src_val))
+                else {
+                    return Err(RejectionReason::RegisterPressure);
+                };
                 pairs.push((dst, src, phi.ty));
             }
             let busy: HashSet<PhysReg> = intervals

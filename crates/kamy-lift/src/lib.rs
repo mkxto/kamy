@@ -181,9 +181,20 @@ fn dispatch(
             if insn.op_kind(0) == OpKind::NearBranch64 {
                 control::lift_call(insn, insn.near_branch_target(), builder, state, cc);
             } else {
-                // Indirect call (`call reg`/`call [mem]`): the direct-target Call
-                // op cannot express it, so relocate the whole function verbatim.
-                state.unsupported = true;
+                let target_val = match insn.op_kind(0) {
+                    OpKind::Register => {
+                        iced_reg_to_gpr(insn.op_register(0)).map(|g| state.get_gpr(g))
+                    }
+                    OpKind::Memory => {
+                        let addr = compute_mem_addr(insn, builder, state);
+                        Some(builder.emit(IrOp::Load, &[addr], IrType::I64))
+                    }
+                    _ => None,
+                };
+                match target_val {
+                    Some(t) => control::lift_call_indirect(t, builder, state, cc),
+                    None => state.unsupported = true,
+                }
             }
             return None;
         }

@@ -210,6 +210,35 @@ mod tests {
     }
 
     #[test]
+    fn dce_keeps_indirect_call() {
+        let mut func = one_block_func();
+        let v_target = func.alloc_value();
+        let v_ret = func.alloc_value();
+        func.blocks[0].insts = vec![
+            Inst {
+                dest: Some(v_target),
+                op: IrOp::Const(0x1000),
+                args: vec![],
+                ty: IrType::I64,
+            },
+            Inst {
+                dest: Some(v_ret),
+                op: IrOp::CallIndirect,
+                args: vec![v_target],
+                ty: IrType::I64,
+            },
+        ];
+        Dce.run(&mut func);
+        assert!(
+            func.blocks[0]
+                .insts
+                .iter()
+                .any(|i| matches!(i.op, IrOp::CallIndirect)),
+            "an indirect call has side effects and must survive DCE"
+        );
+    }
+
+    #[test]
     fn prune_phis_same_args() {
         let mut func = IrFunction {
             entry: BlockId(0),

@@ -90,4 +90,7 @@ pub enum IrOp {
     Call {
         target: u64,
     },
+    /// Indirect call; `args[0]` is the target address, `args[1..]` the ABI
+    /// argument values. Lowered to `call reg`.
+    CallIndirect,
 }
