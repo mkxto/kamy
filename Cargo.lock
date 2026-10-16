@@ -171,7 +171,6 @@ dependencies = [
  "kamy-config",
  "kamy-core",
  "kamy-disasm",
- "kamy-lift",
  "kamy-link",
  "kamy-pe",
  "kamy-transforms",

@@ -54,7 +54,16 @@ pub fn construct_ssa(result: &mut LiftResult) {
         }
     }
 
-    for (bi, block_preds) in preds.iter().enumerate().take(num_blocks) {
+    let entry_idx = result
+        .func
+        .blocks
+        .iter()
+        .position(|b| b.id == result.func.entry)
+        .unwrap_or(0);
+    let order = reverse_post_order(&result.func, entry_idx, num_blocks);
+
+    for bi in order {
+        let block_preds = &preds[bi];
         let num_preds = block_preds.len();
         if num_preds == 0 {
             continue;
@@ -67,6 +76,7 @@ pub fn construct_ssa(result: &mut LiftResult) {
                 let new = result.block_exit[pred_idx][r];
                 if old != new {
                     replace_in_block(&mut result.func.blocks[bi], old, new);
+                    propagate_exit(&mut result.block_exit[bi], old, new);
                 }
             }
         } else {
@@ -80,6 +90,7 @@ pub fn construct_ssa(result: &mut LiftResult) {
                 if all_same {
                     if old != first_val {
                         replace_in_block(&mut result.func.blocks[bi], old, first_val);
+                        propagate_exit(&mut result.block_exit[bi], old, first_val);
                     }
                 } else {
                     let new_vid = result.func.alloc_value();
@@ -93,13 +104,71 @@ pub fn construct_ssa(result: &mut LiftResult) {
                         ty,
                         args: phi_args,
                     });
-                    if old != new_vid {
-                        replace_in_block(&mut result.func.blocks[bi], old, new_vid);
-                    }
+                    // The back-edge arg may reference `old`; rewriting it here turns
+                    // a loop-carried pass-through into a proper self-referential phi.
+                    replace_in_block(&mut result.func.blocks[bi], old, new_vid);
+                    propagate_exit(&mut result.block_exit[bi], old, new_vid);
                 }
             }
         }
     }
+}
+
+/// After a block-entry value is resolved to its incoming definition, any register
+/// that left the block unchanged (its exit still names the old entry undef) must
+/// carry the resolved value forward so successor blocks wire phis to a live def.
+fn propagate_exit(exit: &mut [ValueId; 38], old: ValueId, new: ValueId) {
+    for e in exit.iter_mut() {
+        if *e == old {
+            *e = new;
+        }
+    }
+}
+
+fn succ_indices(block: &IrBlock) -> Vec<usize> {
+    match &block.term {
+        IrTerminator::Jump(t) => vec![t.0 as usize],
+        IrTerminator::Branch {
+            taken, not_taken, ..
+        } => vec![taken.0 as usize, not_taken.0 as usize],
+        IrTerminator::Ret | IrTerminator::Unreachable => vec![],
+    }
+}
+
+/// Reverse post-order from the entry so a block's non-back-edge predecessors are
+/// resolved before it; back edges are handled by self-referential phis. Unreachable
+/// blocks are appended last.
+fn reverse_post_order(func: &IrFunction, entry: usize, num_blocks: usize) -> Vec<usize> {
+    let mut visited = vec![false; num_blocks];
+    let mut succ_cursor = vec![0usize; num_blocks];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut post: Vec<usize> = Vec::with_capacity(num_blocks);
+
+    if entry < num_blocks {
+        visited[entry] = true;
+        stack.push(entry);
+    }
+    while let Some(&bi) = stack.last() {
+        let succ = succ_indices(&func.blocks[bi]);
+        if succ_cursor[bi] < succ.len() {
+            let s = succ[succ_cursor[bi]];
+            succ_cursor[bi] += 1;
+            if s < num_blocks && !visited[s] {
+                visited[s] = true;
+                stack.push(s);
+            }
+        } else {
+            post.push(bi);
+            stack.pop();
+        }
+    }
+    post.reverse();
+    for (b, &seen) in visited.iter().enumerate() {
+        if !seen {
+            post.push(b);
+        }
+    }
+    post
 }
 
 #[cfg(test)]

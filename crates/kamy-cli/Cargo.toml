@@ -20,6 +20,5 @@ kamy-pe.workspace = true
 kamy-disasm.workspace = true
 kamy-link.workspace = true
 kamy-transforms.workspace = true
-kamy-lift.workspace = true
 clap.workspace = true
 anyhow.workspace = true

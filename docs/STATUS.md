@@ -24,7 +24,7 @@ Living document. Updated as work lands.
 | SSA IR types (ValueId, BlockId, IrType, 40+ IrOp, Phi, IrBlock, IrFunction, PhysReg, CallingConvLookup) | Done | `1cfc37b` |
 | Semantic lifter (all D6 ops: GPR arith/logic/data/control + SSE data movement) | Done | `1cfc37b` |
 | NativeInline fallback (iced-x86 InstructionInfoFactory → clobber sets) | Done | `1cfc37b` |
-| SSA construction (maximal phi insertion + renaming) | Done | `1cfc37b` |
+| SSA construction (maximal phi, RPO traversal, cross-block register threading) | Done | `1cfc37b`, threading fixed (RPO + block_exit propagation) |
 | Optimizer (constprop, instcombine, DCE, prune-phis, convergence) | Done | `1cfc37b` |
 | DCE live-out fix (`Use` ops before `Ret` for RAX + callee-saved) | Done | `88e9e8a` |
 | Register allocator (linear-scan, zero-spill hard constraint) | Done | `1cfc37b` |
@@ -34,25 +34,28 @@ Living document. Updated as work lands.
 | Relocating linker (thunks, .kamy section, .pdata rebuild, scrub) | Done | `b29b83b` |
 | SSA linker path (lift→ssa→opt→regalloc→isel→encode + fallback) | Done | `13196a1` |
 | No-transform relocation round-trip (169 functions, verified) | ✅ Proven | `b29b83b` |
-| No-transform SSA round-trip | ⚠️ **Unproven** | 0/169 functions lower through SSA — all fail regalloc `RegisterPressure` and silently fall back to relocation. exit=7 is 100% relocation, not SSA. |
+| No-transform SSA round-trip (shipped config) | ⚠️ 0/169 shipped | Callee-saved disabled (`&[]`) → zero-spill `RegisterPressure`; falls back to relocation. exit=7 is relocation. |
+| SSA lowering reachability (callee-saved pool enabled, diagnostic) | 95/169 regalloc-ready | Proves the SSA engine lowers real functions once the pool is available. Remaining 74: 70 zero-spill pressure, 4 XMM5 encode bug. |
 | MBA pass (add/sub/xor rules, D13 config shape) | Done | `1cfc37b` |
 | MBA probability fix | Done | `fa6b941` |
-| MBA visible output | **Blocked** | SSA lowering lands 0 real functions — see lifter bug #1 below. Not just callee-saved. |
+| MBA visible output | **Blocked** | Gated on callee-saved activation (Phase 4). Lifter threading no longer blocks it (fixed). |
 | Win32metadata calling-convention DB | Deferred | Trait wired + Win64Default + WinmdLookup todo!() |
 
-### Known lifter bugs (from external IR analysis)
+### Known bugs
 
-1. **RSP/callee-saved not threaded across blocks (the blocker).** In the lifted IR,
-   registers unchanged through a block keep their block-entry `Undef` instead of the
-   predecessor's value; downstream φ-nodes then reference dead undefs. `lift_call`'s
-   clobber list is correct (volatiles only); the fault is in SSA construction
-   (`ssa.rs`): after `replace_in_block` rewrites a block-entry undef to the incoming
-   value, the `block_exit` snapshot isn't updated, so successor blocks wire φ-args to
-   the now-dead undef. Result: artificial live values → `RegisterPressure` → 0/169
-   functions lower through SSA. This is the root blocker for all transform work.
-2. **Return-address push is materialized.** `Store(rsp, const_return_addr)` before
+1. ✅ **FIXED — RSP/callee-saved not threaded across blocks.** Registers unchanged
+   through a block kept their block-entry `Undef`; φ-nodes then referenced dead undefs
+   → artificial `RegisterPressure`. Root cause was SSA construction (`ssa.rs`), not
+   `lift_call` (its clobber list is volatiles-only). Fix: RPO traversal + propagate
+   the resolved value into `block_exit` after each replacement. Verified on `fib`
+   (RSP now threads as `v43`); SSA lowering reachability went 0 → 95/169.
+2. **XMM5 memory-operand encode failure.** 4 functions fall back with
+   `mov xmm5,[reg]` encode errors in isel/codegen. Separate from threading.
+3. **Zero-spill register pressure.** 70/169 functions exceed 15 GPRs under the D5
+   zero-spill constraint; need XMM callee-saved or a spill path. Expected gap.
+4. **Return-address push is materialized.** `Store(rsp, const_return_addr)` before
    Call could be folded into the Call node. Optimization, not correctness.
-3. **Over-approximated call args.** Win64Default passes 4 args for every call.
+5. **Over-approximated call args.** Win64Default passes 4 args for every call.
    Resolved by Win32metadata DB (D14) or PDB symbol lookup.
 
 ## Phase 3 — Obfuscation Passes
@@ -70,7 +73,7 @@ Living document. Updated as work lands.
 
 | Item | Status |
 |------|--------|
-| Callee-saved activation (RSP alignment + push/pop) | Interfaces wired, activation blocked on UNWIND_INFO |
+| Callee-saved activation (regalloc pool + isel push/pop + UNWIND_INFO) | Interfaces wired; gates shipping the 95/169 regalloc-ready SSA functions and visible MBA |
 | UNWIND_INFO reconstruction (kamy-seh) | Not started |
 | C_SCOPE_TABLE re-pointing | Not started |
 | CET shadow stack reconciliation | Not started |
@@ -91,9 +94,9 @@ Not started. Coverage reporting, API server, CI integration, ELF, ARM64.
 
 | Test | Status |
 |------|--------|
-| Unit tests (40 across 7 crates) | ✅ All pass |
+| Unit tests (across 7 crates, incl. SSA threading) | ✅ All pass |
 | Relocation round-trip (target.exe, 169 functions) | ✅ Verified (exit=7, ASLR-stable) |
-| SSA identity round-trip (target.exe) | ⚠️ Runs exit=7 but via 100% relocation fallback; 0/169 actually lower through SSA |
+| SSA identity round-trip (target.exe) | ⚠️ exit=7 via relocation fallback (callee-saved disabled); engine reaches 95/169 regalloc-ready with pool |
 | kernel32.dll analysis (2588 functions, 29717 blocks) | ✅ Verified (headers cross-checked) |
 | aftermathlabs/bintests corpus (D25) | Not adopted |
 

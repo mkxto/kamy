@@ -95,8 +95,8 @@ kamy verify input.exe protected.exe --vectors 1000
 - [x] Container IR (Module, Section, Symbol, Relocation, CFG) — Chunk/Link/SymbolicExpression land with Phase 2 symbolization
 
 ### Phase 2 — SSA IR Engine
-- [ ] x86 → SSA IR lifter (core GPR + basic SSE data movement)
-- [ ] Proper SSA construction (φ-nodes, dominance frontiers)
+- [x] x86 → SSA IR lifter (core GPR + basic SSE data movement)
+- [x] Proper SSA construction (φ-nodes, RPO cross-block register threading)
 - [ ] Calling convention database (Win32metadata, PDB)
 - [ ] Instruction selector + linear-scan register allocator
 - [ ] Codegen via iced-x86
@@ -104,7 +104,12 @@ kamy verify input.exe protected.exe --vectors 1000
 - [x] Linker: thunk placement + new section layout + PE rebuild (relocation path via iced-x86 BlockEncoder)
 - [x] Differential self-test (no-transform round-trip) — verified on a real exe; conservative function selection (D22 rejections) for indirect-branch/SEH/reloc cases
 
-Remaining Phase 2 items feed the transform-capable codegen (SSA path); the no-transform round-trip above uses relocation codegen, not the SSA lowering chain.
+The transform-capable SSA codegen now lowers correctly-threaded IR: with the
+callee-saved pool enabled it reaches 95/169 functions regalloc-ready on the test
+binary (0 before the threading fix). Shipping SSA-lowered functions is gated on
+callee-saved activation (push/pop + UNWIND_INFO, Phase 4); until then the
+no-transform round-trip and `protect` ship via the relocation codegen path.
+Remaining isel gaps: 4 XMM5 memory-operand encode failures, zero-spill pressure.
 
 ### Phase 3 — Obfuscation Passes
 - [ ] ObscureReferences
@@ -116,6 +121,7 @@ Remaining Phase 2 items feed the transform-capable codegen (SSA path); the no-tr
 - [ ] Jump table recovery & retargeting
 
 ### Phase 4 — SEH & CET
+- [ ] Callee-saved activation (regalloc pool + isel push/pop + UNWIND_INFO) — gates shipping SSA-lowered functions and visible MBA
 - [ ] .pdata/.xdata parser & rebuilder
 - [ ] UNWIND_INFO reconstruction
 - [ ] C_SCOPE_TABLE re-pointing
