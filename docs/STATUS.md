@@ -34,17 +34,22 @@ Living document. Updated as work lands.
 | Relocating linker (thunks, .kamy section, .pdata rebuild, scrub) | Done | `b29b83b` |
 | SSA linker path (lift→ssa→opt→regalloc→isel→encode + fallback) | Done | `13196a1` |
 | No-transform relocation round-trip (169 functions, verified) | ✅ Proven | `b29b83b` |
-| No-transform SSA round-trip (169 functions through SSA, verified) | ✅ Proven | `88e9e8a` |
+| No-transform SSA round-trip | ⚠️ **Unproven** | 0/169 functions lower through SSA — all fail regalloc `RegisterPressure` and silently fall back to relocation. exit=7 is 100% relocation, not SSA. |
 | MBA pass (add/sub/xor rules, D13 config shape) | Done | `1cfc37b` |
 | MBA probability fix | Done | `fa6b941` |
-| MBA visible output | **Blocked** | Regalloc needs callee-saved (Phase 4) |
+| MBA visible output | **Blocked** | SSA lowering lands 0 real functions — see lifter bug #1 below. Not just callee-saved. |
 | Win32metadata calling-convention DB | Deferred | Trait wired + Win64Default + WinmdLookup todo!() |
 
 ### Known lifter bugs (from external IR analysis)
 
-1. **CALL clobbers all registers instead of only volatiles.** RSP and callee-saved
-   (RBX, RBP, RSI, RDI, R12-R15) should survive calls. Root cause: `lift_call`
-   clobbers everything with Undef. Fix: only clobber volatile regs per Win64 ABI.
+1. **RSP/callee-saved not threaded across blocks (the blocker).** In the lifted IR,
+   registers unchanged through a block keep their block-entry `Undef` instead of the
+   predecessor's value; downstream φ-nodes then reference dead undefs. `lift_call`'s
+   clobber list is correct (volatiles only); the fault is in SSA construction
+   (`ssa.rs`): after `replace_in_block` rewrites a block-entry undef to the incoming
+   value, the `block_exit` snapshot isn't updated, so successor blocks wire φ-args to
+   the now-dead undef. Result: artificial live values → `RegisterPressure` → 0/169
+   functions lower through SSA. This is the root blocker for all transform work.
 2. **Return-address push is materialized.** `Store(rsp, const_return_addr)` before
    Call could be folded into the Call node. Optimization, not correctness.
 3. **Over-approximated call args.** Win64Default passes 4 args for every call.
@@ -88,7 +93,7 @@ Not started. Coverage reporting, API server, CI integration, ELF, ARM64.
 |------|--------|
 | Unit tests (40 across 7 crates) | ✅ All pass |
 | Relocation round-trip (target.exe, 169 functions) | ✅ Verified (exit=7, ASLR-stable) |
-| SSA identity round-trip (target.exe, 169 functions) | ✅ Verified (exit=7) |
+| SSA identity round-trip (target.exe) | ⚠️ Runs exit=7 but via 100% relocation fallback; 0/169 actually lower through SSA |
 | kernel32.dll analysis (2588 functions, 29717 blocks) | ✅ Verified (headers cross-checked) |
 | aftermathlabs/bintests corpus (D25) | Not adopted |
 
