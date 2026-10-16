@@ -85,7 +85,7 @@ Living document. Updated as work lands.
 | MutationEngine | Not started |
 | LoopEncodeSemantics | Not started (underspecified — needs design) |
 | Per-function config profiles + symbol matching | Not started |
-| Jump table recovery & retargeting (D24) | Studied | Design settled by research.md §10: layer 0 IAT/static-ptr classification → phantom-seed fix → layer 2 use-def DAG + petgraph VF2. Re-emit/retarget is our own gap (BLARE2 doesn't document it) |
+| Jump table recovery & retargeting (D24) | Layer 0 done | `jmp [rip+slot]` classified at discovery (`Terminator::Indirect { slot }`); link skips import/forwarder thunks (IAT-slot) and reports in-image static-ptr tail-calls as `ResolvableIndirect`. Measured: kernel32 `BadIndirectBranch` 922→12, target.exe 114→58. Remaining: phantom-seed fix → layer 2 use-def DAG + petgraph VF2 → re-emit/retarget (our own gap) |
 | Trampoline stub obfuscation (D29: flavor diversification + junk fill + direct-call re-pointing) | Not started |
 
 ## Phase 5 — Advanced Passes
@@ -133,16 +133,28 @@ inspect the init callbacks at `.rdata` 0x27f0.
 
 | Binary | Moved | Rejected | Rate | Top rejection |
 |--------|-------|----------|------|---------------|
-| target.exe (Rust) | 169 | 217 | 43.8% | BadIndirectBranch (114) |
-| kernel32.dll | 1214 | 1374 | 46.9% | BadIndirectBranch (922) |
+| target.exe (Rust) | 169 | 162 | 51.1% | SEHComplex (56) |
+| kernel32.dll | 1214 | 488 | 71.3% | SEHComplex (449) |
 
-Measured decomposition (jump-table study, research.md §10): kernel32's 922
-`BadIndirectBranch` = 843 export forwarders (`jmp [rel IAT]`, 6–7 bytes, not
-protection targets) + 67 internal static-pointer jumps (resolvable) + 12 real
-register-dispatch functions (11 switch tables recoverable, 4 `jmp reg` dynamic).
-target.exe's 114 = 59 static-pointer + 51 RVA-table blocks (recoverable) +
-38 dynamic vtable tail-calls (honest rejections) + phantom-seed inflation.
-Layer 0 (classify `jmp [rel X]` via IAT-range test, BLARE2-confirmed) + phantom-seed
-fix + layer 2 (use-def DAG + petgraph VF2) are the D24 implementation order.
+D24 layer 0 landed (`jmp [rip+slot]` classification). Measured reject
+breakdown after the change:
+
+- **kernel32.dll:** `BadIndirectBranch` 922 → **12** (genuine register/indexed
+  dispatch only). The former 922 split into 12 `BadIndirectBranch` + 24
+  `ResolvableIndirect` (in-image static-pointer tail-calls, direct-ification
+  pending) + 886 import/forwarder thunks now **skipped** (not rejected — not
+  protection targets). Total rejected 1374 → 488; `moved` unchanged at 1214.
+- **target.exe:** `BadIndirectBranch` 114 → **58** + 1 `ResolvableIndirect`;
+  the other 55 were `jmp [__imp_…]` import thunks, now skipped. Total rejected
+  217 → 162; `moved` unchanged at 169. (Exact IAT-slot membership is finer than
+  the study's coarse ".rdata window" bucket, so more target.exe jumps classify
+  as imports than §10.2's block-level estimate predicted.)
+
+`moved` is byte-identical before/after on both binaries — layer 0 only
+reclassifies already-rejected functions, so the protected output is unchanged
+(target.exe round-trip still reproduces `acc=0x97a61ac866cf61c7`, exit 7).
+
+Remaining D24 order: phantom-seed fix (known bug #6) → layer 2 (use-def DAG +
+petgraph VF2) for the residual `BadIndirectBranch` (register/indexed dispatch).
 
 Jump table recovery (D24) is the #1 coverage improvement.

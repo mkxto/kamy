@@ -386,10 +386,19 @@ bounds) and register-value analysis for masked forms.
 
 ### 10.4 Re-weighted D24 implementation order
 
-1. **Layer 0 — classify static `jmp [rel X]`** (biggest win, near-zero risk):
-   resolve X's initializer; IAT target → forwarder/imports (skip, or direct
-   jump to moved target); in-image function pointer → direct-ify in place.
-   Expected: kernel32 `BadIndirectBranch` 922 → ~12; target.exe 114 → ~50.
+1. **Layer 0 — classify static `jmp [rel X]`** (biggest win, near-zero risk) —
+   **DONE.** Discovery now tags `jmp qword [rip+disp]` with its fixed pointer
+   slot (`Terminator::Indirect { slot: Option<Rva> }`, computed in
+   `kamy-disasm`). The linker (`kamy-link::classify`) tests the slot against the
+   import IAT (`PeFile::import_slots`): IAT hit → import/forwarder thunk, skip
+   (not a protection target, never a rejection); other in-image slot →
+   `ResolvableIndirect` (recoverable, direct-ification pending); register or
+   table-indexed (`slot: None`) → stays `BadIndirectBranch`.
+   Measured: kernel32 `BadIndirectBranch` 922 → **12** (as predicted; 886 thunks
+   skipped, 24 `ResolvableIndirect`); target.exe 114 → **58** + 1
+   `ResolvableIndirect` (55 were `jmp [__imp_…]` import thunks — exact IAT-slot
+   membership is finer than this section's coarse ".rdata window" bucket, which
+   over-counted target.exe static-pointers). `moved` unchanged on both.
 2. **Fix phantom seeds in discovery** (unaligned call-target seeds inside
    existing .pdata ranges) — otherwise coverage numbers lie.
 3. **Layer 2 — canonical switch pattern** with entry-count + .pdata
