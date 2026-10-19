@@ -181,16 +181,18 @@ verdict. Open tool, not a CI gate (D33).
   595/2945 (20%); rejects dominated by `RegisterPressure` (1102), `SEHComplex`
   (566), `UnsupportedInstruction` (279, now incl. the fs/gs reject below).
   Coverage fell from the pre-#23 794 because the #23 correctness fixes reject
-  conservatively rather than miscompile — recovery tracked in #25.
+  conservatively rather than miscompile — recovery tracked in #15 (caller-frame
+  → concrete-RSP/frame reconstruction) and #25 (fs/gs → NativeInline passthrough).
 - **#23 backend fixes (2/4 → PASS).** The corpus caught five real SSA
   miscompiles, now fixed: logical flag negation lowered as bitwise `not`
   (every negated/compound branch always-taken); the /guard:cf tail-call
   dispatch target dropped from RAX; RSP snapshots (`mov rbp,rsp`) aliased to the
   RSP-chain pin and read post-`sub` RSP; caller-frame access under the shifted
   push prologue; and fs/gs segment operands lowered as near-null `[disp]`. The
-  last two ship as sound conservative rejects (D22). **kernel32** (was
-  `0xC0000409`) and **console_fibmix** now PASS; **gui_msgbox**/**dll_strutil**
-  remain blocked on the SSA loop back-edge threading bug (#24).
+  last two ship as sound conservative rejects (D22): `CallerFrameAccess` →
+  #15, `fs/gs` → #25. **kernel32** (was `0xC0000409`) and **console_fibmix**
+  now PASS; **gui_msgbox**/**dll_strutil** remain blocked on the SSA loop
+  back-edge threading bug (#24).
 - Negative-tested: a tampered golden makes `verify` exit non-zero and flag the
   diverging member (the oracle is not a tautology).
 - `corpus build` needs the toolchains (cl via `vcvars64.bat` / rustc; clang-cl
