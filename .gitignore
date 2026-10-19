@@ -9,6 +9,8 @@ Cargo.lock.bak
 *.dll
 *.efi
 !tests/**/*.exe
+!research/**/*.exe
+!research/**/*.efi
 
 # Editor
 .vscode/
