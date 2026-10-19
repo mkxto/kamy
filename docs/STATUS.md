@@ -154,6 +154,38 @@ enumerate the full trampoline set (5 verified: 0x1000, 0x1070, 0x10c0, 0x17c8, 0
 inspect the init callbacks at `.rdata` 0x27f0.
 
 
+## Runnable differential corpus (issue #7, D33–D36)
+
+`kamy corpus {build,bless,verify,list} --corpus <checkout>` drives a
+multi-toolchain member set in `github.com/mkxto/kamy-corpus` (pinned by
+`corpus.lock`). Each member declares an oracle; `verify` compares the protected
+binary to a committed golden record blessed from the original and reports SSA
+lift/lower coverage beside the pass/fail verdict. Open tool, not a CI gate (D33).
+
+| Member | Toolchain | Oracle | verify | coverage ssa/reloc/reject |
+|--------|-----------|--------|--------|---------------------------|
+| console_fibmix | rustc | stdio | ✅ PASS | 0 / 203 / 146 |
+| gui_msgbox | msvc (cl) | winapi link-shim trace | ✅ PASS | 0 / 394 / 131 |
+| dll_strutil | msvc (cl) | loader / pure exports | ✅ PASS | 0 / 266 / 96 |
+| kernel32 (vendored) | prebuilt | loader / pure exports | ✅ PASS | 0 / 1276 / 433 |
+
+- gui trace comes from a build-time winapi link-shim (no DLL injection):
+  `MessageBoxW|hello world`, `MessageBoxW|second`.
+- dll members run under a loader that maps a uniquely-named copy — defeating the
+  KnownDLLs short-circuit so kernel32's real bytes execute — and calls curated
+  pure exports (`MulDiv(6,7,3)=14`, `lstrlenW=5`, `kamy_fnv("abc")=440920331`).
+- `ssa_lowered=0` because `--no-transform` relocates verbatim; the metric climbs
+  as SSA-forcing transforms land. Totals match the Rejection-rates table.
+- Negative-tested: a tampered golden makes `verify` exit non-zero and flag the
+  diverging member (the oracle is not a tautology).
+- `corpus build` needs the toolchains (cl via `vcvars64.bat` / rustc; clang-cl
+  skipped when absent); `corpus verify` consumes the published originals +
+  goldens and needs no compiler (D34).
+- **Host note:** a protection engine's outputs are inherently AV-flagged. The
+  corpus work dir must be excluded from real-time AV
+  (`Add-MpPreference -ExclusionPath 'C:\dev\kamy-corpus'`) or Defender
+  quarantines generated/protected DLLs (`err 225`).
+
 ## Test corpus
 
 | Test | Status |
@@ -164,6 +196,7 @@ inspect the init callbacks at `.rdata` 0x27f0.
 | kernel32.dll SSA round-trip (2588 functions) | ✅ Verified (static) | Rebuilds via SSA (362 lowered); re-parses as valid PE, exports preserved, exception table consistent (1608/1608 RUNTIME_FUNCTIONs). DLL — not executed. |
 | aftermathlabs/bintests corpus (D25) | Not adopted |
 | backengineering/bintests `misc/jtables` — jump-table corpus (research.md §10.5) | Not adopted |
+| Runnable corpus (issue #7): console/gui/dll/kernel32 | ✅ 4/4 PASS | Golden-record verify + SSA coverage; kernel32 pure exports now executed (loader). |
 
 ## Rejection rates
 
