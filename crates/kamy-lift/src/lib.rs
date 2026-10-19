@@ -586,7 +586,17 @@ pub(crate) fn write_operand(
             }
             if let Some(gpr) = iced_reg_to_gpr(reg) {
                 if ty == IrType::I64 {
-                    state.set_gpr(gpr, val);
+                    // Snapshotting RSP into another register (frame pointer, or a
+                    // saved base like `mov r11,rsp`) must break the RSP pin: the
+                    // allocator pins every rsp-chain value to physical RSP, but a
+                    // copy kept live past a later `sub rsp` needs its own register,
+                    // or its reads would see the already-shifted RSP.
+                    let stored = if gpr != Gpr::Rsp && state.rsp_chain.contains(&val) {
+                        builder.emit(IrOp::Copy, &[val], IrType::I64)
+                    } else {
+                        val
+                    };
+                    state.set_gpr(gpr, stored);
                 } else {
                     let extended = builder.emit(IrOp::Zext, &[val], IrType::I64);
                     state.set_gpr(gpr, extended);
