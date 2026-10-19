@@ -171,27 +171,33 @@ fn verify_corpus_cmd(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Print the two-axis corpus report: per-member PASS/FAIL with
-/// `ssa_lowered/relocated/rejected`, the corpus TOTAL, and the merged rejection
-/// reasons sorted by count descending.
+/// Print the two-axis corpus report: per-member PASS/FAIL, SSA-lowered vs
+/// not-covered (relocated + rejected) with a coverage percent, the corpus
+/// TOTAL, and the merged rejection reasons sorted by count descending.
 fn print_coverage(cov: &kamy_corpus::CorpusCoverage) {
     println!();
-    println!("coverage  name                     verdict  ssa_lowered/relocated/rejected");
-    for m in &cov.members {
-        println!(
-            "          {:<24} {:<7}  {}/{}/{}",
-            m.name,
-            if m.passed { "PASS" } else { "FAIL" },
-            m.coverage.ssa_lowered,
-            m.coverage.relocated,
-            m.coverage.rejected,
-        );
-    }
-    let t = &cov.total;
     println!(
-        "          {:<24} {:<7}  {}/{}/{}",
-        "TOTAL", "", t.ssa_lowered, t.relocated, t.rejected,
+        "coverage  {:<24} {:<7}  {:>11} {:>9} {:>8}  coverage",
+        "name", "verdict", "SSA-lowered", "relocated", "rejected"
     );
+    let row = |name: &str, verdict: &str, c: &kamy_corpus::Coverage| {
+        let total = c.ssa_lowered + c.relocated + c.rejected;
+        let pct = if total > 0 {
+            100.0 * c.ssa_lowered as f64 / total as f64
+        } else {
+            0.0
+        };
+        println!(
+            "          {name:<24} {verdict:<7}  {:>11} {:>9} {:>8}  {}/{total} ({pct:.1}%)",
+            c.ssa_lowered, c.relocated, c.rejected, c.ssa_lowered
+        );
+    };
+    for m in &cov.members {
+        row(&m.name, if m.passed { "PASS" } else { "FAIL" }, &m.coverage);
+    }
+    row("TOTAL", "", &cov.total);
+    println!("not covered = relocated + rejected; verbatim relocation is not SSA coverage.");
+    let t = &cov.total;
     if !t.by_reason.is_empty() {
         let mut reasons: Vec<_> = t.by_reason.iter().collect();
         reasons.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
@@ -304,7 +310,7 @@ fn protect_pipeline(input: &Path, output: &Path) -> anyhow::Result<Coverage> {
     }
     Ok(Coverage {
         ssa_lowered: report.ssa_lowered,
-        relocated: report.moved.len(),
+        relocated: report.moved.len().saturating_sub(report.ssa_lowered),
         rejected: report.rejected.len(),
         by_reason,
     })

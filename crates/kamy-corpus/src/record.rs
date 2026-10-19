@@ -10,8 +10,11 @@ use crate::manifest::MemberKind;
 /// SSA lift/lower coverage for one member, or an accumulated corpus total.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Coverage {
+    /// Functions lowered through the SSA pipeline — the only "covered" bucket.
     pub ssa_lowered: usize,
+    /// Functions shipped as verbatim relocations (no SSA) — not covered.
     pub relocated: usize,
+    /// Functions rejected with a reason — not covered.
     pub rejected: usize,
     pub by_reason: std::collections::BTreeMap<String, usize>,
 }
