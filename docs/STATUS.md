@@ -166,10 +166,10 @@ verdict. Open tool, not a CI gate (D33).
 
 | Member | Toolchain | Oracle | verify | SSA / reloc / reject | coverage |
 |--------|-----------|--------|--------|----------------------|----------|
-| console_fibmix | rustc | stdio | ✅ PASS | 96 / 1 / 252 | 96/349 (28%) |
-| gui_msgbox | msvc (cl) | winapi link-shim trace | ❌ FAIL `0xC0000005` | 170 / 0 / 355 | 170/525 (32%) |
-| dll_strutil | msvc (cl) | loader / pure exports | ❌ FAIL `0xC0000005` | 131 / 0 / 231 | 131/362 (36%) |
-| kernel32 (vendored) | prebuilt | loader / pure exports | ❌ FAIL `0xC0000409` | 397 / 2 / 1310 | 397/1709 (23%) |
+| console_fibmix | rustc | stdio | ✅ PASS | 40 / 1 / 308 | 40/349 (11%) |
+| gui_msgbox | msvc (cl) | winapi link-shim trace | ❌ FAIL (SSA #24) | 145 / 0 / 380 | 145/525 (28%) |
+| dll_strutil | msvc (cl) | loader / pure exports | ❌ FAIL (SSA #24) | 115 / 0 / 247 | 115/362 (32%) |
+| kernel32 (vendored) | prebuilt | loader / pure exports | ✅ PASS | 295 / 2 / 1412 | 295/1709 (17%) |
 
 - gui trace comes from a build-time winapi link-shim (no DLL injection):
   `MessageBoxW|hello world`, `MessageBoxW|second`.
@@ -177,14 +177,20 @@ verdict. Open tool, not a CI gate (D33).
   KnownDLLs short-circuit so kernel32's real bytes execute — and calls curated
   pure exports (`MulDiv(6,7,3)=14`, `lstrlenW=5`, `kamy_fnv("abc")=440920331`).
 - Coverage = SSA-lowered / total; **relocated and rejected are both not-covered**.
-  Verbatim relocation is banned — SSA failures are rejected in place — so `relocated`
-  is ≈0 (switch-table retargets only). TOTAL 794/2945 (27%); rejects dominated by
-  `RegisterPressure` (1275, the zero-spill D5 budget).
-- **Caught real SSA miscompiles — issue #7's whole purpose.** The SSA-protected
-  gui_msgbox and dll_strutil access-violate (`0xC0000005`) and kernel32 fast-fails
-  on a stack-buffer overrun (`0xC0000409`); console_fibmix lowers 96 functions and
-  runs clean. These are backend-correctness bugs the corpus now gates, not corpus
-  defects. A green corpus is the precondition for SSA/backend changes (issue #7).
+  Verbatim relocation is banned — SSA failures are rejected in place. TOTAL
+  595/2945 (20%); rejects dominated by `RegisterPressure` (1102), `SEHComplex`
+  (566), `UnsupportedInstruction` (279, now incl. the fs/gs reject below).
+  Coverage fell from the pre-#23 794 because the #23 correctness fixes reject
+  conservatively rather than miscompile — recovery tracked in #25.
+- **#23 backend fixes (2/4 → PASS).** The corpus caught five real SSA
+  miscompiles, now fixed: logical flag negation lowered as bitwise `not`
+  (every negated/compound branch always-taken); the /guard:cf tail-call
+  dispatch target dropped from RAX; RSP snapshots (`mov rbp,rsp`) aliased to the
+  RSP-chain pin and read post-`sub` RSP; caller-frame access under the shifted
+  push prologue; and fs/gs segment operands lowered as near-null `[disp]`. The
+  last two ship as sound conservative rejects (D22). **kernel32** (was
+  `0xC0000409`) and **console_fibmix** now PASS; **gui_msgbox**/**dll_strutil**
+  remain blocked on the SSA loop back-edge threading bug (#24).
 - Negative-tested: a tampered golden makes `verify` exit non-zero and flag the
   diverging member (the oracle is not a tautology).
 - `corpus build` needs the toolchains (cl via `vcvars64.bat` / rustc; clang-cl
@@ -205,7 +211,7 @@ verdict. Open tool, not a CI gate (D33).
 | kernel32.dll SSA round-trip (2588 functions) | ✅ Verified (static) | Rebuilds via SSA (362 lowered); re-parses as valid PE, exports preserved, exception table consistent (1608/1608 RUNTIME_FUNCTIONs). DLL — not executed. |
 | aftermathlabs/bintests corpus (D25) | Not adopted |
 | backengineering/bintests `misc/jtables` — jump-table corpus (research.md §10.5) | Not adopted |
-| Runnable corpus (issue #7): console/gui/dll/kernel32 | 🔶 console PASS; 3 SSA miscompiles caught | SSA-identity verify + coverage (18.5%); gui/dll `0xC0000005`, kernel32 `0xC0000409` — real backend bugs surfaced. |
+| Runnable corpus (#7): console/gui/dll/kernel32 | 🔶 2/4 PASS (console, kernel32) | #23 fixed 5 SSA miscompiles; gui/dll blocked on SSA back-edge threading (#24), coverage recovery (#25). |
 
 ## Rejection rates
 
