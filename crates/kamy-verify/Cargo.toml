@@ -10,7 +10,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
 kamy-core.workspace = true
+tracing.workspace = true
 
 # Authoring-layer verification tools (grilling D12) are offline/dev-only and
 # land with the MBA rule-authoring tooling in Phase 5:

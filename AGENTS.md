@@ -56,7 +56,9 @@ assumptions. PE-specific code lives only in `kamy-pe`, `kamy-seh`, `kamy-link`,
 and format-specific discovery heuristics in `kamy-disasm`.
 
 Shared types live in `kamy-core` and are consumed, never duplicated. A second
-convention for an existing concern is a defect.
+convention for an existing concern is a defect. `kamy-observe` is likewise
+format-agnostic shared infrastructure — terminal-first observability consumed
+by the front-end, carrying no PE/ELF assumptions.
 
 ## Dependencies
 
@@ -68,6 +70,46 @@ Every dependency must pass both gates (grilling **C1/C2**):
 Never copy-paste or vendor another project's source. Use crates as Cargo
 dependencies; reference designs are fine, lifted code is not. Centralize
 versions in the root `[workspace.dependencies]`.
+
+## Error handling & observability
+
+Errors are standardized on `anyhow`. Every fallible fn — public or private —
+returns `anyhow::Result<T>`; attach context at each boundary with `.context()`
+or `.with_context(|| ...)`, and raise with `bail!`, `ensure!`, or `anyhow!`.
+There are no `thiserror` error enums; `thiserror` has been removed from the
+workspace. The one exception is `kamy_core::RejectionReason`: it is **domain
+data** describing a graceful per-function reject (**D22/D28**), not an error, so
+it stays an enum and is never wrapped in an `anyhow` error.
+
+Diagnostics are standardized on `tracing`. The `kamy-observe` crate owns the
+global subscriber; only the binary front-end (`kamy-cli`) installs it, via
+`kamy_observe::init`. Library crates only emit events and spans — never
+`println!` or `eprintln!`.
+
+Severity is a contract:
+
+- `warn!` — graceful degradation of the requested protection: a pass skipped,
+  transform intensity reduced (**D28** pressure ladder), register pressure
+  forcing a retry or relocation fallback, symbolization below threshold, an
+  unsupported construct the lifter cannot model.
+- `info!` — high-level milestones with counts: functions discovered, moved and
+  rejected totals, the per-reason reject summary.
+- `debug!` — per-unit detail: an individual function's reject (address + reason)
+  or move, a recovered/failed jump table, a parsed-PE summary.
+- `trace!` — per-instruction / per-interval detail.
+- `error!` — reserved for the front-end. Library code returns the error with
+  `.context()` instead of logging and swallowing it.
+
+Use structured fields, not string interpolation
+(`warn!(addr = %rva, reason = %r, "function rejected")`), keep the message a
+short static string, and open at most one span per phase or per function —
+never per instruction.
+
+Level and per-crate scope are controlled by `KAMY_LOG` (EnvFilter syntax, e.g.
+`KAMY_LOG=warn,kamy_link=debug,kamy_transforms=trace`) or the CLI flags `-v`/
+`-vv` (info/debug/trace), `-q` (errors only), `--log <filter>`, and
+`--log-format <compact|tree|json>`. Diagnostics go to stderr; stdout carries
+command results.
 
 ## Build & verification gates
 

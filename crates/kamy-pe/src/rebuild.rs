@@ -1,8 +1,9 @@
 use kamy_core::{Rva, SectionFlags};
 
+use anyhow::Context;
+
 use crate::{
-    IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, PeError, PeFile, read_u16,
-    read_u32,
+    IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, PeFile, read_u16, read_u32,
 };
 
 const IMAGE_SCN_CNT_CODE: u32 = 0x20;
@@ -75,7 +76,7 @@ impl PeFile {
     /// Produce a new PE image: original bytes, with appended sections, applied
     /// byte patches, an extended section table, bumped NumberOfSections and
     /// SizeOfImage, and updated data directory entries.
-    pub fn rebuild(&self, edits: &PeEdits) -> Result<Vec<u8>, PeError> {
+    pub fn rebuild(&self, edits: &PeEdits) -> anyhow::Result<Vec<u8>> {
         let mut out = self.bytes.clone();
         if edits.is_empty() {
             return Ok(out);
@@ -102,23 +103,23 @@ impl PeFile {
         let mut header_cursor = layout
             .section_table
             .checked_add(layout.num_sections * SECTION_HEADER_SIZE)
-            .ok_or(PeError::NoHeaderRoom)?;
+            .context("no room in header for new section")?;
 
         for section in &edits.new_sections {
             let slot_end = header_cursor
                 .checked_add(SECTION_HEADER_SIZE)
-                .ok_or(PeError::NoHeaderRoom)?;
+                .context("no room in header for new section")?;
             if slot_end > header_limit {
-                return Err(PeError::NoHeaderRoom);
+                anyhow::bail!("no room in header for new section");
             }
 
             let raw_pointer = align(
-                u32::try_from(out.len()).map_err(|_| PeError::Truncated)?,
+                u32::try_from(out.len()).context("value exceeds u32")?,
                 layout.file_alignment,
             );
             out.resize(raw_pointer as usize, 0);
 
-            let virtual_size = u32::try_from(section.data.len()).map_err(|_| PeError::Truncated)?;
+            let virtual_size = u32::try_from(section.data.len()).context("value exceeds u32")?;
             let raw_size = align(virtual_size, layout.file_alignment);
             out.extend_from_slice(&section.data);
             out.resize(raw_pointer as usize + raw_size as usize, 0);
@@ -138,12 +139,12 @@ impl PeFile {
         write_u16(
             &mut out,
             layout.coff + 2,
-            u16::try_from(new_num_sections).map_err(|_| PeError::NoHeaderRoom)?,
+            u16::try_from(new_num_sections).context("no room in header for new section")?,
         )?;
 
         let mut size_of_image = read_u32(&out, layout.opt + 56)?;
         for section in &edits.new_sections {
-            let virtual_size = u32::try_from(section.data.len()).map_err(|_| PeError::Truncated)?;
+            let virtual_size = u32::try_from(section.data.len()).context("value exceeds u32")?;
             let end = align(
                 section.rva.get().saturating_add(virtual_size),
                 layout.section_alignment,
@@ -154,7 +155,7 @@ impl PeFile {
 
         for update in &edits.directories {
             if update.index >= layout.num_dirs {
-                return Err(PeError::Malformed("directory index out of range"));
+                anyhow::bail!("directory index out of range");
             }
             let base = layout.opt + 112 + update.index * 8;
             write_u32(&mut out, base, update.rva.get())?;
@@ -172,7 +173,7 @@ impl PeFile {
             .unwrap_or(0)
     }
 
-    fn header_layout(&self) -> Result<HeaderLayout, PeError> {
+    fn header_layout(&self) -> anyhow::Result<HeaderLayout> {
         let e_lfanew = read_u32(&self.bytes, 0x3c)? as usize;
         let coff = e_lfanew + 4;
         let num_sections = read_u16(&self.bytes, coff + 2)? as usize;
@@ -190,24 +191,26 @@ impl PeFile {
         })
     }
 
-    fn patch_offset(&self, rva: u32, len: usize) -> Result<usize, PeError> {
+    fn patch_offset(&self, rva: u32, len: usize) -> anyhow::Result<usize> {
         for s in &self.sections {
             if rva >= s.rva && rva < s.rva.saturating_add(s.raw_size) {
                 let delta = (rva - s.rva) as usize;
                 let offset = (s.raw_pointer as usize)
                     .checked_add(delta)
-                    .ok_or(PeError::PatchOutOfBounds)?;
+                    .context("patch target out of section bounds")?;
                 let section_raw_end = (s.raw_pointer as usize)
                     .checked_add(s.raw_size as usize)
-                    .ok_or(PeError::PatchOutOfBounds)?;
-                let end = offset.checked_add(len).ok_or(PeError::PatchOutOfBounds)?;
+                    .context("patch target out of section bounds")?;
+                let end = offset
+                    .checked_add(len)
+                    .context("patch target out of section bounds")?;
                 if end > section_raw_end || end > self.bytes.len() {
-                    return Err(PeError::PatchOutOfBounds);
+                    anyhow::bail!("patch target out of section bounds");
                 }
                 return Ok(offset);
             }
         }
-        Err(PeError::PatchOutOfBounds)
+        anyhow::bail!("patch target out of section bounds");
     }
 }
 
@@ -244,10 +247,10 @@ fn write_section_header(
     raw_pointer: u32,
     raw_size: u32,
     virtual_size: u32,
-) -> Result<(), PeError> {
+) -> anyhow::Result<()> {
     let header = bytes
         .get_mut(offset..offset + SECTION_HEADER_SIZE)
-        .ok_or(PeError::NoHeaderRoom)?;
+        .context("no room in header for new section")?;
     header.fill(0);
 
     let name = section.name.as_bytes();
@@ -262,20 +265,24 @@ fn write_section_header(
     Ok(())
 }
 
-fn write_u16(bytes: &mut [u8], offset: usize, value: u16) -> Result<(), PeError> {
-    let end = offset.checked_add(2).ok_or(PeError::Truncated)?;
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) -> anyhow::Result<()> {
+    let end = offset
+        .checked_add(2)
+        .context("input truncated or out of bounds")?;
     bytes
         .get_mut(offset..end)
-        .ok_or(PeError::Truncated)?
+        .context("input truncated or out of bounds")?
         .copy_from_slice(&value.to_le_bytes());
     Ok(())
 }
 
-fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), PeError> {
-    let end = offset.checked_add(4).ok_or(PeError::Truncated)?;
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> anyhow::Result<()> {
+    let end = offset
+        .checked_add(4)
+        .context("input truncated or out of bounds")?;
     bytes
         .get_mut(offset..end)
-        .ok_or(PeError::Truncated)?
+        .context("input truncated or out of bounds")?
         .copy_from_slice(&value.to_le_bytes());
     Ok(())
 }

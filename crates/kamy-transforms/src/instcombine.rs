@@ -25,6 +25,10 @@ enum Pending {
 }
 
 impl Pass for InstCombine {
+    fn name(&self) -> &'static str {
+        "inst-combine"
+    }
+
     fn run(&self, func: &mut IrFunction) -> bool {
         let mut consts: HashMap<ValueId, u64> = HashMap::new();
         let mut not_of: HashMap<ValueId, ValueId> = HashMap::new();

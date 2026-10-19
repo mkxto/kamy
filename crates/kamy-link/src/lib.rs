@@ -1,6 +1,7 @@
 //! Relocating linker: move selected functions into a new section, leave a thunk
 //! at each original entry, scrub the vacated body, and rebuild the PE.
 
+use anyhow::Context;
 use kamy_codegen::{relocate, relocate_with_offsets, thunk};
 use kamy_core::ir::{CallingConvLookup, IrFunction};
 use kamy_core::{Function, Module, RejectionReason, Rva, SectionFlags};
@@ -12,14 +13,6 @@ const ENDBR64: [u8; 4] = [0xF3, 0x0F, 0x1E, 0xFA];
 const INT3: u8 = 0xCC;
 const NEAR_JMP_LEN: u32 = 5;
 const FUNCTION_ALIGN: u32 = 16;
-
-#[derive(Debug, thiserror::Error)]
-pub enum LinkError {
-    #[error("codegen: {0}")]
-    Codegen(#[from] kamy_codegen::CodegenError),
-    #[error("pe rebuild: {0}")]
-    Pe(#[from] kamy_pe::PeError),
-}
 
 pub struct Options {
     pub code_section: String,
@@ -64,13 +57,10 @@ pub fn protect(
     module: &Module,
     functions: &[Function],
     opts: &Options,
-) -> Result<(Vec<u8>, Report), LinkError> {
+) -> anyhow::Result<(Vec<u8>, Report)> {
     protect_inner(pe, module, functions, opts, |module, func, base, new_va| {
         let instrs = function_instructions(module, func);
-        Ok((
-            relocate(&instrs, base + u64::from(new_va)).map_err(LinkError::from)?,
-            None,
-        ))
+        Ok((relocate(&instrs, base + u64::from(new_va))?, None))
     })
 }
 
@@ -87,7 +77,7 @@ pub fn protect_with_transforms(
     opts: &Options,
     cc: &dyn CallingConvLookup,
     transform: &mut dyn FnMut(&mut IrFunction, f32),
-) -> Result<(Vec<u8>, Report), LinkError> {
+) -> anyhow::Result<(Vec<u8>, Report)> {
     protect_inner(
         pe,
         module,
@@ -99,7 +89,7 @@ pub fn protect_with_transforms(
                 Ok((body, shape)) => Ok((body, Some(shape))),
                 Err(_) => {
                     let instrs = function_instructions(module, func);
-                    Ok((relocate(&instrs, new_va).map_err(LinkError::from)?, None))
+                    Ok((relocate(&instrs, new_va)?, None))
                 }
             }
         },
@@ -113,7 +103,7 @@ fn ssa_body(
     transform: &mut dyn FnMut(&mut IrFunction, f32),
     base: u64,
     new_va: u64,
-) -> Result<(Vec<u8>, PrologueShape), LinkError> {
+) -> anyhow::Result<(Vec<u8>, PrologueShape)> {
     // D28 pressure ladder: when the zero-spill allocator overflows under a
     // transform, retry at reduced intensity before giving up. Re-lift per
     // attempt so each intensity sees a clean IR. The non-pressure rejects
@@ -123,29 +113,23 @@ fn ssa_body(
     // caller's fallback) only after intensity 0.0 still fails.
     const INTENSITY_LADDER: [f32; 4] = [1.0, 0.5, 0.25, 0.0];
     let entry_va = base + u64::from(func.entry.get());
-    for &intensity in &INTENSITY_LADDER {
+    for (i, &intensity) in INTENSITY_LADDER.iter().enumerate() {
         let mut result = kamy_lift::lift_function(module, func, cc);
         if result.unsupported {
-            return Err(LinkError::Codegen(kamy_codegen::CodegenError::Encode(
-                "unsupported construct".into(),
-            )));
+            anyhow::bail!("unsupported construct");
         }
         kamy_lift::ssa::construct_ssa(&mut result);
         transform(&mut result.func, intensity);
         kamy_transforms::optimize(&mut result.func);
         if uses_unsupported_flags(&result.func) {
-            return Err(LinkError::Codegen(kamy_codegen::CodegenError::Encode(
-                "add/shift-based flag consumed by branch or setcc".into(),
-            )));
+            anyhow::bail!("add/shift-based flag consumed by branch or setcc");
         }
         if result.func.blocks.iter().any(|b| {
             b.insts
                 .iter()
                 .any(|i| matches!(i.op, kamy_core::ir::IrOp::Call { target } if target == entry_va))
         }) {
-            return Err(LinkError::Codegen(kamy_codegen::CodegenError::Encode(
-                "self-recursive (frame reconstruction pending)".into(),
-            )));
+            anyhow::bail!("self-recursive (frame reconstruction pending)");
         }
 
         match kamy_codegen::allocate_registers(
@@ -162,14 +146,24 @@ fn ssa_body(
                     aligned: used.len() % 2 == 1,
                     pushed: used,
                 };
-                return Ok((relocate(&instrs, new_va).map_err(LinkError::from)?, shape));
+                return Ok((relocate(&instrs, new_va)?, shape));
             }
-            Err(_) => continue,
+            Err(_) => {
+                let msg = "register pressure";
+                if let Some(&next) = INTENSITY_LADDER.get(i + 1) {
+                    tracing::warn!(
+                        func = %func.entry,
+                        next_intensity = next,
+                        reason = %msg,
+                        "register pressure: retrying at reduced intensity"
+                    );
+                }
+                continue;
+            }
         }
     }
-    Err(LinkError::Codegen(kamy_codegen::CodegenError::Encode(
-        "register pressure".into(),
-    )))
+    tracing::debug!(func = %func.entry, "pressure ladder exhausted");
+    anyhow::bail!("register pressure");
 }
 
 /// Add- and shift-based condition flags (`add;jo`, `shl;jc`, …) cannot be
@@ -239,8 +233,8 @@ fn protect_inner(
         &Function,
         u64,
         u32,
-    ) -> Result<(Vec<u8>, Option<PrologueShape>), LinkError>,
-) -> Result<(Vec<u8>, Report), LinkError> {
+    ) -> anyhow::Result<(Vec<u8>, Option<PrologueShape>)>,
+) -> anyhow::Result<(Vec<u8>, Report)> {
     let base = module.image_base;
     let table_base_rva = pe.next_section_rva().get();
     let sect_align = pe.section_alignment();
@@ -278,6 +272,7 @@ fn protect_inner(
     let mut tables: Vec<u8> = Vec::with_capacity(total_tables as usize);
 
     for func in ordered {
+        let _s = tracing::debug_span!("function", addr = %func.entry).entered();
         match classify(module, func, &runtime_fns, &import_slots) {
             Ok(cand) => {
                 pad_to_align(&mut code, FUNCTION_ALIGN);
@@ -291,6 +286,11 @@ fn protect_inner(
                             report
                                 .rejected
                                 .push((func.entry, RejectionReason::CodegenFailure));
+                            tracing::debug!(
+                                addr = %func.entry,
+                                reason = %RejectionReason::CodegenFailure,
+                                "function rejected"
+                            );
                             continue;
                         }
                     }
@@ -311,6 +311,11 @@ fn protect_inner(
                             report
                                 .rejected
                                 .push((func.entry, RejectionReason::RecoverableSwitch));
+                            tracing::debug!(
+                                addr = %func.entry,
+                                reason = %RejectionReason::RecoverableSwitch,
+                                "function rejected"
+                            );
                             continue;
                         }
                     }
@@ -347,14 +352,32 @@ fn protect_inner(
                     unwind,
                 });
                 pending_patches.extend(patches);
+                tracing::debug!(
+                    addr = %func.entry,
+                    new_rva = format_args!("{new_rva:#x}"),
+                    len = body.len() as u32,
+                    "moved function"
+                );
             }
-            Err(Some(reason)) => report.rejected.push((func.entry, reason)),
+            Err(Some(reason)) => {
+                tracing::debug!(addr = %func.entry, reason = %reason, "function rejected");
+                report.rejected.push((func.entry, reason));
+            }
             Err(None) => {}
         }
     }
+    tracing::info!(
+        moved = report.moved.len(),
+        ssa_lowered = report.ssa_lowered,
+        rejected = report.rejected.len(),
+        "protection complete"
+    );
 
     if moved.is_empty() {
-        return Ok((pe.rebuild(&PeEdits::default())?, report));
+        return Ok((
+            pe.rebuild(&PeEdits::default()).context("rebuilding PE")?,
+            report,
+        ));
     }
 
     let code_len = code.len() as u32;
@@ -436,7 +459,7 @@ fn protect_inner(
         patches: pending_patches,
         directories,
     };
-    Ok((pe.rebuild(&edits)?, report))
+    Ok((pe.rebuild(&edits).context("rebuilding PE")?, report))
 }
 
 struct Candidate {

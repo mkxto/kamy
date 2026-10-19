@@ -7,6 +7,10 @@ use crate::Pass;
 pub struct Dce;
 
 impl Pass for Dce {
+    fn name(&self) -> &'static str {
+        "dce"
+    }
+
     fn run(&self, func: &mut IrFunction) -> bool {
         let mut def_args: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
         for block in &func.blocks {

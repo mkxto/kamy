@@ -35,6 +35,7 @@ kamy/
 │   ├── kamy-seh/            SEH/unwind: RUNTIME_FUNCTION, UNWIND_INFO, C_SCOPE_TABLE
 │   ├── kamy-verify/         SMT verification, test-vector equivalence
 │   ├── kamy-config/        YAML profile parsing, per-function config
+│   ├── kamy-observe/        tracing subscriber + log config (terminal-first diagnostics)
 │   └── kamy-cli/            CLI binary
 ├── docs/
 │   ├── research.md          Prior art, techniques, academic references
@@ -82,6 +83,22 @@ kamy protect input.exe --profile kamy.yml -o protected.exe --debug-map debug.jso
 
 # Verify: test-vector equivalence check
 kamy verify input.exe protected.exe --vectors 1000
+```
+
+### Logging
+
+Diagnostics use `tracing`; results go to stdout, all logs to stderr. Control
+level and per-crate scope with `KAMY_LOG` (EnvFilter syntax) or CLI flags:
+
+```sh
+# Per-crate scope via env filter
+KAMY_LOG=warn,kamy_link=debug kamy protect input.exe --profile kamy.yml -o protected.exe
+
+# Verbosity flags: -v/-vv (info/debug/trace), -q (errors only)
+kamy protect input.exe --profile kamy.yml -o protected.exe -vv
+
+# Explicit filter and output format
+kamy protect input.exe --profile kamy.yml -o protected.exe --log info --log-format tree
 ```
 
 ## Roadmap

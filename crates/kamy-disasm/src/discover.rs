@@ -29,6 +29,7 @@ const NORETURN_IMPORTS: &[&str] = &[
 ];
 
 pub fn discover_functions(module: &Module, seeds: &[Rva]) -> Vec<Function> {
+    let _s = tracing::info_span!("discover").entered();
     let mut worklist: Vec<Rva> = seeds
         .iter()
         .copied()
@@ -61,5 +62,6 @@ pub fn discover_functions(module: &Module, seeds: &[Rva]) -> Vec<Function> {
     }
 
     functions.sort_by_key(|f| f.entry.get());
+    tracing::info!(functions = functions.len(), "discovered functions");
     functions
 }

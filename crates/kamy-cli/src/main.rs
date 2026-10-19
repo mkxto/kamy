@@ -23,6 +23,22 @@ type TransformFn = dyn FnMut(&mut kamy_core::ir::IrFunction, f32);
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Increase log verbosity; repeat for more detail (-v, -vv, -vvv).
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Silence all logging except errors.
+    #[arg(short, long, global = true)]
+    quiet: bool,
+
+    /// `EnvFilter` directives, e.g. `kamy_link=debug,warn`.
+    #[arg(long, global = true)]
+    log: Option<String>,
+
+    /// Log output format.
+    #[arg(long, global = true, default_value = "compact")]
+    log_format: kamy_observe::LogFormat,
 }
 
 #[derive(Subcommand)]
@@ -72,6 +88,13 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    kamy_observe::init(&kamy_observe::LogConfig {
+        verbosity: cli.verbose,
+        quiet: cli.quiet,
+        filter: cli.log.clone(),
+        format: cli.log_format,
+        ansi: None,
+    })?;
     match cli.command {
         Command::Analyze { input, output, .. } => analyze(&input, output.as_deref()),
         Command::Protect {
@@ -108,15 +131,18 @@ fn verify(original: &Path, protected: &Path, vectors: u32) -> anyhow::Result<()>
         return Ok(());
     }
 
-    eprintln!(
-        "verify FAIL: {} run(s), {} mismatch(es)",
-        report.runs,
-        report.mismatches.len()
+    tracing::error!(
+        runs = report.runs,
+        mismatches = report.mismatches.len(),
+        "verify failed"
     );
     for m in report.mismatches.iter().take(5) {
-        eprintln!(
-            "  run {} {}: original={} protected={}",
-            m.run, m.field, m.original, m.protected
+        tracing::warn!(
+            run = m.run,
+            field = %m.field,
+            original = %m.original,
+            protected = %m.protected,
+            "mismatch"
         );
     }
     anyhow::bail!("verify failed: protected binary diverges from original");
@@ -173,14 +199,14 @@ fn protect_identity(input: &Path, output: &Path) -> anyhow::Result<()> {
     for (_, reason) in &report.rejected {
         *by_reason.entry(reason.tag()).or_default() += 1;
     }
-    eprintln!(
-        "moved {} function(s) ({} via SSA), rejected {}",
-        report.moved.len(),
-        report.ssa_lowered,
-        report.rejected.len()
+    tracing::info!(
+        moved = report.moved.len(),
+        ssa_lowered = report.ssa_lowered,
+        rejected = report.rejected.len(),
+        "protection complete"
     );
     for (reason, count) in by_reason {
-        eprintln!("  reject {reason}: {count}");
+        tracing::info!(reason = %reason, count, "reject summary");
     }
     Ok(())
 }
@@ -248,14 +274,14 @@ fn protect_with_profile(input: &Path, output: &Path, profile_path: &Path) -> any
     for (_, reason) in &report.rejected {
         *by_reason.entry(reason.tag()).or_default() += 1;
     }
-    eprintln!(
-        "moved {} function(s) ({} via SSA), rejected {}",
-        report.moved.len(),
-        report.ssa_lowered,
-        report.rejected.len()
+    tracing::info!(
+        moved = report.moved.len(),
+        ssa_lowered = report.ssa_lowered,
+        rejected = report.rejected.len(),
+        "protection complete"
     );
     for (reason, count) in by_reason {
-        eprintln!("  reject {reason}: {count}");
+        tracing::info!(reason = %reason, count, "reject summary");
     }
     Ok(())
 }

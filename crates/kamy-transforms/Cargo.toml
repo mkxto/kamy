@@ -12,5 +12,6 @@ workspace = true
 [dependencies]
 kamy-core.workspace = true
 kamy-lift.workspace = true
+tracing.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true

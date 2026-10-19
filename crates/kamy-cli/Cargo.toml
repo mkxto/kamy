@@ -23,3 +23,5 @@ kamy-transforms.workspace = true
 kamy-verify.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+kamy-observe.workspace = true
+tracing.workspace = true

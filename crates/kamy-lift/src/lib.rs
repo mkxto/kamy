@@ -32,6 +32,7 @@ pub struct LiftResult {
 
 pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLookup) -> LiftResult {
     let entry_rva = func.entry;
+    let _s = tracing::debug_span!("lift", rva = %entry_rva).entered();
 
     let mut ordered_bbs: Vec<&kamy_core::BasicBlock> = Vec::with_capacity(func.blocks.len());
     let mut rest: Vec<&kamy_core::BasicBlock> = Vec::new();
@@ -154,6 +155,7 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
     {
         // An unresolved terminator (tail-call jmp, indirect/switch jump) leaves
         // control flow unlowered; relocate verbatim.
+        tracing::warn!(rva = %entry_rva, "unresolved terminator; lifting unsupported");
         unsupported = true;
     }
 
@@ -195,7 +197,14 @@ fn dispatch(
                 };
                 match target_val {
                     Some(t) => control::lift_call_indirect(t, builder, state, cc),
-                    None => state.unsupported = true,
+                    None => {
+                        tracing::warn!(
+                            ip = %insn.ip(),
+                            mnemonic = ?insn.mnemonic(),
+                            "indirect call target cannot be lifted"
+                        );
+                        state.unsupported = true;
+                    }
                 }
             }
             return None;

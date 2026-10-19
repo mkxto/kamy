@@ -130,6 +130,7 @@ pub fn dominator_tree(func: &Function) -> DomTree {
     }
     idom[entry] = None;
 
+    tracing::debug!(nodes = n, "computed dominator tree");
     DomTree { idom }
 }
 

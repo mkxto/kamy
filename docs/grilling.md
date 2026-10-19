@@ -703,6 +703,34 @@ Ground truth (RE of `HelloWorld-Injected.exe`, `.belabs` sections, base 0x140000
 - Functions with SEH handlers (`SEHComplex`) remain out of scope for obfuscation until Phase 3 lands.
 - Win32metadata (D14) stays deferred: over-approximated call args are correctness-neutral (conservative), pressure-negative only.
 
+### D32 — Error handling & observability
+
+**Decision:** Standardize errors on `anyhow` across all crates — remove the
+`thiserror` enums `ConfigError`, `PeError`, `CodegenError`, and `LinkError` — and
+standardize diagnostics on `tracing` with a dedicated `kamy-observe` crate owning
+a terminal-first `tracing-subscriber` stack (compact/tree/json formats,
+`EnvFilter` via `KAMY_LOG`). `RejectionReason` remains structured domain data
+(**D22**), distinct from errors.
+
+**Reasoning:** the workspace is one application split into crates, not a public
+library surface, so typed error enums bought matching that no caller used — every
+caller either propagated or counted rejects. `anyhow` removes the per-crate error
+boilerplate while `.context()` preserves the failure chain. Degradation and
+rejection are first-class product signals (**D28** pressure ladder, **D22**
+rejects): routing them through leveled, per-scope `tracing` lets an operator or
+agent see exactly which layer degraded or failed without scattering `println!`.
+tracing + tracing-subscriber + tracing-tree are the de-facto Rust standard and
+pass **C1/C2**.
+
+**Implications:**
+- New `kamy-observe` crate (format-agnostic, **D16**); every engine crate
+  depends on `tracing`.
+- `kamy-cli` installs the subscriber and reserves stdout for results.
+- `RejectionReason` is explicitly not an error type.
+- Severity split: pass/transform degradation at `warn`; milestone counts and the
+  per-reason reject aggregate at `info`; individual per-function rejects and
+  moves at `debug`; per-instruction detail at `trace`.
+
 ## Decision Summary
 
 | # | Decision | Choice |
@@ -738,6 +766,7 @@ Ground truth (RE of `HelloWorld-Injected.exe`, `.belabs` sections, base 0x140000
 | D29 | Stub stealth | Flavor diversification + junk fill + direct-call re-pointing |
 | D30 | Runtime & plugin SDK | CodeDefender model: EP hijack, init table, COFF plugins (D17 enriched) |
 | D31 | Phase order | Unwind kernel into Phase 2; SEH before obfuscation |
+| D32 | Error handling & observability | anyhow everywhere (no thiserror); tracing via kamy-observe; KAMY_LOG scope/level; RejectionReason stays domain data |
 
 ---
 

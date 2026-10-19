@@ -7,6 +7,10 @@ use crate::{Pass, replace_uses};
 pub struct PrunePhis;
 
 impl Pass for PrunePhis {
+    fn name(&self) -> &'static str {
+        "prune-phis"
+    }
+
     fn run(&self, func: &mut IrFunction) -> bool {
         let mut pruned: Vec<(ValueId, ValueId)> = Vec::new();
 

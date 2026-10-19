@@ -10,6 +10,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+tracing.workspace = true
 kamy-core.workspace = true
 kamy-pe.workspace = true
 kamy-disasm.workspace = true
@@ -18,4 +20,3 @@ kamy-lift.workspace = true
 kamy-transforms.workspace = true
 kamy-analysis.workspace = true
 iced-x86.workspace = true
-thiserror.workspace = true

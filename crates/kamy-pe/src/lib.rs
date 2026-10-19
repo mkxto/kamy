@@ -9,6 +9,7 @@ mod reloc;
 pub use pdata::build_unwind_info;
 pub use rebuild::{BytePatch, DirectoryUpdate, NewSection, PeEdits};
 
+use anyhow::Context;
 use kamy_core::{Machine, Module, Relocation, Rva, Section, SectionFlags, Symbol, SymbolKind};
 
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -20,26 +21,6 @@ const DIR_EXPORT: usize = 0;
 const DIR_IMPORT: usize = 1;
 const DIR_EXCEPTION: usize = 3;
 const DIR_BASERELOC: usize = 5;
-
-#[derive(Debug, thiserror::Error)]
-pub enum PeError {
-    #[error("input truncated or out of bounds")]
-    Truncated,
-    #[error("bad DOS signature (expected MZ)")]
-    BadDosSignature,
-    #[error("bad PE signature (expected PE\\0\\0)")]
-    BadPeSignature,
-    #[error("unsupported optional-header magic (expected PE32+ 0x20b)")]
-    BadOptionalMagic,
-    #[error("unsupported machine (expected x86-64 0x8664)")]
-    UnsupportedMachine,
-    #[error("patch target falls outside existing raw section data")]
-    PatchOutOfBounds,
-    #[error("no room in section-header table for a new section")]
-    NoHeaderRoom,
-    #[error("malformed PE: {0}")]
-    Malformed(&'static str),
-}
 
 struct SectionRecord {
     name: String,
@@ -71,30 +52,35 @@ pub struct RuntimeFunction {
 }
 
 impl PeFile {
-    pub fn parse(bytes: &[u8]) -> Result<PeFile, PeError> {
-        if bytes.get(0..2).ok_or(PeError::Truncated)? != b"MZ" {
-            return Err(PeError::BadDosSignature);
+    pub fn parse(bytes: &[u8]) -> anyhow::Result<PeFile> {
+        let _span = tracing::debug_span!("pe_parse").entered();
+        if bytes
+            .get(0..2)
+            .context("input truncated or out of bounds")?
+            != b"MZ"
+        {
+            anyhow::bail!("bad DOS signature (expected MZ)");
         }
         let e_lfanew = read_u32(bytes, 0x3c)? as usize;
 
         if bytes
             .get(e_lfanew..e_lfanew + 4)
-            .ok_or(PeError::Truncated)?
+            .context("input truncated or out of bounds")?
             != b"PE\0\0"
         {
-            return Err(PeError::BadPeSignature);
+            anyhow::bail!("bad PE signature (expected PE\\0\\0)");
         }
 
         let coff = e_lfanew + 4;
         if read_u16(bytes, coff)? != 0x8664 {
-            return Err(PeError::UnsupportedMachine);
+            anyhow::bail!("unsupported machine (expected x86-64 0x8664)");
         }
         let num_sections = read_u16(bytes, coff + 2)? as usize;
         let size_of_optional = read_u16(bytes, coff + 16)? as usize;
 
         let opt = coff + 20;
         if read_u16(bytes, opt)? != 0x20b {
-            return Err(PeError::BadOptionalMagic);
+            anyhow::bail!("unsupported optional-header magic (expected PE32+ 0x20b)");
         }
         let entry_point = read_u32(bytes, opt + 16)?;
         let image_base = read_u64(bytes, opt + 24)?;
@@ -110,7 +96,9 @@ impl PeFile {
         let mut sections = Vec::with_capacity(num_sections);
         for i in 0..num_sections {
             let b = section_table + i * 40;
-            let name_raw = bytes.get(b..b + 8).ok_or(PeError::Truncated)?;
+            let name_raw = bytes
+                .get(b..b + 8)
+                .context("input truncated or out of bounds")?;
             let name_len = name_raw.iter().position(|&c| c == 0).unwrap_or(8);
             sections.push(SectionRecord {
                 name: String::from_utf8_lossy(&name_raw[..name_len]).into_owned(),
@@ -149,6 +137,12 @@ impl PeFile {
             _ => Vec::new(),
         };
 
+        tracing::debug!(
+            sections = pe.sections.len(),
+            image_base = format_args!("{image_base:#x}"),
+            entry = format_args!("{entry_point:#x}"),
+            "parsed PE"
+        );
         Ok(pe)
     }
 
@@ -310,34 +304,40 @@ fn section_flags(characteristics: u32) -> SectionFlags {
     }
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, PeError> {
-    let end = offset.checked_add(2).ok_or(PeError::Truncated)?;
+fn read_u16(bytes: &[u8], offset: usize) -> anyhow::Result<u16> {
+    let end = offset
+        .checked_add(2)
+        .context("input truncated or out of bounds")?;
     Ok(u16::from_le_bytes(
         bytes
             .get(offset..end)
-            .ok_or(PeError::Truncated)?
+            .context("input truncated or out of bounds")?
             .try_into()
             .unwrap(),
     ))
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, PeError> {
-    let end = offset.checked_add(4).ok_or(PeError::Truncated)?;
+fn read_u32(bytes: &[u8], offset: usize) -> anyhow::Result<u32> {
+    let end = offset
+        .checked_add(4)
+        .context("input truncated or out of bounds")?;
     Ok(u32::from_le_bytes(
         bytes
             .get(offset..end)
-            .ok_or(PeError::Truncated)?
+            .context("input truncated or out of bounds")?
             .try_into()
             .unwrap(),
     ))
 }
 
-fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, PeError> {
-    let end = offset.checked_add(8).ok_or(PeError::Truncated)?;
+fn read_u64(bytes: &[u8], offset: usize) -> anyhow::Result<u64> {
+    let end = offset
+        .checked_add(8)
+        .context("input truncated or out of bounds")?;
     Ok(u64::from_le_bytes(
         bytes
             .get(offset..end)
-            .ok_or(PeError::Truncated)?
+            .context("input truncated or out of bounds")?
             .try_into()
             .unwrap(),
     ))
@@ -441,15 +441,15 @@ mod tests {
 
     #[test]
     fn parse_rejects_bad_dos_signature() {
-        assert!(matches!(
-            PeFile::parse(b"ZM\x00\x00"),
-            Err(PeError::BadDosSignature)
-        ));
+        let e = PeFile::parse(b"ZM\x00\x00")
+            .err()
+            .expect("expected parse error");
+        assert_eq!(format!("{e:#}"), "bad DOS signature (expected MZ)");
     }
 
     #[test]
     fn parse_rejects_truncated_input() {
-        assert!(matches!(PeFile::parse(b"MZ"), Err(PeError::Truncated)));
+        assert!(PeFile::parse(b"MZ").is_err());
         assert!(PeFile::parse(&[]).is_err());
     }
 }

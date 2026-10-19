@@ -4,16 +4,8 @@
 //! YAML is parsed with `serde_norway`, the maintained fork of the archived
 //! `serde_yaml` crate (keeps kamy within constraint C2).
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
-
-/// Error raised while loading or parsing a profile.
-#[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
-    #[error("failed to read config file: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("failed to parse YAML config: {0}")]
-    Parse(#[from] serde_norway::Error),
-}
 
 /// Top-level protection configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,13 +21,23 @@ pub struct Config {
 
 impl Config {
     /// Parse a profile from a YAML string.
-    pub fn from_yaml_str(yaml: &str) -> Result<Self, ConfigError> {
-        Ok(serde_norway::from_str(yaml)?)
+    pub fn from_yaml_str(yaml: &str) -> anyhow::Result<Self> {
+        serde_norway::from_str(yaml).context("parsing YAML protection profile")
     }
 
     /// Load and parse a profile from a file path.
-    pub fn from_path(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
-        Self::from_yaml_str(&std::fs::read_to_string(path)?)
+    pub fn from_path(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        tracing::debug!(path = %path.display(), "loading protection profile");
+        let yaml = std::fs::read_to_string(path)
+            .with_context(|| format!("reading profile {}", path.display()))?;
+        let cfg = Self::from_yaml_str(&yaml)?;
+        tracing::debug!(
+            profiles = cfg.profiles.len(),
+            version = %cfg.version,
+            "loaded protection profile"
+        );
+        Ok(cfg)
     }
 }
 

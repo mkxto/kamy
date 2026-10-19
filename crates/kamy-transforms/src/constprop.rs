@@ -59,6 +59,10 @@ fn fold(op: &IrOp, vals: &[u64], ty: IrType, arg_ty: Option<IrType>) -> Option<u
 }
 
 impl Pass for ConstProp {
+    fn name(&self) -> &'static str {
+        "const-prop"
+    }
+
     fn run(&self, func: &mut IrFunction) -> bool {
         let mut consts: HashMap<ValueId, u64> = HashMap::new();
         let mut types: HashMap<ValueId, IrType> = HashMap::new();

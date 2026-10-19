@@ -127,6 +127,7 @@ kamy/
 │   ├── kamy-seh/           # SEH/unwind: parse/rebuild RUNTIME_FUNCTION, UNWIND_INFO, C_SCOPE_TABLE
 │   ├── kamy-verify/        # SMT verification, test-vector equivalence, coverage reporting
 │   ├── kamy-config/        # Profile/config parsing (YAML), per-function layer selection
+│   ├── kamy-observe/       # tracing subscriber + log config (terminal-first diagnostics)
 │   └── kamy-cli/           # CLI binary
 ├── docs/
 │   ├── research.md
@@ -355,6 +356,26 @@ Main thread:
 ```
 
 Thread-local caches for expression simplification (VTIL model). No global locks in hot paths.
+
+### 9.1 Observability
+
+Errors are standardized on `anyhow` (D32): every fallible fn returns
+`anyhow::Result<T>`, with `.context()` attaching a message at each boundary and
+`bail!`/`ensure!`/`anyhow!` raising. No `thiserror` enums remain.
+`kamy_core::RejectionReason` stays structured domain data (D22) and is never an
+error.
+
+Diagnostics use `tracing`. `kamy-observe` owns the terminal-first subscriber;
+`kamy-cli` installs it via `kamy_observe::init`, and library crates only emit
+events and spans. Severity is a contract: `warn!` for graceful degradation or
+rejection (pass skipped, intensity reduced, function rejected, register
+pressure, symbolization below threshold, fallback), `info!` for milestones with
+counts, `debug!` for per-unit detail, `trace!` for per-instruction/interval
+detail; `error!` is reserved for the front-end. Level and per-crate scope are
+controlled by `KAMY_LOG` (EnvFilter syntax, e.g.
+`KAMY_LOG=warn,kamy_link=debug,kamy_transforms=trace`) or the CLI flags
+`-v`/`-vv`, `-q`, `--log`, and `--log-format <compact|tree|json>`. Diagnostics
+go to stderr; stdout carries command results.
 
 ---
 

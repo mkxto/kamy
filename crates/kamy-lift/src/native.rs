@@ -32,6 +32,11 @@ pub(crate) fn native_inline_fallback(
     if insn.is_ip_rel_memory_operand() {
         // A RIP-relative operand on an unmodeled instruction would be re-emitted
         // with its original displacement and resolve to the wrong VA once moved.
+        tracing::warn!(
+            ip = %insn.ip(),
+            mnemonic = ?insn.mnemonic(),
+            "rip-relative operand on unmodeled instruction; lifting unsupported"
+        );
         state.unsupported = true;
     }
     let mut factory = InstructionInfoFactory::new();
@@ -77,6 +82,7 @@ pub(crate) fn native_inline_fallback(
         writes: writes.clone(),
     };
 
+    tracing::trace!(mnemonic = ?insn.mnemonic(), "native passthrough");
     builder.emit(IrOp::NativeInline(native), &read_vals, IrType::I64);
 
     for phys in &writes {

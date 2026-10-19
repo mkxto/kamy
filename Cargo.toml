@@ -29,6 +29,7 @@ kamy-link = { path = "crates/kamy-link", version = "0.0.0" }
 kamy-seh = { path = "crates/kamy-seh", version = "0.0.0" }
 kamy-verify = { path = "crates/kamy-verify", version = "0.0.0" }
 kamy-config = { path = "crates/kamy-config", version = "0.0.0" }
+kamy-observe = { path = "crates/kamy-observe", version = "0.0.0" }
 
 # External crates
 iced-x86 = "1.21.0"
@@ -36,7 +37,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_norway = "0.9.42"
 rayon = "1.12.0"
 anyhow = "1.0.104"
-thiserror = "2.0.21"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "ansi", "json"] }
+tracing-tree = "0.4.0"
 clap = { version = "4.6.7", features = ["derive"] }
 rand_chacha = "0.10.0"
 rand_core = "0.10.1"

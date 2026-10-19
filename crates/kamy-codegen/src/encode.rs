@@ -1,8 +1,6 @@
 use iced_x86::Instruction;
 
-use crate::CodegenError;
-
-pub fn assemble(instrs: &[Instruction], new_va: u64) -> Result<Vec<u8>, CodegenError> {
+pub fn assemble(instrs: &[Instruction], new_va: u64) -> anyhow::Result<Vec<u8>> {
     crate::relocate(instrs, new_va)
 }
 

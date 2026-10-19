@@ -10,33 +10,21 @@ pub use regalloc::{
     CALLEE_SAVED_GPRS, RegAllocation, RegCopy, allocate_registers, callee_saved_used,
 };
 
-use std::fmt;
-
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Instruction, InstructionBlock};
-
-#[derive(Debug)]
-pub enum CodegenError {
-    Encode(String),
-}
-
-impl fmt::Display for CodegenError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CodegenError::Encode(msg) => write!(f, "instruction encode failed: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for CodegenError {}
 
 /// Re-encode a contiguous run of decoded instructions at a new virtual address.
 /// Intra-run relative branches stay correct (targets move with the block);
 /// references outside the run keep their absolute targets; rip-relative
 /// displacements are recomputed so they still resolve to the same absolute VA.
-pub fn relocate(instrs: &[Instruction], new_va: u64) -> Result<Vec<u8>, CodegenError> {
+pub fn relocate(instrs: &[Instruction], new_va: u64) -> anyhow::Result<Vec<u8>> {
     let block = InstructionBlock::new(instrs, new_va);
     let result = BlockEncoder::encode(64, block, BlockEncoderOptions::NONE)
-        .map_err(|e| CodegenError::Encode(e.to_string()))?;
+        .map_err(|e| anyhow::anyhow!("instruction encode failed: {e}"))?;
+    tracing::trace!(
+        bytes = result.code_buffer.len(),
+        new_va = format_args!("{new_va:#x}"),
+        "relocated block"
+    );
     Ok(result.code_buffer)
 }
 
@@ -49,14 +37,19 @@ pub fn relocate(instrs: &[Instruction], new_va: u64) -> Result<Vec<u8>, CodegenE
 pub fn relocate_with_offsets(
     instrs: &[Instruction],
     new_va: u64,
-) -> Result<(Vec<u8>, Vec<u32>), CodegenError> {
+) -> anyhow::Result<(Vec<u8>, Vec<u32>)> {
     let block = InstructionBlock::new(instrs, new_va);
     let result = BlockEncoder::encode(
         64,
         block,
         BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
     )
-    .map_err(|e| CodegenError::Encode(e.to_string()))?;
+    .map_err(|e| anyhow::anyhow!("instruction encode failed: {e}"))?;
+    tracing::trace!(
+        bytes = result.code_buffer.len(),
+        new_va = format_args!("{new_va:#x}"),
+        "relocated block"
+    );
     Ok((result.code_buffer, result.new_instruction_offsets))
 }
 

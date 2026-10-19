@@ -152,6 +152,7 @@ pub(crate) fn recover_impl(
 
     let blocks = build_blocks(&instrs, &leaders);
     let mut func = Function { entry, blocks };
+    tracing::debug!(func = %entry, blocks = func.blocks.len(), "recovered cfg");
     for (jmp_end, table) in &resolved {
         for b in &mut func.blocks {
             if b.end.get() == *jmp_end

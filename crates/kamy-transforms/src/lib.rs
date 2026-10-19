@@ -14,19 +14,27 @@ use kamy_core::ir::{IrFunction, IrTerminator, ValueId};
 
 pub trait Pass {
     fn run(&self, func: &mut IrFunction) -> bool;
+    fn name(&self) -> &'static str;
 }
 
 pub fn optimize(func: &mut IrFunction) {
+    let _s = tracing::debug_span!("optimize").entered();
     let passes: &[&dyn Pass] = &[&ConstProp, &InstCombine, &Dce, &PrunePhis];
+    let mut rounds = 0u32;
     loop {
+        rounds += 1;
         let mut changed = false;
         for pass in passes {
-            changed |= pass.run(func);
+            if pass.run(func) {
+                changed = true;
+                tracing::trace!(pass = pass.name(), round = rounds, "pass changed IR");
+            }
         }
         if !changed {
             break;
         }
     }
+    tracing::debug!(rounds, "optimizer converged");
 }
 
 pub fn replace_uses(func: &mut IrFunction, old: ValueId, new: ValueId) {

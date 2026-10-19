@@ -58,6 +58,7 @@ impl MbaPass {
         let intensity = intensity.clamp(0.0, 1.0);
         let mut rng = ChaCha8Rng::seed_from_u64(self.seed);
         let mut changed = false;
+        let mut sites = 0u32;
         let mut expanded: HashSet<ValueId> = HashSet::new();
 
         for _ in 0..self.config.iterations {
@@ -138,6 +139,7 @@ impl MbaPass {
                             }
                             i += n + 1;
                             changed = true;
+                            sites += 1;
                         }
                         Expansion::Sub => {
                             // x-y = x + (~y + 1)
@@ -176,6 +178,7 @@ impl MbaPass {
                             }
                             i += n + 1;
                             changed = true;
+                            sites += 1;
                         }
                         Expansion::Xor => {
                             // x^y = (x & ~y) | (~x & y)
@@ -218,10 +221,16 @@ impl MbaPass {
                             }
                             i += n + 1;
                             changed = true;
+                            sites += 1;
                         }
                     }
                 }
             }
+        }
+
+        tracing::debug!(intensity, changed, sites, "mba pass");
+        if intensity < 1.0 {
+            tracing::warn!(intensity, "mba running at reduced intensity");
         }
 
         changed
@@ -229,6 +238,10 @@ impl MbaPass {
 }
 
 impl super::Pass for MbaPass {
+    fn name(&self) -> &'static str {
+        "mba"
+    }
+
     fn run(&self, func: &mut IrFunction) -> bool {
         self.run_with_intensity(func, 1.0)
     }

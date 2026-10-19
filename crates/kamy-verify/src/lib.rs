@@ -1,5 +1,7 @@
 //! Test-vector equivalence and differential self-test harness.
 
+use anyhow::Context as _;
+
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -96,7 +98,8 @@ pub fn differential(
     protected: &Path,
     vectors: u32,
     seed: u64,
-) -> std::io::Result<DiffReport> {
+) -> anyhow::Result<DiffReport> {
+    let _s = tracing::info_span!("verify").entered();
     let runs = vectors.max(1);
     let mut mismatches = Vec::new();
 
@@ -112,8 +115,9 @@ pub fn differential(
             buf
         };
 
-        let a = run(original, &input)?;
-        let b = run(protected, &input)?;
+        let a = run(original, &input).with_context(|| format!("running {}", original.display()))?;
+        let b =
+            run(protected, &input).with_context(|| format!("running {}", protected.display()))?;
 
         if a.exit != b.exit {
             mismatches.push(Mismatch {
@@ -141,7 +145,22 @@ pub fn differential(
         }
     }
 
-    Ok(DiffReport { runs, mismatches })
+    let report = DiffReport { runs, mismatches };
+    for m in &report.mismatches {
+        tracing::warn!(
+            run = m.run,
+            field = %m.field,
+            original = %m.original,
+            protected = %m.protected,
+            "behavioral divergence"
+        );
+    }
+    tracing::info!(
+        runs,
+        mismatches = report.mismatches.len(),
+        "differential complete"
+    );
+    Ok(report)
 }
 
 #[cfg(test)]

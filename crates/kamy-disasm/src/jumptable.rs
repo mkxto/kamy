@@ -242,94 +242,86 @@ pub(crate) fn detect_switch(
         let load = &instrs[dag.iidx[map[p_load]]];
         let jmp = &instrs[dag.iidx[map[p_jmp]]];
 
-        // `lea reg,[rip+d]` resolves to the absolute base VA; the table sits at
-        // base + the load displacement; each case target is base + entry.
-        let base_va = lea.memory_displacement64();
-        let table_va = base_va.wrapping_add(load.memory_displacement64());
-        let signed = load.mnemonic() == Mnemonic::Movsxd;
-        let base_is_image = !signed;
-        let Some(index) = gpr64(load.memory_index()) else {
-            continue;
-        };
-        let Some(count) = bound_count(instrs, index) else {
-            continue;
-        };
-        if count == 0 || count > MAX_ENTRIES {
-            continue;
-        }
-
-        // MSVC module-base entries are measured from the image base; a base that
-        // is not the image base is ambiguous, so recover nothing for it.
-        if base_is_image && base_va != module.image_base {
-            continue;
-        }
-
-        let Some(table_rva) = table_va
-            .checked_sub(module.image_base)
-            .and_then(|v| u32::try_from(v).ok())
-        else {
-            continue;
-        };
-        let Some(data) = module.bytes_at(Rva::new(table_rva)) else {
-            continue;
-        };
-        let Some(need) = (count as usize).checked_mul(4) else {
-            continue;
-        };
-        if data.len() < need {
-            continue;
-        }
-
-        // Every slot in table order, duplicates preserved (`len == count`).
-        let mut entries = Vec::with_capacity(count as usize);
-        let mut ok = true;
-        for k in 0..count as usize {
-            let o = k * 4;
-            let raw = u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
-            let delta = if signed {
-                i64::from(raw as i32)
-            } else {
-                i64::from(raw)
-            };
-            let tgt_va = (base_va as i64).wrapping_add(delta) as u64;
-            let Some(tgt_rva) = tgt_va
-                .checked_sub(module.image_base)
-                .and_then(|v| u32::try_from(v).ok())
-            else {
-                ok = false;
-                break;
-            };
-            if tgt_rva < lo || tgt_rva >= hi {
-                ok = false;
-                break;
-            }
-            entries.push(Rva::new(tgt_rva));
-        }
-        if !ok {
-            continue;
-        }
-
-        let jmp_end = (jmp.ip() - module.image_base) as u32 + jmp.len() as u32;
+        let jmp_rva = (jmp.ip() - module.image_base) as u32;
+        let jmp_end = jmp_rva + jmp.len() as u32;
         // A dispatch may match several isomorphisms; keep the first valid table.
         if out.iter().any(|(end, _)| *end == jmp_end) {
             continue;
         }
 
-        // LLVM retargets the `lea`; MSVC retargets the table load.
-        let dispatch = if base_is_image { load } else { lea };
-        let dispatch_rva = Rva::new((dispatch.ip() - module.image_base) as u32);
+        // Validate one matched candidate; any `None` below means the shape is
+        // ambiguous or out of range and no table is emitted (§10.5).
+        let recovered = (|| -> Option<kamy_core::SwitchTable> {
+            // `lea reg,[rip+d]` resolves to the absolute base VA; the table sits
+            // at base + the load displacement; each case target is base + entry.
+            let base_va = lea.memory_displacement64();
+            let table_va = base_va.wrapping_add(load.memory_displacement64());
+            let signed = load.mnemonic() == Mnemonic::Movsxd;
+            let base_is_image = !signed;
+            let index = gpr64(load.memory_index())?;
+            let count = bound_count(instrs, index)?;
+            if count == 0 || count > MAX_ENTRIES {
+                return None;
+            }
 
-        out.push((
-            jmp_end,
-            kamy_core::SwitchTable {
+            // MSVC module-base entries are measured from the image base; a base
+            // that is not the image base is ambiguous, so recover nothing for it.
+            if base_is_image && base_va != module.image_base {
+                return None;
+            }
+
+            let table_rva = table_va
+                .checked_sub(module.image_base)
+                .and_then(|v| u32::try_from(v).ok())?;
+            let data = module.bytes_at(Rva::new(table_rva))?;
+            let need = (count as usize).checked_mul(4)?;
+            if data.len() < need {
+                return None;
+            }
+
+            // Every slot in table order, duplicates preserved (`len == count`).
+            let mut entries = Vec::with_capacity(count as usize);
+            for k in 0..count as usize {
+                let o = k * 4;
+                let raw = u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+                let delta = if signed {
+                    i64::from(raw as i32)
+                } else {
+                    i64::from(raw)
+                };
+                let tgt_va = (base_va as i64).wrapping_add(delta) as u64;
+                let tgt_rva = tgt_va
+                    .checked_sub(module.image_base)
+                    .and_then(|v| u32::try_from(v).ok())?;
+                if tgt_rva < lo || tgt_rva >= hi {
+                    return None;
+                }
+                entries.push(Rva::new(tgt_rva));
+            }
+
+            // LLVM retargets the `lea`; MSVC retargets the table load.
+            let dispatch = if base_is_image { load } else { lea };
+            let dispatch_rva = Rva::new((dispatch.ip() - module.image_base) as u32);
+
+            Some(kamy_core::SwitchTable {
                 dispatch_rva,
                 table_rva: Rva::new(table_rva),
                 base_va,
                 base_is_image,
                 count: count as u32,
                 entries,
-            },
-        ));
+            })
+        })();
+
+        match recovered {
+            Some(table) => {
+                tracing::debug!(entries = table.entries.len(), "recovered jump table");
+                out.push((jmp_end, table));
+            }
+            None => {
+                tracing::debug!(addr = %Rva::new(jmp_rva), "jump table recovery failed");
+            }
+        }
     }
     out
 }
