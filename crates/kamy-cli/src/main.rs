@@ -163,7 +163,7 @@ fn corpus(cmd: CorpusCmd) -> anyhow::Result<()> {
 /// PASS/FAIL plus the SSA lift/lower coverage table and corpus totals. The
 /// command still errors if any member diverges, after coverage is printed.
 fn verify_corpus_cmd(dir: &Path) -> anyhow::Result<()> {
-    let cov = kamy_corpus::verify_corpus(dir, &|inp, outp| protect_pipeline(inp, outp))?;
+    let cov = kamy_corpus::verify_corpus(dir, &|inp, outp| protect_ssa_identity(inp, outp))?;
     print_coverage(&cov);
     if cov.failed > 0 {
         anyhow::bail!("{} member(s) failed verification", cov.failed);
@@ -284,10 +284,9 @@ fn analyze(input: &Path, output: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run the identity protect pipeline (parse PE, lift, lower via the linker) and
-/// write the protected image to `output`. Returns the SSA lift/lower
-/// [`Coverage`] measured for this binary. Shared by `protect --no-transform`
-/// and corpus verification so both exercise the same path.
+/// Relocation-only protect (`protect --no-transform`, Phase 1): every function is
+/// relocated verbatim, so `ssa_lowered` is always 0. The corpus uses
+/// [`protect_ssa_identity`] instead, which runs the SSA backend.
 fn protect_pipeline(input: &Path, output: &Path) -> anyhow::Result<Coverage> {
     let bytes = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
     let pe = PeFile::parse(&bytes).with_context(|| format!("parsing {}", input.display()))?;
@@ -301,6 +300,42 @@ fn protect_pipeline(input: &Path, output: &Path) -> anyhow::Result<Coverage> {
         &module,
         &module.functions,
         &kamy_link::Options::default(),
+    )?;
+    std::fs::write(output, &image).with_context(|| format!("writing {}", output.display()))?;
+
+    let mut by_reason: std::collections::BTreeMap<String, usize> = Default::default();
+    for (_, reason) in &report.rejected {
+        *by_reason.entry(reason.tag().to_string()).or_default() += 1;
+    }
+    Ok(Coverage {
+        ssa_lowered: report.ssa_lowered,
+        relocated: report.moved.len().saturating_sub(report.ssa_lowered),
+        rejected: report.rejected.len(),
+        by_reason,
+    })
+}
+
+/// Protect through the SSA backend with an identity transform: lift → SSA →
+/// optimize → regalloc → isel → encode, applying no obfuscation. A verbatim
+/// relocation cannot miscompile, so the corpus drives this path to actually
+/// exercise the backend; `ssa_lowered` then reflects real coverage.
+fn protect_ssa_identity(input: &Path, output: &Path) -> anyhow::Result<Coverage> {
+    let bytes = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
+    let pe = PeFile::parse(&bytes).with_context(|| format!("parsing {}", input.display()))?;
+
+    let mut module = pe.to_module();
+    let seeds = pe.seeds();
+    module.functions = discover_functions(&module, &seeds);
+
+    let cc = kamy_core::ir::Win64Default;
+    let mut identity = |_: &mut kamy_core::ir::IrFunction, _: f32| {};
+    let (image, report) = kamy_link::protect_with_transforms(
+        &pe,
+        &module,
+        &module.functions,
+        &kamy_link::Options::default(),
+        &cc,
+        &mut identity,
     )?;
     std::fs::write(output, &image).with_context(|| format!("writing {}", output.display()))?;
 

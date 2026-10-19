@@ -101,13 +101,14 @@ fn observe_dll(member: &Member, bin: &Path) -> Result<BehaviorRecord> {
         let output = cmd
             .output()
             .with_context(|| format!("spawning loader for {}", export.name))?;
-        anyhow::ensure!(
-            output.status.success(),
-            "loader failed for {}::{}",
-            member.name,
-            export.name
-        );
-        let ret = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let ret = if output.status.success() {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        } else {
+            format!(
+                "<loader-failed exit {}>",
+                output.status.code().unwrap_or(-1)
+            )
+        };
         results.push(DllResult {
             call: format!("{}({})", export.name, export.args.join(",")),
             ret,
