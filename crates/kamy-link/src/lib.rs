@@ -122,7 +122,7 @@ fn ssa_body(
         transform(&mut result.func, intensity);
         kamy_transforms::optimize(&mut result.func);
         if uses_unsupported_flags(&result.func) {
-            anyhow::bail!("add/shift-based flag consumed by branch or setcc");
+            anyhow::bail!("variable-count shift flag consumed by branch or setcc");
         }
         if result.func.blocks.iter().any(|b| {
             b.insts
@@ -175,11 +175,13 @@ fn ssa_body(
     anyhow::bail!("register pressure");
 }
 
-/// Add- and shift-based condition flags (`add;jo`, `shl;jc`, …) cannot be
-/// reconstructed without a scratch register, so a function that actually
-/// consumes one is relocated verbatim instead of miscompiled (reject-on-
-/// ambiguity, D22). Subtract comparisons (`cmp a,b`) and result flags
-/// (`test r,r`) are lowered directly and are not rejected here.
+/// Variable-count shift condition flags (`shl cl;jc`, …) cannot be
+/// reconstructed without CL, which the allocator does not model, so a function
+/// that consumes one is relocated verbatim instead of miscompiled (reject-on-
+/// ambiguity, D22). Add flags and constant-count shift flags ARE recomputable
+/// (re-executed into a reserved scratch at the consumer) and so are no longer
+/// rejected here; subtract comparisons (`cmp a,b`) and result flags (`test
+/// r,r`) are lowered directly as before.
 fn uses_unsupported_flags(func: &IrFunction) -> bool {
     use kamy_core::ir::{IrOp, IrTerminator};
     let mut used = HashSet::new();
@@ -194,17 +196,18 @@ fn uses_unsupported_flags(func: &IrFunction) -> bool {
             used.insert(*cond);
         }
     }
+    let is_const = |vid: kamy_core::ir::ValueId| -> bool {
+        func.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| i.dest == Some(vid) && matches!(i.op, IrOp::Const(_)))
+        })
+    };
     func.blocks.iter().any(|b| {
         b.insts.iter().any(|i| {
-            matches!(
-                i.op,
-                IrOp::CarryAdd
-                    | IrOp::OverflowAdd
-                    | IrOp::AuxCarryAdd
-                    | IrOp::CarryShl
-                    | IrOp::CarryShr
-                    | IrOp::CarrySar
-            ) && i.dest.is_some_and(|d| used.contains(&d))
+            matches!(i.op, IrOp::CarryShl | IrOp::CarryShr | IrOp::CarrySar)
+                && !is_const(i.args[1])
+                && i.dest.is_some_and(|d| used.contains(&d))
         })
     })
 }

@@ -18,6 +18,7 @@ pub struct RegAllocation {
     pub assignments: HashMap<ValueId, PhysReg>,
     pub copies: Vec<RegCopy>,
     pub edge_copies: HashMap<(BlockId, BlockId), Vec<RegCopy>>,
+    pub flag_scratch: Option<PhysReg>,
 }
 
 #[derive(Debug, Clone)]
@@ -299,6 +300,43 @@ fn compute_live_intervals(func: &IrFunction, order: &[BlockId]) -> Vec<LiveInter
     intervals
 }
 
+/// True iff a *used* flag op can be re-established at its consumer by
+/// re-executing the producing op into a scratch register: add flags
+/// (`CarryAdd/OverflowAdd/AuxCarryAdd`), or shift flags
+/// (`CarryShl/CarryShr/CarrySar`) whose count is a constant. Variable-count
+/// shift flags are excluded (reproducing them needs CL, which is not modeled).
+fn consumes_recomputable_flag(func: &IrFunction) -> bool {
+    let mut used = HashSet::new();
+    for b in &func.blocks {
+        for i in &b.insts {
+            used.extend(i.args.iter().copied());
+        }
+        for p in &b.phis {
+            used.extend(p.args.iter().map(|(_, v)| *v));
+        }
+        if let IrTerminator::Branch { cond, .. } = &b.term {
+            used.insert(*cond);
+        }
+    }
+    let is_const = |vid: ValueId| -> bool {
+        func.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| i.dest == Some(vid) && matches!(i.op, IrOp::Const(_)))
+        })
+    };
+    func.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            i.dest.is_some_and(|d| used.contains(&d))
+                && match i.op {
+                    IrOp::CarryAdd | IrOp::OverflowAdd | IrOp::AuxCarryAdd => true,
+                    IrOp::CarryShl | IrOp::CarryShr | IrOp::CarrySar => is_const(i.args[1]),
+                    _ => false,
+                }
+        })
+    })
+}
+
 pub fn allocate_registers(
     func: &IrFunction,
     saved_regs: &[PhysReg],
@@ -352,6 +390,24 @@ pub fn allocate_registers(
     let mut active: Vec<(LiveInterval, PhysReg)> = Vec::new();
     let mut free_gprs: Vec<Gpr> = avail_gprs.clone();
     let mut free_xmms: Vec<XmmReg> = avail_xmms.clone();
+
+    // If a branch/setcc consumes an add- or constant-count-shift flag, the x86
+    // flags are re-established at the consumer by re-executing the op into a
+    // reserved scratch (R11). Reserve it here so no value is ever placed there.
+    let flag_scratch: Option<PhysReg> = if consumes_recomputable_flag(func) {
+        if intervals
+            .iter()
+            .any(|iv| iv.pinned == Some(PhysReg::Gpr(Gpr::R11)))
+        {
+            // R11 genuinely live; cannot reserve it as scratch. Reject soundly.
+            return Err(RejectionReason::RegisterPressure);
+        }
+        avail_gprs.retain(|g| *g != Gpr::R11);
+        free_gprs.retain(|g| *g != Gpr::R11);
+        Some(PhysReg::Gpr(Gpr::R11))
+    } else {
+        None
+    };
 
     for iv in &intervals {
         active.retain(|(a, reg)| {
@@ -496,6 +552,7 @@ pub fn allocate_registers(
         assignments,
         copies,
         edge_copies,
+        flag_scratch,
     })
 }
 
@@ -694,6 +751,76 @@ mod tests {
     }
 
     #[test]
+    fn branch_on_add_flag_reserves_r11_scratch() {
+        // b0: a=Undef, b=Undef, r=Add(a,b), cf=CarryAdd(a,b); branch cf -> b1:b2
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let a = func.alloc_value();
+        let b = func.alloc_value();
+        let r = func.alloc_value();
+        let cf = func.alloc_value();
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![
+                Inst {
+                    dest: Some(a),
+                    op: IrOp::Undef,
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(b),
+                    op: IrOp::Undef,
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(r),
+                    op: IrOp::Add,
+                    args: vec![a, b],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(cf),
+                    op: IrOp::CarryAdd,
+                    args: vec![a, b],
+                    ty: IrType::I8,
+                },
+            ],
+            term: IrTerminator::Branch {
+                cond: cf,
+                taken: BlockId(1),
+                not_taken: BlockId(2),
+            },
+        });
+        for id in [BlockId(1), BlockId(2)] {
+            func.blocks.push(IrBlock {
+                id,
+                phis: vec![],
+                insts: vec![],
+                term: IrTerminator::Ret,
+            });
+        }
+        let mut reg_pins = HashMap::new();
+        reg_pins.insert(a, PhysReg::Gpr(Gpr::Rcx));
+        reg_pins.insert(b, PhysReg::Gpr(Gpr::Rdx));
+        let alloc =
+            allocate_registers(&func, &CALLEE_SAVED_GPRS, &HashSet::new(), &reg_pins).unwrap();
+        assert_eq!(alloc.flag_scratch, Some(PhysReg::Gpr(Gpr::R11)));
+        assert!(
+            !alloc
+                .assignments
+                .values()
+                .any(|p| *p == PhysReg::Gpr(Gpr::R11)),
+            "R11 is reserved as flag scratch and must not be assigned to any value"
+        );
+    }
+
+    #[test]
     fn allocate_simple_no_copies() {
         let func = make_test_function();
         let result = allocate_registers(&func, &[], &HashSet::new(), &HashMap::new()).unwrap();
@@ -721,6 +848,7 @@ mod tests {
             assignments,
             copies: vec![],
             edge_copies: HashMap::new(),
+            flag_scratch: None,
         };
         assert_eq!(
             callee_saved_used(&alloc),

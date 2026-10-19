@@ -278,6 +278,37 @@ fn emit_flag_compare(
             let rb = reg_of(alloc, b, ty);
             out.push(Instruction::with2(cmp_code(ty), ra, rb).unwrap());
         }
+        IrOp::CarryAdd | IrOp::OverflowAdd | IrOp::AuxCarryAdd => {
+            let a = producer.args[0];
+            let b = producer.args[1];
+            let ty = value_type(func, a);
+            let ra = reg_of(alloc, a, ty);
+            let rb = reg_of(alloc, b, ty);
+            let scratch = phys_to_register(alloc.flag_scratch.expect("flag scratch reserved"), ty);
+            out.push(Instruction::with2(mov_code(ty), scratch, ra).unwrap());
+            out.push(Instruction::with2(alu_code(&IrOp::Add, ty), scratch, rb).unwrap());
+        }
+        IrOp::CarryShl | IrOp::CarryShr | IrOp::CarrySar => {
+            let orig = producer.args[0];
+            let count = producer.args[1];
+            let ty = value_type(func, orig);
+            let ro = reg_of(alloc, orig, ty);
+            let scratch = phys_to_register(alloc.flag_scratch.expect("flag scratch reserved"), ty);
+            let shift_kind = match producer.op {
+                IrOp::CarryShl => IrOp::Shl,
+                IrOp::CarryShr => IrOp::Shr,
+                _ => IrOp::Sar,
+            };
+            out.push(Instruction::with2(mov_code(ty), scratch, ro).unwrap());
+            out.push(
+                Instruction::with2(
+                    shift_imm_code(&shift_kind, ty),
+                    scratch,
+                    const_value(func, count).expect("const count") as i32,
+                )
+                .unwrap(),
+            );
+        }
         _ => {}
     }
 }
@@ -1124,7 +1155,13 @@ fn select_terminator(
                     | IrOp::Parity
                     | IrOp::BorrowSub
                     | IrOp::OverflowSub
-                    | IrOp::AuxBorrowSub => {
+                    | IrOp::AuxBorrowSub
+                    | IrOp::CarryAdd
+                    | IrOp::OverflowAdd
+                    | IrOp::AuxCarryAdd
+                    | IrOp::CarryShl
+                    | IrOp::CarryShr
+                    | IrOp::CarrySar => {
                         emit_flag_compare(func, alloc, producer, out);
                         let jcc = flag_op_to_jcc(&producer.op);
                         out.push(Instruction::with_branch(jcc, taken_va).unwrap());
@@ -1201,6 +1238,7 @@ mod tests {
             assignments,
             copies: vec![],
             edge_copies: HashMap::new(),
+            flag_scratch: None,
         };
 
         let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
@@ -1299,6 +1337,7 @@ mod tests {
             assignments,
             copies: vec![],
             edge_copies: HashMap::new(),
+            flag_scratch: None,
         };
 
         let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
@@ -1360,6 +1399,7 @@ mod tests {
             assignments,
             copies: vec![],
             edge_copies: HashMap::new(),
+            flag_scratch: None,
         };
 
         let instrs = select_instructions(
@@ -1420,6 +1460,7 @@ mod tests {
             assignments,
             copies: vec![],
             edge_copies: HashMap::new(),
+            flag_scratch: None,
         };
 
         let instrs = select_instructions(
@@ -1529,6 +1570,93 @@ mod tests {
     }
 
     #[test]
+    fn branch_on_add_flag_reexecutes_into_scratch() {
+        // b0: a=Undef, b=Undef, r=Add(a,b), cf=CarryAdd(a,b); branch cf -> b1:b2
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let a = func.alloc_value();
+        let b = func.alloc_value();
+        let r = func.alloc_value();
+        let cf = func.alloc_value();
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![
+                Inst {
+                    dest: Some(a),
+                    op: IrOp::Undef,
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(b),
+                    op: IrOp::Undef,
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(r),
+                    op: IrOp::Add,
+                    args: vec![a, b],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(cf),
+                    op: IrOp::CarryAdd,
+                    args: vec![a, b],
+                    ty: IrType::I8,
+                },
+            ],
+            term: IrTerminator::Branch {
+                cond: cf,
+                taken: BlockId(1),
+                not_taken: BlockId(2),
+            },
+        });
+        for id in [BlockId(1), BlockId(2)] {
+            func.blocks.push(IrBlock {
+                id,
+                phis: vec![],
+                insts: vec![],
+                term: IrTerminator::Ret,
+            });
+        }
+        let mut assignments = HashMap::new();
+        assignments.insert(a, PhysReg::Gpr(Gpr::Rcx));
+        assignments.insert(b, PhysReg::Gpr(Gpr::Rdx));
+        assignments.insert(r, PhysReg::Gpr(Gpr::R8));
+        assignments.insert(cf, PhysReg::Gpr(Gpr::Rax));
+        let alloc = RegAllocation {
+            assignments,
+            copies: vec![],
+            edge_copies: HashMap::new(),
+            flag_scratch: Some(PhysReg::Gpr(Gpr::R11)),
+        };
+        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
+        crate::relocate(&instrs, 0x140001000).expect("branch on add flag must encode");
+        use iced_x86::Mnemonic;
+        let mnemonics: Vec<Mnemonic> = instrs.iter().map(|i| i.mnemonic()).collect();
+        assert!(
+            mnemonics.contains(&Mnemonic::Add),
+            "add flag must be re-executed as `add`: {mnemonics:?}"
+        );
+        assert!(
+            mnemonics.contains(&Mnemonic::Jb),
+            "a CarryAdd branch must lower to `jb`: {mnemonics:?}"
+        );
+        assert!(
+            instrs
+                .iter()
+                .any(|i| i.mnemonic() == Mnemonic::Add
+                    && i.op0_register() == iced_x86::Register::R11),
+            "the flag add must re-execute into the R11 scratch: {mnemonics:?}"
+        );
+    }
+
+    #[test]
     fn rip_addr_lowers_to_position_independent_lea() {
         const TARGET: u64 = 0x1_4000_5000;
         let mut func = IrFunction {
@@ -1609,6 +1737,7 @@ mod tests {
             assignments,
             copies: vec![],
             edge_copies: HashMap::new(),
+            flag_scratch: None,
         };
 
         // One callee-saved push is odd, so a realign shim is added; the frame must
@@ -1708,6 +1837,7 @@ mod tests {
             assignments,
             copies: vec![],
             edge_copies: HashMap::new(),
+            flag_scratch: None,
         };
         let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
         use iced_x86::{Mnemonic, OpKind};
