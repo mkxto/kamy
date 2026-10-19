@@ -60,7 +60,7 @@ pub fn protect(
 ) -> anyhow::Result<(Vec<u8>, Report)> {
     protect_inner(pe, module, functions, opts, |module, func, base, new_va| {
         let instrs = function_instructions(module, func);
-        Ok((relocate(&instrs, base + u64::from(new_va))?, None))
+        Ok((relocate(&instrs, base + u64::from(new_va))?, Err(None)))
     })
 }
 
@@ -86,10 +86,10 @@ pub fn protect_with_transforms(
         |module, func, base, new_rva| {
             let new_va = base + u64::from(new_rva);
             match ssa_body(module, func, cc, transform, base, new_va) {
-                Ok((body, shape)) => Ok((body, Some(shape))),
-                Err(_) => {
+                Ok((body, shape)) => Ok((body, Ok(shape))),
+                Err(reason) => {
                     let instrs = function_instructions(module, func);
-                    Ok((relocate(&instrs, new_va)?, None))
+                    Ok((relocate(&instrs, new_va)?, Err(Some(reason))))
                 }
             }
         },
@@ -103,7 +103,7 @@ fn ssa_body(
     transform: &mut dyn FnMut(&mut IrFunction, f32),
     base: u64,
     new_va: u64,
-) -> anyhow::Result<(Vec<u8>, PrologueShape)> {
+) -> Result<(Vec<u8>, PrologueShape), RejectionReason> {
     // D28 pressure ladder: when the zero-spill allocator overflows under a
     // transform, retry at reduced intensity before giving up. Re-lift per
     // attempt so each intensity sees a clean IR. The non-pressure rejects
@@ -116,20 +116,20 @@ fn ssa_body(
     for (i, &intensity) in INTENSITY_LADDER.iter().enumerate() {
         let mut result = kamy_lift::lift_function(module, func, cc);
         if result.unsupported {
-            anyhow::bail!("unsupported construct");
+            return Err(RejectionReason::UnsupportedInstruction);
         }
         kamy_lift::ssa::construct_ssa(&mut result);
         transform(&mut result.func, intensity);
         kamy_transforms::optimize(&mut result.func);
         if uses_unsupported_flags(&result.func) {
-            anyhow::bail!("variable-count shift flag consumed by branch or setcc");
+            return Err(RejectionReason::UnsupportedFlags);
         }
         if result.func.blocks.iter().any(|b| {
             b.insts
                 .iter()
                 .any(|i| matches!(i.op, kamy_core::ir::IrOp::Call { target } if target == entry_va))
         }) {
-            anyhow::bail!("self-recursive (frame reconstruction pending)");
+            return Err(RejectionReason::SelfRecursive);
         }
 
         match kamy_codegen::allocate_registers(
@@ -155,7 +155,9 @@ fn ssa_body(
                     pushed: used,
                     stack_alloc,
                 };
-                return Ok((relocate(&instrs, new_va)?, shape));
+                return relocate(&instrs, new_va)
+                    .map(|b| (b, shape))
+                    .map_err(|_| RejectionReason::CodegenFailure);
             }
             Err(_) => {
                 let msg = "register pressure";
@@ -172,7 +174,7 @@ fn ssa_body(
         }
     }
     tracing::debug!(func = %func.entry, "pressure ladder exhausted");
-    anyhow::bail!("register pressure");
+    Err(RejectionReason::RegisterPressure)
 }
 
 /// Variable-count shift condition flags (`shl cl;jc`, …) cannot be
@@ -245,7 +247,10 @@ fn protect_inner(
         &Function,
         u64,
         u32,
-    ) -> anyhow::Result<(Vec<u8>, Option<PrologueShape>)>,
+    ) -> anyhow::Result<(
+        Vec<u8>,
+        Result<PrologueShape, Option<RejectionReason>>,
+    )>,
 ) -> anyhow::Result<(Vec<u8>, Report)> {
     let base = module.image_base;
     let table_base_rva = pe.next_section_rva().get();
@@ -318,7 +323,7 @@ fn protect_inner(
                         &mut tables,
                         &cand.switches,
                     ) {
-                        Ok(b) => (b, None),
+                        Ok(b) => (b, Err(None)),
                         Err(()) => {
                             report
                                 .rejected
@@ -333,8 +338,10 @@ fn protect_inner(
                     }
                 };
 
-                if shape.is_some() {
-                    report.ssa_lowered += 1;
+                match &shape {
+                    Ok(_) => report.ssa_lowered += 1,
+                    Err(Some(reason)) => report.rejected.push((cand.entry, *reason)),
+                    Err(None) => {}
                 }
 
                 let patch = entry_patch(base, cand.entry.get(), new_rva, cand.endbr);
@@ -356,7 +363,9 @@ fn protect_inner(
                 // SSA-lowered funcs get FRESH UNWIND_INFO for the generated
                 // push/align prologue (null blob when no reg was pushed);
                 // relocation-shipped funcs keep their original UNWIND_INFO RVA.
-                let unwind = shape.map(|s| kamy_pe::build_unwind_info(&s.pushed, s.stack_alloc));
+                let unwind = shape
+                    .ok()
+                    .map(|s| kamy_pe::build_unwind_info(&s.pushed, s.stack_alloc));
                 moved.push(Moved {
                     entry: cand.entry,
                     new_rva,
@@ -379,9 +388,9 @@ fn protect_inner(
         }
     }
     tracing::info!(
-        moved = report.moved.len(),
         ssa_lowered = report.ssa_lowered,
         rejected = report.rejected.len(),
+        relocated = report.moved.len(),
         "protection complete"
     );
 

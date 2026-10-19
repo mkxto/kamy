@@ -34,6 +34,47 @@ pub enum RejectionReason {
     CodegenFailure,
     /// Transforms would require spills, violating the zero-spill constraint (D5).
     RegisterPressure,
+    /// A branch/`setcc` consumes a variable-count shift flag (`shl cl;jc`): the
+    /// count lives in CL, which the zero-spill allocator does not model.
+    UnsupportedFlags,
+    /// Function calls its own entry; the lowered prologue would stack a second
+    /// frame on top of the original (D5 frame reconstruction pending).
+    SelfRecursive,
+
+    // --- Target reject taxonomy (CodeDefender parity). Documented for a precise
+    // breakdown; producers for several of these are not wired yet.
+    /// Body falls through into the next function (no clean boundary).
+    FallthroughToFunction,
+    /// Far (inter-segment) jump.
+    FarJump,
+    /// Call target could not be validated/relocated.
+    InvalidCall,
+    /// Unconditional jump target could not be validated/relocated.
+    InvalidJump,
+    /// Conditional jump target could not be validated/relocated.
+    InvalidJcc,
+    /// Software interrupt that cannot be relocated.
+    InvalidInterrupt,
+    /// A data/code reference could not be resolved to the moved layout.
+    InvalidReference,
+    /// Raw decode of the function bytes failed.
+    DecodeFailure,
+    /// TSX `xabort`/`xend` in the body.
+    XAbortOrXEnd,
+    /// Reachable only via an exception path we do not model.
+    UnhandledException,
+    /// Exception unwind-epilogue (footer) record is malformed.
+    EhInvalidFooter,
+    /// Function does not own the UNWIND_INFO it points at (shared/chained).
+    EhFunctionDoesntOwnInfo,
+    /// Could not create an exception bucket for the moved function.
+    EhNoBucketCreation,
+    /// UNWIND_INFO fields are inconsistent.
+    EhBadInfo,
+    /// Chained unwind record forms an invalid chain.
+    EhInvalidChain,
+    /// A reference inside the exception footer failed to relocate.
+    EhFooterReferenceFailed,
 }
 
 impl RejectionReason {
@@ -51,6 +92,24 @@ impl RejectionReason {
             Self::SymbolizationUncertain => "SymbolizationUncertain",
             Self::CodegenFailure => "CodegenFailure",
             Self::RegisterPressure => "RegisterPressure",
+            Self::UnsupportedFlags => "UnsupportedFlags",
+            Self::SelfRecursive => "SelfRecursive",
+            Self::FallthroughToFunction => "FallthroughToFunction",
+            Self::FarJump => "FarJump",
+            Self::InvalidCall => "InvalidCall",
+            Self::InvalidJump => "InvalidJump",
+            Self::InvalidJcc => "InvalidJcc",
+            Self::InvalidInterrupt => "InvalidInterrupt",
+            Self::InvalidReference => "InvalidReference",
+            Self::DecodeFailure => "DecodeFailure",
+            Self::XAbortOrXEnd => "XAbortOrXEnd",
+            Self::UnhandledException => "UnhandledException",
+            Self::EhInvalidFooter => "EhInvalidFooter",
+            Self::EhFunctionDoesntOwnInfo => "EhFunctionDoesntOwnInfo",
+            Self::EhNoBucketCreation => "EhNoBucketCreation",
+            Self::EhBadInfo => "EhBadInfo",
+            Self::EhInvalidChain => "EhInvalidChain",
+            Self::EhFooterReferenceFailed => "EhFooterReferenceFailed",
         }
     }
 }

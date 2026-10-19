@@ -200,9 +200,9 @@ fn protect_identity(input: &Path, output: &Path) -> anyhow::Result<()> {
         *by_reason.entry(reason.tag()).or_default() += 1;
     }
     tracing::info!(
-        moved = report.moved.len(),
         ssa_lowered = report.ssa_lowered,
         rejected = report.rejected.len(),
+        relocated = report.moved.len(),
         "protection complete"
     );
     for (reason, count) in by_reason {
@@ -275,9 +275,9 @@ fn protect_with_profile(input: &Path, output: &Path, profile_path: &Path) -> any
         *by_reason.entry(reason.tag()).or_default() += 1;
     }
     tracing::info!(
-        moved = report.moved.len(),
         ssa_lowered = report.ssa_lowered,
         rejected = report.rejected.len(),
+        relocated = report.moved.len(),
         "protection complete"
     );
     for (reason, count) in by_reason {
