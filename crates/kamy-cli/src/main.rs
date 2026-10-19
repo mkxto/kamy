@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use kamy_config::Config;
+use kamy_corpus::Coverage;
 use kamy_disasm::discover_functions;
 use kamy_pe::PeFile;
 
@@ -84,6 +85,35 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         vectors: u32,
     },
+    /// Differential corpus tooling (build/bless/verify/list).
+    Corpus {
+        #[command(subcommand)]
+        cmd: CorpusCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CorpusCmd {
+    /// Build each member's original binary.
+    Build {
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+    },
+    /// Build, observe, and record each member's golden behavior.
+    Bless {
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+    },
+    /// Protect each member and diff against its golden record.
+    Verify {
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+    },
+    /// List corpus members and their oracle kinds.
+    List {
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -116,7 +146,76 @@ fn main() -> anyhow::Result<()> {
             protected,
             vectors,
         } => verify(&original, &protected, vectors),
+        Command::Corpus { cmd } => corpus(cmd),
     }
+}
+
+fn corpus(cmd: CorpusCmd) -> anyhow::Result<()> {
+    match cmd {
+        CorpusCmd::Build { corpus } => kamy_corpus::build_corpus(&corpus_dir(corpus)?),
+        CorpusCmd::Bless { corpus } => kamy_corpus::bless_corpus(&corpus_dir(corpus)?),
+        CorpusCmd::Verify { corpus } => verify_corpus_cmd(&corpus_dir(corpus)?),
+        CorpusCmd::List { corpus } => kamy_corpus::list_corpus(&corpus_dir(corpus)?),
+    }
+}
+
+/// Run the differential corpus verification and surface both axes: per-member
+/// PASS/FAIL plus the SSA lift/lower coverage table and corpus totals. The
+/// command still errors if any member diverges, after coverage is printed.
+fn verify_corpus_cmd(dir: &Path) -> anyhow::Result<()> {
+    let cov = kamy_corpus::verify_corpus(dir, &|inp, outp| protect_pipeline(inp, outp))?;
+    print_coverage(&cov);
+    if cov.failed > 0 {
+        anyhow::bail!("{} member(s) failed verification", cov.failed);
+    }
+    Ok(())
+}
+
+/// Print the two-axis corpus report: per-member PASS/FAIL with
+/// `ssa_lowered/relocated/rejected`, the corpus TOTAL, and the merged rejection
+/// reasons sorted by count descending.
+fn print_coverage(cov: &kamy_corpus::CorpusCoverage) {
+    println!();
+    println!("coverage  name                     verdict  ssa_lowered/relocated/rejected");
+    for m in &cov.members {
+        println!(
+            "          {:<24} {:<7}  {}/{}/{}",
+            m.name,
+            if m.passed { "PASS" } else { "FAIL" },
+            m.coverage.ssa_lowered,
+            m.coverage.relocated,
+            m.coverage.rejected,
+        );
+    }
+    let t = &cov.total;
+    println!(
+        "          {:<24} {:<7}  {}/{}/{}",
+        "TOTAL", "", t.ssa_lowered, t.relocated, t.rejected,
+    );
+    if !t.by_reason.is_empty() {
+        let mut reasons: Vec<_> = t.by_reason.iter().collect();
+        reasons.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        println!("rejections by reason:");
+        for (reason, count) in reasons {
+            println!("          {reason:<24} {count}");
+        }
+    }
+    println!(
+        "members={} passed={} failed={}",
+        cov.members.len(),
+        cov.passed,
+        cov.failed,
+    );
+}
+
+/// Resolve the corpus directory from `--corpus` or `KAMY_CORPUS_DIR`.
+fn corpus_dir(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(dir) = explicit {
+        return Ok(dir);
+    }
+    std::env::var_os("KAMY_CORPUS_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("corpus dir required: pass --corpus or set KAMY_CORPUS_DIR"))
 }
 
 /// Fixed seed so the differential harness is reproducible across invocations.
@@ -179,7 +278,11 @@ fn analyze(input: &Path, output: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn protect_identity(input: &Path, output: &Path) -> anyhow::Result<()> {
+/// Run the identity protect pipeline (parse PE, lift, lower via the linker) and
+/// write the protected image to `output`. Returns the SSA lift/lower
+/// [`Coverage`] measured for this binary. Shared by `protect --no-transform`
+/// and corpus verification so both exercise the same path.
+fn protect_pipeline(input: &Path, output: &Path) -> anyhow::Result<Coverage> {
     let bytes = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
     let pe = PeFile::parse(&bytes).with_context(|| format!("parsing {}", input.display()))?;
 
@@ -195,17 +298,27 @@ fn protect_identity(input: &Path, output: &Path) -> anyhow::Result<()> {
     )?;
     std::fs::write(output, &image).with_context(|| format!("writing {}", output.display()))?;
 
-    let mut by_reason: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    let mut by_reason: std::collections::BTreeMap<String, usize> = Default::default();
     for (_, reason) in &report.rejected {
-        *by_reason.entry(reason.tag()).or_default() += 1;
+        *by_reason.entry(reason.tag().to_string()).or_default() += 1;
     }
+    Ok(Coverage {
+        ssa_lowered: report.ssa_lowered,
+        relocated: report.moved.len(),
+        rejected: report.rejected.len(),
+        by_reason,
+    })
+}
+
+fn protect_identity(input: &Path, output: &Path) -> anyhow::Result<()> {
+    let cov = protect_pipeline(input, output)?;
     tracing::info!(
-        ssa_lowered = report.ssa_lowered,
-        rejected = report.rejected.len(),
-        relocated = report.moved.len(),
+        ssa_lowered = cov.ssa_lowered,
+        rejected = cov.rejected,
+        relocated = cov.relocated,
         "protection complete"
     );
-    for (reason, count) in by_reason {
+    for (reason, count) in &cov.by_reason {
         tracing::info!(reason = %reason, count, "reject summary");
     }
     Ok(())

@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 kamy-config.workspace = true
+kamy-corpus.workspace = true
 kamy-core.workspace = true
 kamy-pe.workspace = true
 kamy-disasm.workspace = true

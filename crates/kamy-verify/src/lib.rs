@@ -48,13 +48,12 @@ impl SplitMix64 {
     }
 }
 
-struct RunResult {
-    exit: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-fn run(binary: &Path, input: &[u8]) -> std::io::Result<RunResult> {
+/// Spawn `binary`, feed `input` on stdin, wait, and capture observable output.
+/// Returns `(exit_code, stdout, stderr)`; `exit` is `None` on signal.
+pub fn run_capture(
+    binary: &Path,
+    input: &[u8],
+) -> std::io::Result<(Option<i32>, Vec<u8>, Vec<u8>)> {
     let mut child = Command::new(binary)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -67,11 +66,22 @@ fn run(binary: &Path, input: &[u8]) -> std::io::Result<RunResult> {
     }
 
     let output = child.wait_with_output()?;
-    Ok(RunResult {
-        exit: output.status.code(),
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
+    Ok((output.status.code(), output.stdout, output.stderr))
+}
+
+/// Deterministic stdin payload for run index `run` under `seed`. Run 0 is empty;
+/// later runs yield the seeded splitmix64 payload of 1..=256 bytes.
+#[must_use]
+pub fn seeded_input(seed: u64, run: u32) -> Vec<u8> {
+    if run == 0 {
+        return Vec::new();
+    }
+    let mut rng = SplitMix64(seed.wrapping_add(u64::from(run)));
+    // 1..=256 bytes, deterministically sized per run.
+    let len = 1 + (rng.next_u64() % 256) as usize;
+    let mut buf = vec![0u8; len];
+    rng.fill(&mut buf);
+    buf
 }
 
 fn show_code(code: Option<i32>) -> String {
@@ -104,43 +114,35 @@ pub fn differential(
     let mut mismatches = Vec::new();
 
     for run_idx in 0..runs {
-        let input = if run_idx == 0 {
-            Vec::new()
-        } else {
-            let mut rng = SplitMix64(seed.wrapping_add(u64::from(run_idx)));
-            // 1..=256 bytes, deterministically sized per run.
-            let len = 1 + (rng.next_u64() % 256) as usize;
-            let mut buf = vec![0u8; len];
-            rng.fill(&mut buf);
-            buf
-        };
+        let input = seeded_input(seed, run_idx);
 
-        let a = run(original, &input).with_context(|| format!("running {}", original.display()))?;
-        let b =
-            run(protected, &input).with_context(|| format!("running {}", protected.display()))?;
+        let (a_exit, a_out, a_err) = run_capture(original, &input)
+            .with_context(|| format!("running {}", original.display()))?;
+        let (b_exit, b_out, b_err) = run_capture(protected, &input)
+            .with_context(|| format!("running {}", protected.display()))?;
 
-        if a.exit != b.exit {
+        if a_exit != b_exit {
             mismatches.push(Mismatch {
                 run: run_idx,
                 field: "exit".to_string(),
-                original: show_code(a.exit),
-                protected: show_code(b.exit),
+                original: show_code(a_exit),
+                protected: show_code(b_exit),
             });
         }
-        if a.stdout != b.stdout {
+        if a_out != b_out {
             mismatches.push(Mismatch {
                 run: run_idx,
                 field: "stdout".to_string(),
-                original: preview(&a.stdout),
-                protected: preview(&b.stdout),
+                original: preview(&a_out),
+                protected: preview(&b_out),
             });
         }
-        if a.stderr != b.stderr {
+        if a_err != b_err {
             mismatches.push(Mismatch {
                 run: run_idx,
                 field: "stderr".to_string(),
-                original: preview(&a.stderr),
-                protected: preview(&b.stderr),
+                original: preview(&a_err),
+                protected: preview(&b_err),
             });
         }
     }

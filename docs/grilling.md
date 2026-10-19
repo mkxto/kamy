@@ -734,6 +734,22 @@ pass **C1/C2**.
   per-reason reject aggregate at `info`; individual per-function rejects and
   moves at `debug`; per-instruction detail at `trace`.
 
+### D33 — Runnable differential corpus (issue #7)
+
+**Decision:** Golden record, blessed from the original. `kamy corpus verify` compares the protected binary to a committed per-member record; the original is executed only during `--bless` (run N times with seeded inputs, determinism-checked) and the record carries os/arch/toolchain provenance. The corpus lives in `github.com/mkxto/kamy-corpus`, referenced by a loose `--corpus <dir>` / `KAMY_CORPUS_DIR` and pinned for reproducibility by a committed `corpus.lock` (url + commit sha). It is an open verification tool, deliberately NOT a blocking CI gate (deferred); issue #7's CI-gate acceptance is explicitly left open.
+
+### D34 — Per-member oracle
+
+**Decision:** Each member declares an oracle. `console` = exit code + stdout + stderr. `gui` = an ordered API-call trace of call names + STRING arguments only (minimal trace: no numeric/pointer/flag capture), captured by a build-time winapi link-shim (NO runtime DLL injection) that emits to a sidecar trace file and suppresses the blocking side effect. `dll` = results of a loader host that `LoadLibrary`s the binary by path and calls a curated set of pure, self-contained exports; impure/stateful exports stay static-only. This turns kernel32-class binaries from static-reparse-only into actually-executed for their pure exports — the blind spot issue #7 names.
+
+### D35 — Two-phase build
+
+**Decision:** `kamy corpus build` compiles members from per-member recipes (MSVC `cl` via `vcvars64.bat`, `clang-cl`, `rustc`) on a toolchain-equipped host; `kamy corpus verify` consumes prebuilt binaries + golden and needs no compilers. Members must be deterministic-by-construction; a non-deterministic original is quarantined at bless. An absent toolchain (e.g. clang-cl) skips its members with a warning rather than failing.
+
+### D36 — kamy-corpus crate
+
+**Decision:** A new workspace crate `kamy-corpus` owns the manifest, build driver, bless, verify loop, and the DLL loader. `kamy-verify` keeps the format-agnostic record/compare/run primitives. Windows-specific execution (vcvars build, loader FFI) is cfg-gated so the core still compiles cross-platform.
+
 ## Decision Summary
 
 | # | Decision | Choice |
@@ -770,6 +786,10 @@ pass **C1/C2**.
 | D30 | Runtime & plugin SDK | CodeDefender model: EP hijack, init table, COFF plugins (D17 enriched) |
 | D31 | Phase order | Unwind kernel into Phase 2; SEH before obfuscation |
 | D32 | Error handling & observability | anyhow everywhere (no thiserror); tracing via kamy-observe; KAMY_LOG scope/level; RejectionReason stays domain data |
+| D33 | Runnable corpus | Golden record blessed from original; open tool, no CI gate |
+| D34 | Per-member oracle | console stdio / gui link-shim trace / dll loader over pure exports |
+| D35 | Two-phase build | `corpus build` needs toolchains; `corpus verify` does not |
+| D36 | kamy-corpus crate | Orchestration crate; kamy-verify stays format-agnostic |
 
 ---
 

@@ -192,6 +192,7 @@ dependencies = [
  "clap",
  "kamy-config",
  "kamy-core",
+ "kamy-corpus",
  "kamy-disasm",
  "kamy-link",
  "kamy-observe",
@@ -224,6 +225,17 @@ dependencies = [
 [[package]]
 name = "kamy-core"
 version = "0.0.0"
+
+[[package]]
+name = "kamy-corpus"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "kamy-verify",
+ "serde",
+ "serde_norway",
+ "tracing",
+]
 
 [[package]]
 name = "kamy-disasm"

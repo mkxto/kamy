@@ -30,6 +30,7 @@ kamy-seh = { path = "crates/kamy-seh", version = "0.0.0" }
 kamy-verify = { path = "crates/kamy-verify", version = "0.0.0" }
 kamy-config = { path = "crates/kamy-config", version = "0.0.0" }
 kamy-observe = { path = "crates/kamy-observe", version = "0.0.0" }
+kamy-corpus = { path = "crates/kamy-corpus", version = "0.0.0" }
 
 # External crates
 iced-x86 = "1.21.0"
