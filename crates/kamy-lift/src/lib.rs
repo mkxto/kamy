@@ -176,6 +176,14 @@ fn dispatch(
     state: &mut LiftState,
     cc: &dyn CallingConvLookup,
 ) -> Option<ValueId> {
+    // FS/GS-relative accesses (TEB/PEB, stack cookie, TLS) have a nonzero
+    // segment base the flat-address SSA cannot model; lowering them as plain
+    // `[disp]` reads near-null. Reject the function instead (D22). DS/SS/ES/CS
+    // are flat in long mode, so only FS/GS matter.
+    if matches!(insn.segment_prefix(), Register::FS | Register::GS) {
+        state.unsupported = true;
+        return None;
+    }
     match insn.flow_control() {
         FlowControl::Return => {
             control::lift_ret(builder, state);
