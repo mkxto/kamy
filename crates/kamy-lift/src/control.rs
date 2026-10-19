@@ -258,9 +258,11 @@ pub(crate) fn lift_tail_call(
                 PhysReg::Xmm(x) => s.get_xmm(*x),
                 PhysReg::Flag(f) => s.get_flag(*f),
             };
-            let arg = if s.reg_pins.get(&v) == Some(phys) {
-                v
-            } else if s.reg_pins.contains_key(&v) || s.rsp_chain.contains(&v) {
+            // Copy before pinning so the pin lands on a fresh value defined in
+            // this block. A block-entry register placeholder is pre-pinned, but
+            // construct_ssa rewrites it to a phi at a merge tail block, dropping
+            // the pin (dead key) — the copy's dest survives that rewrite.
+            let arg = if s.reg_pins.contains_key(&v) || s.rsp_chain.contains(&v) {
                 let ty = if matches!(phys, PhysReg::Xmm(_)) {
                     IrType::I128
                 } else {
@@ -276,6 +278,20 @@ pub(crate) fn lift_tail_call(
             b.emit_void(IrOp::Use, &[arg], IrType::I64);
         }
     }
+    // RAX carries a tail-forwarded value independent of the arg signature: the
+    // Windows /guard:cf dispatch thunk (`jmp [__guard_dispatch_icall_fptr]`)
+    // takes the indirect-call target in RAX, so a tail jmp through it must keep
+    // the function's RAX live to the jump or the guard dispatches to garbage.
+    let rax_v = s.get_gpr(Gpr::Rax);
+    let rax_out = if s.reg_pins.contains_key(&rax_v) || s.rsp_chain.contains(&rax_v) {
+        let c = b.emit(IrOp::Copy, &[rax_v], IrType::I64);
+        s.reg_pins.insert(c, PhysReg::Gpr(Gpr::Rax));
+        c
+    } else {
+        s.reg_pins.insert(rax_v, PhysReg::Gpr(Gpr::Rax));
+        rax_v
+    };
+    b.emit_void(IrOp::Use, &[rax_out], IrType::I64);
     b.emit_void(IrOp::Use, &[s.get_gpr(Gpr::Rsp)], IrType::I64);
 }
 
