@@ -166,19 +166,20 @@ verdict. Open tool, not a CI gate (D33).
 
 | Member | Toolchain | Oracle | verify | SSA / reloc / reject | coverage |
 |--------|-----------|--------|--------|----------------------|----------|
-| console_fibmix | rustc | stdio | ✅ PASS | 96 / 107 / 252 | 96/455 (21%) |
-| gui_msgbox | msvc (cl) | winapi link-shim trace | ❌ FAIL `0xC0000005` | 170 / 224 / 355 | 170/749 (23%) |
-| dll_strutil | msvc (cl) | loader / pure exports | ❌ FAIL `0xC0000005` | 131 / 135 / 231 | 131/497 (26%) |
-| kernel32 (vendored) | prebuilt | loader / pure exports | ❌ FAIL `0xC0000409` | 397 / 879 / 1310 | 397/2586 (15%) |
+| console_fibmix | rustc | stdio | ✅ PASS | 96 / 1 / 252 | 96/349 (28%) |
+| gui_msgbox | msvc (cl) | winapi link-shim trace | ❌ FAIL `0xC0000005` | 170 / 0 / 355 | 170/525 (32%) |
+| dll_strutil | msvc (cl) | loader / pure exports | ❌ FAIL `0xC0000005` | 131 / 0 / 231 | 131/362 (36%) |
+| kernel32 (vendored) | prebuilt | loader / pure exports | ❌ FAIL `0xC0000409` | 397 / 2 / 1310 | 397/1709 (23%) |
 
 - gui trace comes from a build-time winapi link-shim (no DLL injection):
   `MessageBoxW|hello world`, `MessageBoxW|second`.
 - dll members run under a loader that maps a uniquely-named copy — defeating the
   KnownDLLs short-circuit so kernel32's real bytes execute — and calls curated
   pure exports (`MulDiv(6,7,3)=14`, `lstrlenW=5`, `kamy_fnv("abc")=440920331`).
-- Coverage = SSA-lowered / total; **relocated and rejected are both not-covered**
-  (verbatim relocation is not SSA coverage). TOTAL 794/4287 (18.5%); rejects
-  dominated by `RegisterPressure` (1275, the zero-spill D5 budget).
+- Coverage = SSA-lowered / total; **relocated and rejected are both not-covered**.
+  Verbatim relocation is banned — SSA failures are rejected in place — so `relocated`
+  is ≈0 (switch-table retargets only). TOTAL 794/2945 (27%); rejects dominated by
+  `RegisterPressure` (1275, the zero-spill D5 budget).
 - **Caught real SSA miscompiles — issue #7's whole purpose.** The SSA-protected
   gui_msgbox and dll_strutil access-violate (`0xC0000005`) and kernel32 fast-fails
   on a stack-buffer overrun (`0xC0000409`); console_fibmix lowers 96 functions and
