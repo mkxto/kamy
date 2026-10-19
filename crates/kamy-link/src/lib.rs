@@ -64,12 +64,11 @@ pub fn protect(
     })
 }
 
-/// SSA path with IR-level transforms. Falls back to relocation when the
-/// regalloc can't fit the transformed code into volatile registers.
-///
-/// MBA and other IR transforms are architecturally correct but produce
-/// relocation-identical output until callee-saved register support lands
-/// (RSP pinning + prologue/epilogue emission + UNWIND_INFO reconstruction).
+/// SSA path with IR-level transforms. A function that cannot be SSA-lowered
+/// (register pressure, unsupported instruction/flags, self-recursion) is
+/// rejected in place — verbatim relocation is banned, since copying a function
+/// unchanged applies no protection and only risks relocation bugs. Only
+/// SSA-lowered (and switch-retargeted) functions are moved.
 pub fn protect_with_transforms(
     pe: &PeFile,
     module: &Module,
@@ -87,10 +86,7 @@ pub fn protect_with_transforms(
             let new_va = base + u64::from(new_rva);
             match ssa_body(module, func, cc, transform, base, new_va) {
                 Ok((body, shape)) => Ok((body, Ok(shape))),
-                Err(reason) => {
-                    let instrs = function_instructions(module, func);
-                    Ok((relocate(&instrs, new_va)?, Err(Some(reason))))
-                }
+                Err(reason) => Ok((Vec::new(), Err(Some(reason)))),
             }
         },
     )
@@ -340,7 +336,10 @@ fn protect_inner(
 
                 match &shape {
                     Ok(_) => report.ssa_lowered += 1,
-                    Err(Some(reason)) => report.rejected.push((cand.entry, *reason)),
+                    Err(Some(reason)) => {
+                        report.rejected.push((cand.entry, *reason));
+                        continue;
+                    }
                     Err(None) => {}
                 }
 
