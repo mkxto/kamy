@@ -21,7 +21,7 @@ pub fn build_corpus(dir: &Path) -> Result<()> {
     let (mut built, mut skipped) = (0u32, 0u32);
     for member in &members {
         let _s = tracing::info_span!("member", name = %member.name).entered();
-        match build::build_member(member, dir)? {
+        match build::build_member(member, dir, true)? {
             Some(path) => {
                 built += 1;
                 tracing::info!(path = %path.display(), "built");

@@ -15,7 +15,9 @@ use crate::manifest::Member;
 /// Returns the binary path, or `Ok(None)` when the member is skipped because its
 /// toolchain (e.g. `clang-cl`) is unavailable. `prebuilt` members return the
 /// committed path without building.
-pub fn build_member(member: &Member, corpus_root: &Path) -> Result<Option<PathBuf>> {
+/// With `force`, always rebuild from source; otherwise reuse an existing
+/// original so `bless`/`verify` need no toolchain (D34).
+pub fn build_member(member: &Member, corpus_root: &Path, force: bool) -> Result<Option<PathBuf>> {
     if member.prebuilt.is_some() {
         let path = member.binary_path();
         anyhow::ensure!(
@@ -24,6 +26,10 @@ pub fn build_member(member: &Member, corpus_root: &Path) -> Result<Option<PathBu
             path.display()
         );
         return Ok(Some(path));
+    }
+    let out = member.binary_path();
+    if !force && out.is_file() {
+        return Ok(Some(out));
     }
     build_from_source(member, corpus_root)
 }

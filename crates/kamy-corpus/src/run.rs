@@ -142,7 +142,7 @@ fn loader_path() -> Result<PathBuf> {
 
 /// Bless the original: build, observe twice for determinism, stamp, and save.
 pub fn bless_member(member: &Member, root: &Path, seed: u64) -> Result<BehaviorRecord> {
-    let bin = build_member(member, root)?
+    let bin = build_member(member, root, false)?
         .with_context(|| format!("member {} could not be built", member.name))?;
 
     let first = observe(member, &bin, seed)?;
@@ -170,7 +170,7 @@ pub fn verify_member(
     seed: u64,
     protect: &dyn Fn(&Path, &Path) -> Result<Coverage>,
 ) -> Result<(Vec<String>, Coverage)> {
-    let original = build_member(member, root)?
+    let original = build_member(member, root, false)?
         .with_context(|| format!("member {} has no original binary", member.name))?;
 
     let expected_path = member.expected_path();
