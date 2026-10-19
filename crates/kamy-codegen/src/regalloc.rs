@@ -88,6 +88,21 @@ pub fn callee_saved_used(alloc: &RegAllocation) -> Vec<iced_x86::Register> {
         .collect()
 }
 
+/// Callee-saved XMMs actually used by `alloc`, in canonical pool order, as iced
+/// registers. Drives the prologue movups save area and the UNWIND stack alloc.
+pub fn callee_saved_xmms_used(alloc: &RegAllocation) -> Vec<iced_x86::Register> {
+    CALLEE_SAVED_XMMS
+        .iter()
+        .filter(|saved| {
+            alloc
+                .assignments
+                .values()
+                .any(|v| matches!(v, PhysReg::Xmm(x) if x == *saved))
+        })
+        .map(|saved| xmm_to_iced(*saved))
+        .collect()
+}
+
 const VOLATILE_XMMS: [XmmReg; 6] = [
     XmmReg::Xmm0,
     XmmReg::Xmm1,
@@ -97,10 +112,59 @@ const VOLATILE_XMMS: [XmmReg; 6] = [
     XmmReg::Xmm5,
 ];
 
+/// Win64 callee-saved XMM pool (XMM6..XMM15). Saved with movups in the generated
+/// prologue; drives epilogue restore and the UNWIND stack allocation.
+const CALLEE_SAVED_XMMS: [XmmReg; 10] = [
+    XmmReg::Xmm6,
+    XmmReg::Xmm7,
+    XmmReg::Xmm8,
+    XmmReg::Xmm9,
+    XmmReg::Xmm10,
+    XmmReg::Xmm11,
+    XmmReg::Xmm12,
+    XmmReg::Xmm13,
+    XmmReg::Xmm14,
+    XmmReg::Xmm15,
+];
+
+fn is_callee_saved_xmm(x: XmmReg) -> bool {
+    CALLEE_SAVED_XMMS.contains(&x)
+}
+
+fn xmm_to_iced(x: XmmReg) -> iced_x86::Register {
+    use iced_x86::Register as R;
+    match x {
+        XmmReg::Xmm0 => R::XMM0,
+        XmmReg::Xmm1 => R::XMM1,
+        XmmReg::Xmm2 => R::XMM2,
+        XmmReg::Xmm3 => R::XMM3,
+        XmmReg::Xmm4 => R::XMM4,
+        XmmReg::Xmm5 => R::XMM5,
+        XmmReg::Xmm6 => R::XMM6,
+        XmmReg::Xmm7 => R::XMM7,
+        XmmReg::Xmm8 => R::XMM8,
+        XmmReg::Xmm9 => R::XMM9,
+        XmmReg::Xmm10 => R::XMM10,
+        XmmReg::Xmm11 => R::XMM11,
+        XmmReg::Xmm12 => R::XMM12,
+        XmmReg::Xmm13 => R::XMM13,
+        XmmReg::Xmm14 => R::XMM14,
+        XmmReg::Xmm15 => R::XMM15,
+    }
+}
+
 fn is_callee_saved_gpr(g: Gpr) -> bool {
     CALLEE_SAVED_GPRS
         .iter()
         .any(|p| matches!(p, PhysReg::Gpr(x) if *x == g))
+}
+
+fn is_volatile_phys(p: PhysReg) -> bool {
+    match p {
+        PhysReg::Gpr(g) => g.is_volatile_win64(),
+        PhysReg::Xmm(x) => VOLATILE_XMMS.contains(&x),
+        PhysReg::Flag(_) => false,
+    }
 }
 
 fn block_order(func: &IrFunction) -> Vec<BlockId> {
@@ -261,7 +325,11 @@ pub fn allocate_registers(
         .collect();
 
     let mut avail_gprs: Vec<Gpr> = VOLATILE_GPRS.to_vec();
-    let mut avail_xmms: Vec<XmmReg> = VOLATILE_XMMS.to_vec();
+    let mut avail_xmms: Vec<XmmReg> = VOLATILE_XMMS
+        .iter()
+        .chain(CALLEE_SAVED_XMMS.iter())
+        .copied()
+        .collect();
 
     for reg in saved_regs {
         match reg {
@@ -320,6 +388,15 @@ pub fn allocate_registers(
                 active.push((iv.clone(), pinned));
                 continue;
             }
+            if iv.crosses_call && is_volatile_phys(pinned) {
+                // A value pinned to a volatile register that outlives a call would
+                // be clobbered by it, and the single-assignment lowering cannot
+                // relocate a pinned value mid-life. reg→reg moves are modeled as a
+                // Copy (a fresh value the allocator can place in a callee-saved
+                // register), so a correct function never reaches here; reject rather
+                // than miscompile if one does.
+                return Err(RejectionReason::RegisterPressure);
+            }
             let occupied = active.iter().any(|(_, r)| *r == pinned);
             if occupied {
                 let conf = active
@@ -360,14 +437,26 @@ pub fn allocate_registers(
                 .map(|(r, _, _)| *r)
                 .collect();
             let reg = if needs_xmm {
-                if iv.crosses_call {
-                    // No callee-saved XMM pool: an XMM value cannot survive a call.
-                    return Err(RejectionReason::RegisterPressure);
-                }
-                match free_xmms
-                    .iter()
-                    .position(|x| !forbidden.contains(&PhysReg::Xmm(*x)))
-                {
+                let pos = if iv.crosses_call {
+                    // Must survive the call → callee-saved XMM (saved in our prologue).
+                    free_xmms.iter().position(|x| {
+                        is_callee_saved_xmm(*x) && !forbidden.contains(&PhysReg::Xmm(*x))
+                    })
+                } else {
+                    // Prefer a volatile so callee-saved stay free for crossers; fall
+                    // back to any free register the pins leave available.
+                    free_xmms
+                        .iter()
+                        .position(|x| {
+                            !is_callee_saved_xmm(*x) && !forbidden.contains(&PhysReg::Xmm(*x))
+                        })
+                        .or_else(|| {
+                            free_xmms
+                                .iter()
+                                .position(|x| !forbidden.contains(&PhysReg::Xmm(*x)))
+                        })
+                };
+                match pos {
                     Some(p) => PhysReg::Xmm(free_xmms.remove(p)),
                     None => return Err(RejectionReason::RegisterPressure),
                 }
@@ -636,6 +725,117 @@ mod tests {
         assert_eq!(
             callee_saved_used(&alloc),
             vec![iced_x86::Register::RBX, iced_x86::Register::R13]
+        );
+    }
+
+    #[test]
+    fn xmm_value_across_call_uses_callee_saved() {
+        // An XMM value live across a call previously rejected (no callee-saved XMM
+        // pool); with XMM6..XMM15 it must allocate and be reported as used.
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let addr = func.alloc_value();
+        let xv = func.alloc_value();
+        let callret = func.alloc_value();
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![
+                Inst {
+                    dest: Some(addr),
+                    op: IrOp::Const(0x1000),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(xv),
+                    op: IrOp::Load,
+                    args: vec![addr],
+                    ty: IrType::I128,
+                },
+                Inst {
+                    dest: Some(callret),
+                    op: IrOp::Call { target: 0x2000 },
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: None,
+                    op: IrOp::Store,
+                    args: vec![addr, xv],
+                    ty: IrType::I128,
+                },
+            ],
+            term: IrTerminator::Ret,
+        });
+
+        let alloc = allocate_registers(&func, &CALLEE_SAVED_GPRS, &HashSet::new(), &HashMap::new())
+            .expect("xmm-across-call must allocate with the callee-saved pool");
+        let phys = alloc.assignments[&xv];
+        assert!(
+            matches!(phys, PhysReg::Xmm(x) if is_callee_saved_xmm(x)),
+            "xmm value crossing a call must land in a callee-saved XMM, got {phys:?}"
+        );
+        assert_eq!(
+            callee_saved_xmms_used(&alloc),
+            vec![iced_x86::Register::XMM6]
+        );
+    }
+
+    #[test]
+    fn volatile_pinned_value_across_call_rejects() {
+        // A value pinned to a volatile register (an incoming arg) that outlives a
+        // call would be clobbered by it, and the single-assignment lowering cannot
+        // relocate a pinned value mid-life, so the allocator rejects rather than
+        // miscompile. Recovering these needs live-range splitting (see STATUS).
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let arg = func.alloc_value();
+        let callret = func.alloc_value();
+        let data = func.alloc_value();
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![
+                Inst {
+                    dest: Some(arg),
+                    op: IrOp::Undef,
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(callret),
+                    op: IrOp::Call { target: 0x2000 },
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(data),
+                    op: IrOp::Const(7),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: None,
+                    op: IrOp::Store,
+                    args: vec![arg, data],
+                    ty: IrType::I64,
+                },
+            ],
+            term: IrTerminator::Ret,
+        });
+        let mut pins = HashMap::new();
+        pins.insert(arg, PhysReg::Gpr(Gpr::Rcx));
+        let r = allocate_registers(&func, &CALLEE_SAVED_GPRS, &HashSet::new(), &pins);
+        assert!(
+            matches!(r, Err(RejectionReason::RegisterPressure)),
+            "a volatile-pinned value crossing a call must reject, got {r:?}"
         );
     }
 

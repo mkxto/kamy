@@ -41,7 +41,7 @@ pub struct Report {
 #[derive(Clone)]
 struct PrologueShape {
     pushed: Vec<iced_x86::Register>,
-    aligned: bool,
+    stack_alloc: u32,
 }
 
 struct Moved {
@@ -140,11 +140,20 @@ fn ssa_body(
         ) {
             Ok(alloc) => {
                 let used = kamy_codegen::callee_saved_used(&alloc);
-                let instrs =
-                    kamy_codegen::select_instructions(&result.func, &alloc, base, new_va, &used);
+                let used_xmm = kamy_codegen::callee_saved_xmms_used(&alloc);
+                let instrs = kamy_codegen::select_instructions(
+                    &result.func,
+                    &alloc,
+                    base,
+                    new_va,
+                    &used,
+                    &used_xmm,
+                );
+                let align_pad = if used.len() % 2 == 1 { 8 } else { 0 };
+                let stack_alloc = align_pad + 16 * used_xmm.len() as u32;
                 let shape = PrologueShape {
-                    aligned: used.len() % 2 == 1,
                     pushed: used,
+                    stack_alloc,
                 };
                 return Ok((relocate(&instrs, new_va)?, shape));
             }
@@ -344,7 +353,7 @@ fn protect_inner(
                 // SSA-lowered funcs get FRESH UNWIND_INFO for the generated
                 // push/align prologue (null blob when no reg was pushed);
                 // relocation-shipped funcs keep their original UNWIND_INFO RVA.
-                let unwind = shape.map(|s| kamy_pe::build_unwind_info(&s.pushed, s.aligned));
+                let unwind = shape.map(|s| kamy_pe::build_unwind_info(&s.pushed, s.stack_alloc));
                 moved.push(Moved {
                     entry: cand.entry,
                     new_rva,

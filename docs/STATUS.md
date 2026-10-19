@@ -52,10 +52,23 @@ Living document. Updated as work lands.
    `lift_call` (its clobber list is volatiles-only). Fix: RPO traversal + propagate
    the resolved value into `block_exit` after each replacement. Verified on `fib`
    (RSP now threads as `v43`); SSA lowering reachability went 0 → 95/169.
-2. **XMM5 memory-operand encode failure.** 4 functions fall back with
-   `mov xmm5,[reg]` encode errors in isel/codegen. Separate from threading.
-3. **Zero-spill register pressure.** 70/169 functions exceed 15 GPRs under the D5
-   zero-spill constraint; need XMM callee-saved or a spill path. Expected gap.
+2. ✅ **FIXED — XMM5 memory-operand encode failure.** A 128-bit memory source
+   lifts to `Load:I128`, which the allocator places in an XMM register, but isel
+   emitted the GPR `mov r64,[mem]` for it; iced builds that instruction yet
+   `BlockEncoder` rejects it, so the linker relocated the function verbatim. isel
+   now routes every XMM-assigned Load/Store/Const-zero/Copy/Xor through the SSE
+   forms (`movss`/`movsd`/`movups`/`movaps`/`xorps`/`movq`). Recovered +4 on an SSE
+   fixture, +16 on kernel32.
+3. ✅ **FIXED — Zero-spill XMM register pressure.** XMM6–XMM15 are now a
+   callee-saved pool: a 128-bit value that crosses a call lands there, saved with
+   `movups` in the generated prologue (one combined `sub rsp` folds the alignment
+   pad and the 16-byte save slots) and described as a `UWOP_ALLOC` in `UNWIND_INFO`.
+   `SAVE_XMM128` for the individual stores needs a 16-aligned frame — incompatible
+   with keeping the lowered body at `rsp%16==8` without a frame pointer — so the
+   per-register restore on an exception unwind is deferred to full SEH (D31 Phase
+   3); the ALLOC alone keeps stack walks correct. Demonstrated: a fixture whose
+   function keeps eight vectors across a call lowers via SSA into XMM6–XMM13 and
+   `verify` PASS.
 4. **Return-address push is materialized.** `Store(rsp, const_return_addr)` before
    Call could be folded into the Call node. Optimization, not correctness.
 5. **Over-approximated call args.** Win64Default passes 4 args for every call.
@@ -76,6 +89,19 @@ Living document. Updated as work lands.
    2–3 phantom call-seeds still land inside real code via data-in-code, not
    over-decode — a local-noreturn fixpoint / data-in-code handling is the
    remaining lever. See research.md §10.2.
+7. **Volatile-pinned GPR live across a call is rejected, not recovered.** A reg→reg
+   `mov` aliases the source value in the lifter, so an incoming argument moved into
+   a callee-saved register (`mov rsi, r8; call; use rsi`) stays pinned to its
+   *volatile* source register; kept across the call, that register is clobbered.
+   The allocator now rejects such functions (relocates verbatim) instead of
+   miscompiling — surfaced when the XMM pool (bug 3) let these functions past the
+   old XMM-pressure reject. Correct but conservative: it dropped kernel32
+   SSA-lowered 488 → 430 by rejecting ~58 previously-unsound lowerings (kernel32 is
+   not executed, so those miscompiles were never caught). The real fix is live-range
+   splitting / shrink-wrapping — move the value into a callee-saved register for its
+   cross-call span. A blanket "Copy every volatile-sourced `mov`" perturbs
+   allocation enough to clobber loop-carried values (regressed hex formatting), so
+   the split must be targeted.
 
 ## Phase 3 — SEH & CET (D31: correctness before obfuscation)
 

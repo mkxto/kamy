@@ -8,6 +8,7 @@ pub use encode::assemble;
 pub use isel::select_instructions;
 pub use regalloc::{
     CALLEE_SAVED_GPRS, RegAllocation, RegCopy, allocate_registers, callee_saved_used,
+    callee_saved_xmms_used,
 };
 
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Instruction, InstructionBlock};

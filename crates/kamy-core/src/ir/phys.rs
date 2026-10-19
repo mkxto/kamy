@@ -41,6 +41,15 @@ impl Gpr {
     pub fn index(self) -> usize {
         self as usize
     }
+
+    /// Win64 volatile (caller-saved) GPR: clobbered across a call. RSP is the
+    /// preserved stack pointer and is deliberately not classified here.
+    pub fn is_volatile_win64(self) -> bool {
+        matches!(
+            self,
+            Self::Rax | Self::Rcx | Self::Rdx | Self::R8 | Self::R9 | Self::R10 | Self::R11
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]

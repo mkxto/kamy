@@ -419,6 +419,7 @@ pub fn select_instructions(
     _image_base: u64,
     _entry_va: u64,
     callee_saved_used: &[Register],
+    callee_saved_xmms: &[Register],
 ) -> Vec<Instruction> {
     let order = block_order(func);
     let mut out: Vec<Instruction> = Vec::new();
@@ -435,11 +436,28 @@ pub fn select_instructions(
     for &r in callee_saved_used {
         out.push(Instruction::with1(Code::Push_r64, r).unwrap());
     }
-    // Entry RSP ≡ 8 (mod 16); each 8-byte push flips 16-alignment parity, so an
-    // odd number of pushes needs a +8 to realign the stack to 16 bytes.
-    let odd_pushes = callee_saved_used.len() % 2 == 1;
-    if odd_pushes {
-        out.push(Instruction::with2(Code::Sub_rm64_imm8, Register::RSP, 8i32).unwrap());
+    // Entry RSP ≡ 8 (mod 16). Each 8-byte push flips 16-alignment parity, so an
+    // odd push count needs an 8-byte pad; each nonvolatile XMM save adds 16. The
+    // combined `sub rsp, stack_alloc` is a multiple of 16, so the lowered body
+    // still sees the %16==8 it was compiled for.
+    let align_pad: u32 = if callee_saved_used.len() % 2 == 1 {
+        8
+    } else {
+        0
+    };
+    let stack_alloc: u32 = align_pad + 16 * callee_saved_xmms.len() as u32;
+    if stack_alloc > 0 {
+        let code = if stack_alloc <= 127 {
+            Code::Sub_rm64_imm8
+        } else {
+            Code::Sub_rm64_imm32
+        };
+        out.push(Instruction::with2(code, Register::RSP, stack_alloc as i32).unwrap());
+    }
+    // The save area sits at %16==8, so movups (unaligned), not movaps.
+    for (i, &x) in callee_saved_xmms.iter().enumerate() {
+        let mem = MemoryOperand::with_base_displ(Register::RSP, (16 * i) as i64);
+        out.push(Instruction::with2(Code::Movups_xmmm128_xmm, mem, x).unwrap());
     }
 
     // A critical edge (branch predecessor -> phi-carrying successor) gets its own
@@ -467,8 +485,17 @@ pub fn select_instructions(
         }
 
         if matches!(block.term, IrTerminator::Ret | IrTerminator::Tail { .. }) {
-            if odd_pushes {
-                out.push(Instruction::with2(Code::Add_rm64_imm8, Register::RSP, 8i32).unwrap());
+            for (i, &x) in callee_saved_xmms.iter().enumerate() {
+                let mem = MemoryOperand::with_base_displ(Register::RSP, (16 * i) as i64);
+                out.push(Instruction::with2(Code::Movups_xmm_xmmm128, x, mem).unwrap());
+            }
+            if stack_alloc > 0 {
+                let code = if stack_alloc <= 127 {
+                    Code::Add_rm64_imm8
+                } else {
+                    Code::Add_rm64_imm32
+                };
+                out.push(Instruction::with2(code, Register::RSP, stack_alloc as i32).unwrap());
             }
             for &r in callee_saved_used.iter().rev() {
                 out.push(Instruction::with1(Code::Pop_r64, r).unwrap());
@@ -576,7 +603,10 @@ fn select_inst(
         IrOp::Copy => {
             let dest = inst.dest.unwrap();
             let src = inst.args[0];
-            match (is_xmm(alloc.assignments[&dest]), is_xmm(alloc.assignments[&src])) {
+            match (
+                is_xmm(alloc.assignments[&dest]),
+                is_xmm(alloc.assignments[&src]),
+            ) {
                 (false, false) => {
                     let dest_reg = reg_of(alloc, dest, ty);
                     let src_ty = value_type(func, src);
@@ -590,7 +620,8 @@ fn select_inst(
                     let src_reg = reg_of(alloc, src, IrType::I128);
                     if dest_reg != src_reg {
                         out.push(
-                            Instruction::with2(Code::Movaps_xmm_xmmm128, dest_reg, src_reg).unwrap(),
+                            Instruction::with2(Code::Movaps_xmm_xmmm128, dest_reg, src_reg)
+                                .unwrap(),
                         );
                     }
                 }
@@ -617,14 +648,19 @@ fn select_inst(
                 let lhs_reg = reg_of(alloc, lhs, IrType::I128);
                 let rhs_reg = reg_of(alloc, rhs, IrType::I128);
                 if dest_reg == rhs_reg {
-                    out.push(Instruction::with2(Code::Xorps_xmm_xmmm128, dest_reg, lhs_reg).unwrap());
+                    out.push(
+                        Instruction::with2(Code::Xorps_xmm_xmmm128, dest_reg, lhs_reg).unwrap(),
+                    );
                 } else {
                     if dest_reg != lhs_reg {
                         out.push(
-                            Instruction::with2(Code::Movaps_xmm_xmmm128, dest_reg, lhs_reg).unwrap(),
+                            Instruction::with2(Code::Movaps_xmm_xmmm128, dest_reg, lhs_reg)
+                                .unwrap(),
                         );
                     }
-                    out.push(Instruction::with2(Code::Xorps_xmm_xmmm128, dest_reg, rhs_reg).unwrap());
+                    out.push(
+                        Instruction::with2(Code::Xorps_xmm_xmmm128, dest_reg, rhs_reg).unwrap(),
+                    );
                 }
                 return;
             }
@@ -1167,7 +1203,7 @@ mod tests {
             edge_copies: HashMap::new(),
         };
 
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[]);
+        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
 
         assert!(!instrs.is_empty());
 
@@ -1208,13 +1244,48 @@ mod tests {
             id: BlockId(0),
             phis: vec![],
             insts: vec![
-                Inst { dest: Some(addr), op: IrOp::Const(0x2000), args: vec![], ty: IrType::I64 },
-                Inst { dest: Some(zero), op: IrOp::Const(0), args: vec![], ty: IrType::I128 },
-                Inst { dest: Some(load128), op: IrOp::Load, args: vec![addr], ty: IrType::I128 },
-                Inst { dest: None, op: IrOp::Store, args: vec![addr, load128], ty: IrType::I128 },
-                Inst { dest: Some(load64), op: IrOp::Load, args: vec![addr], ty: IrType::I64 },
-                Inst { dest: None, op: IrOp::Store, args: vec![addr, load64], ty: IrType::I64 },
-                Inst { dest: None, op: IrOp::Store, args: vec![addr, zero], ty: IrType::I128 },
+                Inst {
+                    dest: Some(addr),
+                    op: IrOp::Const(0x2000),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(zero),
+                    op: IrOp::Const(0),
+                    args: vec![],
+                    ty: IrType::I128,
+                },
+                Inst {
+                    dest: Some(load128),
+                    op: IrOp::Load,
+                    args: vec![addr],
+                    ty: IrType::I128,
+                },
+                Inst {
+                    dest: None,
+                    op: IrOp::Store,
+                    args: vec![addr, load128],
+                    ty: IrType::I128,
+                },
+                Inst {
+                    dest: Some(load64),
+                    op: IrOp::Load,
+                    args: vec![addr],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: None,
+                    op: IrOp::Store,
+                    args: vec![addr, load64],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: None,
+                    op: IrOp::Store,
+                    args: vec![addr, zero],
+                    ty: IrType::I128,
+                },
             ],
             term: IrTerminator::Ret,
         });
@@ -1230,7 +1301,7 @@ mod tests {
             edge_copies: HashMap::new(),
         };
 
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[]);
+        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
 
         // The exact gate the linker hit: BlockEncoder must accept every instruction.
         let bytes = crate::relocate(&instrs, 0x140001000).expect("xmm moves must encode");
@@ -1238,9 +1309,18 @@ mod tests {
 
         use iced_x86::Mnemonic;
         let mnem: Vec<Mnemonic> = instrs.iter().map(|i| i.mnemonic()).collect();
-        assert!(mnem.contains(&Mnemonic::Movups), "movups for I128 xmm: {mnem:?}");
-        assert!(mnem.contains(&Mnemonic::Movsd), "movsd for I64 xmm: {mnem:?}");
-        assert!(mnem.contains(&Mnemonic::Xorps), "xorps zero idiom: {mnem:?}");
+        assert!(
+            mnem.contains(&Mnemonic::Movups),
+            "movups for I128 xmm: {mnem:?}"
+        );
+        assert!(
+            mnem.contains(&Mnemonic::Movsd),
+            "movsd for I64 xmm: {mnem:?}"
+        );
+        assert!(
+            mnem.contains(&Mnemonic::Xorps),
+            "xorps zero idiom: {mnem:?}"
+        );
         for ins in &instrs {
             if ins.mnemonic() == Mnemonic::Mov {
                 for i in 0..ins.op_count() {
@@ -1282,7 +1362,14 @@ mod tests {
             edge_copies: HashMap::new(),
         };
 
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[Register::RBX]);
+        let instrs = select_instructions(
+            &func,
+            &alloc,
+            0x140000000,
+            0x140001000,
+            &[Register::RBX],
+            &[],
+        );
 
         let push_idx = instrs
             .iter()
@@ -1303,6 +1390,76 @@ mod tests {
             .position(|i| i.mnemonic() == iced_x86::Mnemonic::Add)
             .expect("add rsp,8 present");
         assert!(add_idx < pop_idx, "add rsp,8 must precede the pop at ret");
+    }
+
+    #[test]
+    fn xmm_callee_saved_save_restore() {
+        // One GPR push (odd → 8 pad) + one saved XMM → sub rsp,24; a movups save
+        // in the prologue and a movups restore + add rsp in the epilogue, all of
+        // which must encode.
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let v0 = func.alloc_value();
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![Inst {
+                dest: Some(v0),
+                op: IrOp::Const(1),
+                args: vec![],
+                ty: IrType::I64,
+            }],
+            term: IrTerminator::Ret,
+        });
+        let mut assignments = HashMap::new();
+        assignments.insert(v0, PhysReg::Gpr(Gpr::Rbx));
+        let alloc = RegAllocation {
+            assignments,
+            copies: vec![],
+            edge_copies: HashMap::new(),
+        };
+
+        let instrs = select_instructions(
+            &func,
+            &alloc,
+            0x140000000,
+            0x140001000,
+            &[Register::RBX],
+            &[Register::XMM6],
+        );
+        crate::relocate(&instrs, 0x140001000).expect("xmm prologue encodes");
+
+        use iced_x86::Mnemonic;
+        let sub = instrs
+            .iter()
+            .position(|i| i.mnemonic() == Mnemonic::Sub)
+            .expect("sub rsp present");
+        let store = instrs
+            .iter()
+            .position(|i| i.mnemonic() == Mnemonic::Movups)
+            .expect("movups save present");
+        assert!(store > sub, "xmm save follows the stack allocation");
+        assert_eq!(instrs[sub].immediate(1), 24, "8 align pad + 16 for one xmm");
+        assert_eq!(
+            instrs
+                .iter()
+                .filter(|i| i.mnemonic() == Mnemonic::Movups)
+                .count(),
+            2,
+            "save in prologue, restore in epilogue"
+        );
+        let add = instrs
+            .iter()
+            .position(|i| i.mnemonic() == Mnemonic::Add)
+            .expect("add rsp present");
+        let pop = instrs
+            .iter()
+            .position(|i| i.mnemonic() == Mnemonic::Pop)
+            .expect("pop present");
+        assert!(add < pop, "stack free precedes the pop at ret");
     }
 
     #[test]
@@ -1361,7 +1518,7 @@ mod tests {
             &HashMap::new(),
         )
         .unwrap();
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[]);
+        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
         // Intra-function branch targets must resolve to in-block instructions.
         crate::relocate(&instrs, 0x140001000).expect("branches resolve");
         let mnemonics: Vec<iced_x86::Mnemonic> = instrs.iter().map(|i| i.mnemonic()).collect();
@@ -1406,7 +1563,7 @@ mod tests {
             &HashMap::new(),
         )
         .unwrap();
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x1_4000_2000, &[]);
+        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x1_4000_2000, &[], &[]);
         // Encode at two different VAs; both must still resolve to the same absolute
         // target (position independence).
         for new_va in [0x1_4000_2000u64, 0x1_4000_9000u64] {
@@ -1456,7 +1613,14 @@ mod tests {
 
         // One callee-saved push is odd, so a realign shim is added; the frame must
         // be torn down (realign add + pop) before the tail jmp, and no ret emitted.
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[Register::RBX]);
+        let instrs = select_instructions(
+            &func,
+            &alloc,
+            0x140000000,
+            0x140001000,
+            &[Register::RBX],
+            &[],
+        );
         let mnem: Vec<iced_x86::Mnemonic> = instrs.iter().map(|i| i.mnemonic()).collect();
         assert!(
             !mnem.contains(&iced_x86::Mnemonic::Ret),
@@ -1545,7 +1709,7 @@ mod tests {
             copies: vec![],
             edge_copies: HashMap::new(),
         };
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[]);
+        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
         use iced_x86::{Mnemonic, OpKind};
         let shl = instrs
             .iter()

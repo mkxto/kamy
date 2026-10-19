@@ -75,12 +75,12 @@ fn unwind_reg_number(reg: Register) -> u8 {
 
 /// Build a Win64 `UNWIND_INFO` blob for a generated push/align prologue.
 ///
-/// `pushed` lists the callee-saved GPRs pushed in canonical order; `aligned`
-/// is true when the prologue appends `sub rsp,8` (odd push count) to realign.
-/// Nodes are ordered by descending prolog offset: the `sub rsp,8`
-/// `UWOP_ALLOC_SMALL` (if any) first, then each push in REVERSE order. The
-/// node array is padded to an even length so the structure is 4-byte sized.
-pub fn build_unwind_info(pushed: &[Register], aligned: bool) -> Vec<u8> {
+/// `pushed` lists the callee-saved GPRs pushed in canonical order; `stack_alloc`
+/// is the single `sub rsp` the prologue performs after the pushes (the 16-byte
+/// realignment pad plus 16 bytes per saved nonvolatile XMM), or 0 for none.
+/// Nodes are ordered by descending prolog offset: the allocation (if any) first,
+/// then each push in REVERSE order. The node array is padded to an even length.
+pub fn build_unwind_info(pushed: &[Register], stack_alloc: u32) -> Vec<u8> {
     // Cumulative encoded prolog offset after each push, in push order.
     let mut offset = 0u32;
     let mut after_push = Vec::with_capacity(pushed.len());
@@ -88,15 +88,29 @@ pub fn build_unwind_info(pushed: &[Register], aligned: bool) -> Vec<u8> {
         offset += push_size(reg);
         after_push.push(offset);
     }
-    if aligned {
-        offset += 4; // sub rsp,8 == 48 83 EC 08
+    if stack_alloc > 0 {
+        // sub rsp,imm8 (48 83 EC ib) for ≤127; else sub rsp,imm32 (48 81 EC id).
+        offset += if stack_alloc <= 127 { 4 } else { 7 };
     }
     let size_of_prolog = offset;
 
+    // Descending prolog offset: the stack allocation (highest offset) first, then
+    // each push in reverse. The allocation folds the 16-byte-alignment pad and the
+    // nonvolatile XMM save area (16 bytes each) into one `sub rsp`. SAVE_XMM128 for
+    // the individual XMM stores needs a 16-aligned frame and is deferred to full
+    // SEH (D31 Phase 3); the ALLOC alone keeps RSP unwinding correct for walks.
     let mut nodes: Vec<[u8; 2]> = Vec::new();
-    if aligned {
-        // UWOP_ALLOC_SMALL: byte0 = prolog offset after sub, byte1 = (0<<4)|0x02.
-        nodes.push([size_of_prolog as u8, 0x02]);
+    if stack_alloc > 0 {
+        debug_assert_eq!(stack_alloc % 8, 0, "stack alloc must be 8-byte scaled");
+        if stack_alloc <= 128 {
+            // UWOP_ALLOC_SMALL: size = info*8 + 8, so info = (size-8)/8.
+            let info = ((stack_alloc - 8) / 8) as u8;
+            nodes.push([size_of_prolog as u8, (info << 4) | 0x02]);
+        } else {
+            // UWOP_ALLOC_LARGE, op_info=0: the next USHORT holds size/8.
+            nodes.push([size_of_prolog as u8, 0x01]);
+            nodes.push(((stack_alloc / 8) as u16).to_le_bytes());
+        }
     }
     for (i, &reg) in pushed.iter().enumerate().rev() {
         // UWOP_PUSH_NONVOL: byte0 = offset immediately after the push.
@@ -124,7 +138,7 @@ mod tests {
 
     #[test]
     fn unwind_info_aligned_three_pushes() {
-        let info = build_unwind_info(&[Register::RBX, Register::RDI, Register::R12], true);
+        let info = build_unwind_info(&[Register::RBX, Register::RDI, Register::R12], 8);
         assert_eq!(info[0], 0x01);
         assert_eq!(info[1], 8); // SizeOfProlog: 1+1+2 + 4(sub) = 8
         assert_eq!(info[2], 4); // 3 pushes + 1 alloc
@@ -141,7 +155,7 @@ mod tests {
 
     #[test]
     fn unwind_info_even_no_alloc_padded() {
-        let info = build_unwind_info(&[Register::RBX, Register::RBP], false);
+        let info = build_unwind_info(&[Register::RBX, Register::RBP], 0);
         assert_eq!(info[0], 0x01);
         assert_eq!(info[1], 2); // 1+1, no sub
         assert_eq!(info[2], 2); // 2 pushes, no alloc
@@ -152,5 +166,20 @@ mod tests {
         // 2 nodes is even: no pad node, length 4+4=8.
         assert_eq!(info.len(), 8);
         assert_eq!(info.len() % 4, 0);
+    }
+
+    #[test]
+    fn unwind_info_xmm_area_alloc_large() {
+        // 1 push (odd → 8 pad) + 10 saved XMM (160) = sub rsp,168 → ALLOC_LARGE.
+        let info = build_unwind_info(&[Register::RBX], 168);
+        assert_eq!(info[0], 0x01);
+        assert_eq!(info[1], 8); // SizeOfProlog: push rbx (1) + sub imm32 (7).
+        assert_eq!(info[2], 3); // 2 alloc-large nodes + 1 push.
+        assert_eq!(info[3], 0x00);
+        // ALLOC_LARGE op_info 0: [prolog_off, 0x01] then USHORT size/8 = 21.
+        assert_eq!(&info[4..6], &[8, 0x01]);
+        assert_eq!(&info[6..8], &21u16.to_le_bytes());
+        // push rbx reversed last: offset 1 after push, RBX=3 → 0x30.
+        assert_eq!(&info[8..10], &[1, 0x30]);
     }
 }
