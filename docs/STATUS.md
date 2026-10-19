@@ -159,15 +159,17 @@ inspect the init callbacks at `.rdata` 0x27f0.
 `kamy corpus {build,bless,verify,list} --corpus <checkout>` drives a
 multi-toolchain member set in `github.com/mkxto/kamy-corpus` (pinned by
 `corpus.lock`). Each member declares an oracle; `verify` compares the protected
-binary to a committed golden record blessed from the original and reports SSA
-lift/lower coverage beside the pass/fail verdict. Open tool, not a CI gate (D33).
+binary — protected through the SSA backend (`protect_with_transforms` + identity
+transform, so a miscompile surfaces as a crash) — against a committed golden
+record blessed from the original, and reports SSA lift/lower coverage beside the
+verdict. Open tool, not a CI gate (D33).
 
 | Member | Toolchain | Oracle | verify | SSA / reloc / reject | coverage |
 |--------|-----------|--------|--------|----------------------|----------|
-| console_fibmix | rustc | stdio | ✅ PASS | 0 / 203 / 146 | 0/349 |
-| gui_msgbox | msvc (cl) | winapi link-shim trace | ✅ PASS | 0 / 394 / 131 | 0/525 |
-| dll_strutil | msvc (cl) | loader / pure exports | ✅ PASS | 0 / 266 / 96 | 0/362 |
-| kernel32 (vendored) | prebuilt | loader / pure exports | ✅ PASS | 0 / 1276 / 433 | 0/1709 |
+| console_fibmix | rustc | stdio | ✅ PASS | 96 / 107 / 252 | 96/455 (21%) |
+| gui_msgbox | msvc (cl) | winapi link-shim trace | ❌ FAIL `0xC0000005` | 170 / 224 / 355 | 170/749 (23%) |
+| dll_strutil | msvc (cl) | loader / pure exports | ❌ FAIL `0xC0000005` | 131 / 135 / 231 | 131/497 (26%) |
+| kernel32 (vendored) | prebuilt | loader / pure exports | ❌ FAIL `0xC0000409` | 397 / 879 / 1310 | 397/2586 (15%) |
 
 - gui trace comes from a build-time winapi link-shim (no DLL injection):
   `MessageBoxW|hello world`, `MessageBoxW|second`.
@@ -175,8 +177,13 @@ lift/lower coverage beside the pass/fail verdict. Open tool, not a CI gate (D33)
   KnownDLLs short-circuit so kernel32's real bytes execute — and calls curated
   pure exports (`MulDiv(6,7,3)=14`, `lstrlenW=5`, `kamy_fnv("abc")=440920331`).
 - Coverage = SSA-lowered / total; **relocated and rejected are both not-covered**
-  (verbatim relocation is not SSA coverage). `--no-transform` lowers 0 via SSA, so
-  coverage reads 0% today and climbs as SSA-forcing transforms land.
+  (verbatim relocation is not SSA coverage). TOTAL 794/4287 (18.5%); rejects
+  dominated by `RegisterPressure` (1275, the zero-spill D5 budget).
+- **Caught real SSA miscompiles — issue #7's whole purpose.** The SSA-protected
+  gui_msgbox and dll_strutil access-violate (`0xC0000005`) and kernel32 fast-fails
+  on a stack-buffer overrun (`0xC0000409`); console_fibmix lowers 96 functions and
+  runs clean. These are backend-correctness bugs the corpus now gates, not corpus
+  defects. A green corpus is the precondition for SSA/backend changes (issue #7).
 - Negative-tested: a tampered golden makes `verify` exit non-zero and flag the
   diverging member (the oracle is not a tautology).
 - `corpus build` needs the toolchains (cl via `vcvars64.bat` / rustc; clang-cl
@@ -197,7 +204,7 @@ lift/lower coverage beside the pass/fail verdict. Open tool, not a CI gate (D33)
 | kernel32.dll SSA round-trip (2588 functions) | ✅ Verified (static) | Rebuilds via SSA (362 lowered); re-parses as valid PE, exports preserved, exception table consistent (1608/1608 RUNTIME_FUNCTIONs). DLL — not executed. |
 | aftermathlabs/bintests corpus (D25) | Not adopted |
 | backengineering/bintests `misc/jtables` — jump-table corpus (research.md §10.5) | Not adopted |
-| Runnable corpus (issue #7): console/gui/dll/kernel32 | ✅ 4/4 PASS | Golden-record verify + SSA coverage; kernel32 pure exports now executed (loader). |
+| Runnable corpus (issue #7): console/gui/dll/kernel32 | 🔶 console PASS; 3 SSA miscompiles caught | SSA-identity verify + coverage (18.5%); gui/dll `0xC0000005`, kernel32 `0xC0000409` — real backend bugs surfaced. |
 
 ## Rejection rates
 
