@@ -40,6 +40,12 @@ pub enum RejectionReason {
     /// Function calls its own entry; the lowered prologue would stack a second
     /// frame on top of the original (D5 frame reconstruction pending).
     SelfRecursive,
+    /// Reads or writes its caller's stack frame — the shadow-space home slots
+    /// or an incoming stack argument (a positive offset from the entry RSP).
+    /// The generated callee-saved push prologue shifts RSP, so those accesses
+    /// would land on the pushed registers; rejected until shrink-wrapping
+    /// reuses the function's own register saves (D5).
+    CallerFrameAccess,
 
     // --- Target reject taxonomy (CodeDefender parity). Documented for a precise
     // breakdown; producers for several of these are not wired yet.
@@ -94,6 +100,7 @@ impl RejectionReason {
             Self::RegisterPressure => "RegisterPressure",
             Self::UnsupportedFlags => "UnsupportedFlags",
             Self::SelfRecursive => "SelfRecursive",
+            Self::CallerFrameAccess => "CallerFrameAccess",
             Self::FallthroughToFunction => "FallthroughToFunction",
             Self::FarJump => "FarJump",
             Self::InvalidCall => "InvalidCall",

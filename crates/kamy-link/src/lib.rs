@@ -137,6 +137,16 @@ fn ssa_body(
             Ok(alloc) => {
                 let used = kamy_codegen::callee_saved_used(&alloc);
                 let used_xmm = kamy_codegen::callee_saved_xmms_used(&alloc);
+                let align_pad = if used.len() % 2 == 1 { 8 } else { 0 };
+                let stack_alloc = align_pad + 16 * used_xmm.len() as u32;
+                // The generated push/align prologue shifts RSP; a function that
+                // reaches its caller's frame (shadow home / incoming stack arg)
+                // would then address the pushed registers. Reject, don't
+                // miscompile (D22) — only when a shift is actually emitted.
+                let prologue_delta = 8 * used.len() as u32 + stack_alloc;
+                if prologue_delta > 0 && accesses_caller_frame(&result.func, &result.rsp_chain) {
+                    return Err(RejectionReason::CallerFrameAccess);
+                }
                 let instrs = kamy_codegen::select_instructions(
                     &result.func,
                     &alloc,
@@ -145,8 +155,6 @@ fn ssa_body(
                     &used,
                     &used_xmm,
                 );
-                let align_pad = if used.len() % 2 == 1 { 8 } else { 0 };
-                let stack_alloc = align_pad + 16 * used_xmm.len() as u32;
                 let shape = PrologueShape {
                     pushed: used,
                     stack_alloc,
@@ -206,6 +214,97 @@ fn uses_unsupported_flags(func: &IrFunction) -> bool {
             matches!(i.op, IrOp::CarryShl | IrOp::CarryShr | IrOp::CarrySar)
                 && !is_const(i.args[1])
                 && i.dest.is_some_and(|d| used.contains(&d))
+        })
+    })
+}
+
+/// True if the function reads or writes its caller's stack frame: a load/store
+/// at a non-negative offset from the entry RSP (the shadow-space home slots or
+/// an incoming stack argument). Stack offsets propagate from the entry RSP — an
+/// `Undef` in the lifter's RSP chain, offset 0 — through the `Copy`/`Add`/`Sub`
+/// (by a constant) chain and matching phis that thread the stack pointer and
+/// frame pointer. Used to reject such functions (D22) because the generated
+/// callee-saved prologue shifts RSP out from under those accesses.
+fn accesses_caller_frame(func: &IrFunction, rsp_chain: &HashSet<kamy_core::ir::ValueId>) -> bool {
+    use kamy_core::ir::{IrOp, ValueId};
+
+    let mut consts: HashMap<ValueId, i64> = HashMap::new();
+    for b in &func.blocks {
+        for i in &b.insts {
+            if let (Some(d), IrOp::Const(c)) = (i.dest, &i.op) {
+                consts.insert(d, *c as i64);
+            }
+        }
+    }
+
+    let mut off: HashMap<ValueId, i64> = HashMap::new();
+    for b in &func.blocks {
+        for i in &b.insts {
+            if let Some(d) = i.dest {
+                if matches!(i.op, IrOp::Undef) && rsp_chain.contains(&d) {
+                    off.insert(d, 0);
+                }
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for b in &func.blocks {
+            for p in &b.phis {
+                if off.contains_key(&p.dest) {
+                    continue;
+                }
+                let offs: Option<Vec<i64>> =
+                    p.args.iter().map(|(_, v)| off.get(v).copied()).collect();
+                if let Some(os) = offs {
+                    if let Some(&first) = os.first() {
+                        if os.iter().all(|&o| o == first) {
+                            off.insert(p.dest, first);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            for i in &b.insts {
+                let Some(d) = i.dest else { continue };
+                if off.contains_key(&d) {
+                    continue;
+                }
+                let new = match &i.op {
+                    IrOp::Copy => i.args.first().and_then(|a| off.get(a).copied()),
+                    IrOp::Add if i.args.len() == 2 => off
+                        .get(&i.args[0])
+                        .zip(consts.get(&i.args[1]))
+                        .map(|(o, c)| o + c)
+                        .or_else(|| {
+                            off.get(&i.args[1])
+                                .zip(consts.get(&i.args[0]))
+                                .map(|(o, c)| o + c)
+                        }),
+                    IrOp::Sub if i.args.len() == 2 => off
+                        .get(&i.args[0])
+                        .zip(consts.get(&i.args[1]))
+                        .map(|(o, c)| o - c),
+                    _ => None,
+                };
+                if let Some(v) = new {
+                    off.insert(d, v);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    func.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(i.op, IrOp::Load | IrOp::Store)
+                && i.args
+                    .first()
+                    .and_then(|a| off.get(a))
+                    .is_some_and(|&o| o >= 0)
         })
     })
 }
