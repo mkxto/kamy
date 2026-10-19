@@ -300,10 +300,37 @@ fn store_code(ty: IrType) -> Code {
     }
 }
 
+fn is_xmm(phys: PhysReg) -> bool {
+    matches!(phys, PhysReg::Xmm(_))
+}
+
+/// SSE move for a memory→XMM load of `ty` bytes. Only I32 (movss), I64 (movsd),
+/// and I128 (movups) ever reach an XMM operand; narrower widths have no SSE
+/// producer.
+fn xmm_load_code(ty: IrType) -> Code {
+    match ty {
+        IrType::I32 => Code::Movss_xmm_xmmm32,
+        IrType::I64 => Code::Movsd_xmm_xmmm64,
+        _ => Code::Movups_xmm_xmmm128,
+    }
+}
+
+fn xmm_store_code(ty: IrType) -> Code {
+    match ty {
+        IrType::I32 => Code::Movss_xmmm32_xmm,
+        IrType::I64 => Code::Movsd_xmmm64_xmm,
+        _ => Code::Movups_xmmm128_xmm,
+    }
+}
+
 fn emit_copy(out: &mut Vec<Instruction>, copy: &RegCopy) {
     let from_reg = phys_to_register(copy.from, copy.ty);
     let to_reg = phys_to_register(copy.to, copy.ty);
-    let code = mov_code(copy.ty);
+    let code = if is_xmm(copy.from) || is_xmm(copy.to) {
+        Code::Movaps_xmm_xmmm128
+    } else {
+        mov_code(copy.ty)
+    };
     out.push(Instruction::with2(code, to_reg, from_reg).unwrap());
 }
 
@@ -491,6 +518,12 @@ fn select_inst(
             let dest = inst.dest.unwrap();
             let dest_reg = reg_of(alloc, dest, ty);
             if *imm == 0 {
+                if is_xmm(alloc.assignments[&dest]) {
+                    out.push(
+                        Instruction::with2(Code::Xorps_xmm_xmmm128, dest_reg, dest_reg).unwrap(),
+                    );
+                    return;
+                }
                 let xor_code = match ty {
                     IrType::I64 | IrType::I128 => Code::Xor_rm32_r32,
                     IrType::I32 => Code::Xor_rm32_r32,
@@ -543,11 +576,34 @@ fn select_inst(
         IrOp::Copy => {
             let dest = inst.dest.unwrap();
             let src = inst.args[0];
-            let dest_reg = reg_of(alloc, dest, ty);
-            let src_ty = value_type(func, src);
-            let src_reg = reg_of(alloc, src, src_ty);
-            if dest_reg != src_reg {
-                out.push(Instruction::with2(mov_code(ty), dest_reg, src_reg).unwrap());
+            match (is_xmm(alloc.assignments[&dest]), is_xmm(alloc.assignments[&src])) {
+                (false, false) => {
+                    let dest_reg = reg_of(alloc, dest, ty);
+                    let src_ty = value_type(func, src);
+                    let src_reg = reg_of(alloc, src, src_ty);
+                    if dest_reg != src_reg {
+                        out.push(Instruction::with2(mov_code(ty), dest_reg, src_reg).unwrap());
+                    }
+                }
+                (true, true) => {
+                    let dest_reg = reg_of(alloc, dest, IrType::I128);
+                    let src_reg = reg_of(alloc, src, IrType::I128);
+                    if dest_reg != src_reg {
+                        out.push(
+                            Instruction::with2(Code::Movaps_xmm_xmmm128, dest_reg, src_reg).unwrap(),
+                        );
+                    }
+                }
+                (true, false) => {
+                    let dest_reg = reg_of(alloc, dest, IrType::I128);
+                    let src_reg = reg_of(alloc, src, IrType::I64);
+                    out.push(Instruction::with2(Code::Movq_xmm_rm64, dest_reg, src_reg).unwrap());
+                }
+                (false, true) => {
+                    let dest_reg = reg_of(alloc, dest, IrType::I64);
+                    let src_reg = reg_of(alloc, src, IrType::I128);
+                    out.push(Instruction::with2(Code::Movq_rm64_xmm, dest_reg, src_reg).unwrap());
+                }
             }
         }
 
@@ -555,6 +611,23 @@ fn select_inst(
             let dest = inst.dest.unwrap();
             let lhs = inst.args[0];
             let rhs = inst.args[1];
+            if is_xmm(alloc.assignments[&dest]) {
+                // Only xorps (Xor) produces an XMM ALU value; packed logical op.
+                let dest_reg = reg_of(alloc, dest, IrType::I128);
+                let lhs_reg = reg_of(alloc, lhs, IrType::I128);
+                let rhs_reg = reg_of(alloc, rhs, IrType::I128);
+                if dest_reg == rhs_reg {
+                    out.push(Instruction::with2(Code::Xorps_xmm_xmmm128, dest_reg, lhs_reg).unwrap());
+                } else {
+                    if dest_reg != lhs_reg {
+                        out.push(
+                            Instruction::with2(Code::Movaps_xmm_xmmm128, dest_reg, lhs_reg).unwrap(),
+                        );
+                    }
+                    out.push(Instruction::with2(Code::Xorps_xmm_xmmm128, dest_reg, rhs_reg).unwrap());
+                }
+                return;
+            }
             let dest_reg = reg_of(alloc, dest, ty);
             let lhs_reg = reg_of(alloc, lhs, ty);
             let rhs_reg = reg_of(alloc, rhs, ty);
@@ -650,21 +723,29 @@ fn select_inst(
         IrOp::Load => {
             let dest = inst.dest.unwrap();
             let addr = inst.args[0];
-            let dest_reg = reg_of(alloc, dest, ty);
             let addr_reg = reg_of(alloc, addr, IrType::I64);
             let mem = MemoryOperand::with_base(addr_reg);
-            let code = load_code(ty);
-            out.push(Instruction::with2(code, dest_reg, mem).unwrap());
+            if is_xmm(alloc.assignments[&dest]) {
+                let dest_reg = reg_of(alloc, dest, IrType::I128);
+                out.push(Instruction::with2(xmm_load_code(ty), dest_reg, mem).unwrap());
+            } else {
+                let dest_reg = reg_of(alloc, dest, ty);
+                out.push(Instruction::with2(load_code(ty), dest_reg, mem).unwrap());
+            }
         }
 
         IrOp::Store => {
             let addr = inst.args[0];
             let val = inst.args[1];
             let addr_reg = reg_of(alloc, addr, IrType::I64);
-            let val_reg = reg_of(alloc, val, ty);
             let mem = MemoryOperand::with_base(addr_reg);
-            let code = store_code(ty);
-            out.push(Instruction::with2(code, mem, val_reg).unwrap());
+            if is_xmm(alloc.assignments[&val]) {
+                let val_reg = reg_of(alloc, val, IrType::I128);
+                out.push(Instruction::with2(xmm_store_code(ty), mem, val_reg).unwrap());
+            } else {
+                let val_reg = reg_of(alloc, val, ty);
+                out.push(Instruction::with2(store_code(ty), mem, val_reg).unwrap());
+            }
         }
 
         IrOp::Zext => {
@@ -1104,6 +1185,72 @@ mod tests {
             mnemonics.contains(&Mnemonic::Ret),
             "should contain ret: {mnemonics:?}"
         );
+    }
+
+    #[test]
+    fn xmm_data_movement_encodes() {
+        // Regression (known bug #2): an XMM-assigned Load/Store/xorps must lower
+        // to SSE moves. The GPR `mov r64,[mem]` form iced builds for an XMM
+        // operand constructs fine but fails BlockEncoder, which the linker
+        // swallowed into a verbatim fallback (no protection). `relocate` must now
+        // succeed and the opcodes must be the SSE moves.
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let addr = func.alloc_value();
+        let zero = func.alloc_value();
+        let load128 = func.alloc_value();
+        let load64 = func.alloc_value();
+
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![
+                Inst { dest: Some(addr), op: IrOp::Const(0x2000), args: vec![], ty: IrType::I64 },
+                Inst { dest: Some(zero), op: IrOp::Const(0), args: vec![], ty: IrType::I128 },
+                Inst { dest: Some(load128), op: IrOp::Load, args: vec![addr], ty: IrType::I128 },
+                Inst { dest: None, op: IrOp::Store, args: vec![addr, load128], ty: IrType::I128 },
+                Inst { dest: Some(load64), op: IrOp::Load, args: vec![addr], ty: IrType::I64 },
+                Inst { dest: None, op: IrOp::Store, args: vec![addr, load64], ty: IrType::I64 },
+                Inst { dest: None, op: IrOp::Store, args: vec![addr, zero], ty: IrType::I128 },
+            ],
+            term: IrTerminator::Ret,
+        });
+
+        let mut assignments = HashMap::new();
+        assignments.insert(addr, PhysReg::Gpr(Gpr::Rcx));
+        assignments.insert(zero, PhysReg::Xmm(XmmReg::Xmm1));
+        assignments.insert(load128, PhysReg::Xmm(XmmReg::Xmm5));
+        assignments.insert(load64, PhysReg::Xmm(XmmReg::Xmm0));
+        let alloc = RegAllocation {
+            assignments,
+            copies: vec![],
+            edge_copies: HashMap::new(),
+        };
+
+        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[]);
+
+        // The exact gate the linker hit: BlockEncoder must accept every instruction.
+        let bytes = crate::relocate(&instrs, 0x140001000).expect("xmm moves must encode");
+        assert!(!bytes.is_empty());
+
+        use iced_x86::Mnemonic;
+        let mnem: Vec<Mnemonic> = instrs.iter().map(|i| i.mnemonic()).collect();
+        assert!(mnem.contains(&Mnemonic::Movups), "movups for I128 xmm: {mnem:?}");
+        assert!(mnem.contains(&Mnemonic::Movsd), "movsd for I64 xmm: {mnem:?}");
+        assert!(mnem.contains(&Mnemonic::Xorps), "xorps zero idiom: {mnem:?}");
+        for ins in &instrs {
+            if ins.mnemonic() == Mnemonic::Mov {
+                for i in 0..ins.op_count() {
+                    assert!(
+                        !ins.op_register(i).is_xmm(),
+                        "GPR mov must not take an XMM operand: {ins:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
