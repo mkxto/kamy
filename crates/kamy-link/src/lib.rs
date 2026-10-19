@@ -86,7 +86,7 @@ pub fn protect_with_transforms(
     functions: &[Function],
     opts: &Options,
     cc: &dyn CallingConvLookup,
-    transform: &mut dyn FnMut(&mut IrFunction),
+    transform: &mut dyn FnMut(&mut IrFunction, f32),
 ) -> Result<(Vec<u8>, Report), LinkError> {
     protect_inner(
         pe,
@@ -110,53 +110,66 @@ fn ssa_body(
     module: &Module,
     func: &Function,
     cc: &dyn CallingConvLookup,
-    transform: &mut dyn FnMut(&mut IrFunction),
+    transform: &mut dyn FnMut(&mut IrFunction, f32),
     base: u64,
     new_va: u64,
 ) -> Result<(Vec<u8>, PrologueShape), LinkError> {
-    let mut result = kamy_lift::lift_function(module, func, cc);
-    if result.unsupported {
-        return Err(LinkError::Codegen(kamy_codegen::CodegenError::Encode(
-            "unsupported construct".into(),
-        )));
-    }
-    kamy_lift::ssa::construct_ssa(&mut result);
-    transform(&mut result.func);
-    kamy_transforms::optimize(&mut result.func);
-    if uses_unsupported_flags(&result.func) {
-        return Err(LinkError::Codegen(kamy_codegen::CodegenError::Encode(
-            "add/shift-based flag consumed by branch or setcc".into(),
-        )));
-    }
+    // D28 pressure ladder: when the zero-spill allocator overflows under a
+    // transform, retry at reduced intensity before giving up. Re-lift per
+    // attempt so each intensity sees a clean IR. The non-pressure rejects
+    // (unsupported / unsupported-flags / self-recursive) are intensity-
+    // invariant, so they surface on the first attempt and short-circuit;
+    // only `RegisterPressure` walks the ladder, relocating verbatim (the
+    // caller's fallback) only after intensity 0.0 still fails.
+    const INTENSITY_LADDER: [f32; 4] = [1.0, 0.5, 0.25, 0.0];
     let entry_va = base + u64::from(func.entry.get());
-    if result.func.blocks.iter().any(|b| {
-        b.insts
-            .iter()
-            .any(|i| matches!(i.op, kamy_core::ir::IrOp::Call { target } if target == entry_va))
-    }) {
-        return Err(LinkError::Codegen(kamy_codegen::CodegenError::Encode(
-            "self-recursive (frame reconstruction pending)".into(),
-        )));
-    }
+    for &intensity in &INTENSITY_LADDER {
+        let mut result = kamy_lift::lift_function(module, func, cc);
+        if result.unsupported {
+            return Err(LinkError::Codegen(kamy_codegen::CodegenError::Encode(
+                "unsupported construct".into(),
+            )));
+        }
+        kamy_lift::ssa::construct_ssa(&mut result);
+        transform(&mut result.func, intensity);
+        kamy_transforms::optimize(&mut result.func);
+        if uses_unsupported_flags(&result.func) {
+            return Err(LinkError::Codegen(kamy_codegen::CodegenError::Encode(
+                "add/shift-based flag consumed by branch or setcc".into(),
+            )));
+        }
+        if result.func.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| matches!(i.op, kamy_core::ir::IrOp::Call { target } if target == entry_va))
+        }) {
+            return Err(LinkError::Codegen(kamy_codegen::CodegenError::Encode(
+                "self-recursive (frame reconstruction pending)".into(),
+            )));
+        }
 
-    let alloc = kamy_codegen::allocate_registers(
-        &result.func,
-        &kamy_codegen::CALLEE_SAVED_GPRS,
-        &result.rsp_chain,
-        &result.reg_pins,
-    )
-    .map_err(|_| {
-        LinkError::Codegen(kamy_codegen::CodegenError::Encode(
-            "register pressure".into(),
-        ))
-    })?;
-    let used = kamy_codegen::callee_saved_used(&alloc);
-    let instrs = kamy_codegen::select_instructions(&result.func, &alloc, base, new_va, &used);
-    let shape = PrologueShape {
-        aligned: used.len() % 2 == 1,
-        pushed: used,
-    };
-    Ok((relocate(&instrs, new_va).map_err(LinkError::from)?, shape))
+        match kamy_codegen::allocate_registers(
+            &result.func,
+            &kamy_codegen::CALLEE_SAVED_GPRS,
+            &result.rsp_chain,
+            &result.reg_pins,
+        ) {
+            Ok(alloc) => {
+                let used = kamy_codegen::callee_saved_used(&alloc);
+                let instrs =
+                    kamy_codegen::select_instructions(&result.func, &alloc, base, new_va, &used);
+                let shape = PrologueShape {
+                    aligned: used.len() % 2 == 1,
+                    pushed: used,
+                };
+                return Ok((relocate(&instrs, new_va).map_err(LinkError::from)?, shape));
+            }
+            Err(_) => continue,
+        }
+    }
+    Err(LinkError::Codegen(kamy_codegen::CodegenError::Encode(
+        "register pressure".into(),
+    )))
 }
 
 /// Add- and shift-based condition flags (`add;jo`, `shl;jc`, …) cannot be

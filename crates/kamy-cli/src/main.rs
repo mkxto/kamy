@@ -13,6 +13,11 @@ use kamy_config::Config;
 use kamy_disasm::discover_functions;
 use kamy_pe::PeFile;
 
+/// IR-level transform applied per function at a given D28 intensity (1.0 = full,
+/// 0.0 = no-op); the linker walks a reduced-intensity ladder on register
+/// pressure.
+type TransformFn = dyn FnMut(&mut kamy_core::ir::IrFunction, f32);
+
 #[derive(Parser)]
 #[command(name = "kamy", version, about = "Binary-to-binary protection engine")]
 struct Cli {
@@ -218,15 +223,15 @@ fn protect_with_profile(input: &Path, output: &Path, profile_path: &Path) -> any
     }
 
     let cc = kamy_core::ir::Win64Default;
-    let mut transform_fn: Box<dyn FnMut(&mut kamy_core::ir::IrFunction)> =
-        if let Some(mba) = mba_pass {
-            Box::new(move |func: &mut kamy_core::ir::IrFunction| {
-                use kamy_transforms::Pass;
-                mba.run(func);
-            })
-        } else {
-            Box::new(|_: &mut kamy_core::ir::IrFunction| {})
-        };
+    let mut transform_fn: Box<TransformFn> = if let Some(mba) = mba_pass {
+        Box::new(
+            move |func: &mut kamy_core::ir::IrFunction, intensity: f32| {
+                mba.run_with_intensity(func, intensity);
+            },
+        )
+    } else {
+        Box::new(|_: &mut kamy_core::ir::IrFunction, _: f32| {})
+    };
 
     let (image, report) = kamy_link::protect_with_transforms(
         &pe,
