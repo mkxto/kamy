@@ -261,7 +261,7 @@ profiles:
   - type: LoopEncodeSemantics
     iterations: 1
     probability: 25
-    semantics: { add: true, sub: true, and: true, xor: true, or: true, not: true, neg: true }
+    semantics: { add: true, sub: true, and: true, xor: true }
     bitwidths: { bit8: true, bit16: true, bit32: true, bit64: true }
   - type: MutationEngine
     iterations: 1

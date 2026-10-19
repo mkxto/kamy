@@ -178,6 +178,42 @@ Instruction reordering, basic-block shuffling, register reassignment. Lightweigh
 ### 2.7 Operand Encryption + Decrypt Stubs
 Build-time encryption of immediates/displacements/memory operands. Runtime decrypt instructions injected into the stream. Must handle relocatable operands specially (RVA conversion).
 
+### 2.8 Loop-Based Semantic Encoding
+Replace a single binary operation (`add`, `sub`, `and`, `xor`) with an
+iterative loop that computes the same result by carry/bit propagation, so the
+arithmetic identity never appears as one instruction in the output. Config
+shape mirrors MBA/mutation — per-op `semantics` (restricted to
+`{add, sub, and, xor}`) × `bitwidths {8, 16, 32, 64}`, `iterations`,
+`probability` — but the op set is deliberately narrower than MBA's seven.
+
+**Confirmed exemplar — addition as a ripple-carry loop** (decompiled from a
+protected sample). `a + b` lowers to the bit-serial adder:
+
+```
+while (b != 0) {
+    carry = a & b;
+    a     = a ^ b;        // emitted as (a|b) - (a&b)
+    b     = carry << 1;   // 2 * carry
+}
+// result in a
+```
+
+The decompiler recovers the XOR step as `(a|b) - (a&b)` and the AND step as the
+carry, iterating until the carry word is zero — i.e. the sum computed one carry
+rank at a time rather than by a native `add`. `sub` follows via the borrow dual;
+`and`/`xor` encode as per-bit accumulation loops.
+
+**Correctness requirements:** the loop must be exactly equivalent for all inputs
+including overflow/carry-out into flags — a consumer that reads EFLAGS from the
+original op needs those flags reconstructed, not left in the loop's terminal
+state. Terminates in a bounded number of iterations (≤ bitwidth), so the backedge
+is a real loop in the SSA IR with a φ on the accumulator and carry.
+
+**Resistance:** defeats pattern/signature scans and simple inst-combine (the op
+is now a loop, not a rewritable linear expression), but the carry-propagation
+idiom is itself recognizable; strength comes from composing with MBA on the
+loop body and opaque predicates on the trip count, not from the loop alone.
+
 ---
 
 ## 3. Windows x64 SEH/Unwind — The Hard Reliability Frontier

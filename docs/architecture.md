@@ -45,7 +45,7 @@ A "light" profile runs fewer/simpler passes on the same IR as a "heavy" profile.
 - `ObscureConstants` — hide constant values
 - `MixedBooleanArithmetic` — MBA with configurable semantics/bitwidths/iterations/probability
 - `MutationEngine` — instruction mutation (SSE-aware), same config shape
-- `LoopEncodeSemantics` — loop-body encoding
+- `LoopEncodeSemantics` — encode `add`/`sub`/`and`/`xor` as an iterative loop (ripple-carry / per-bit)
 
 **Compiler settings** (always present, not opt-in):
 - Lifter: `lift_calls`, `calling_convention`, `max_stack_copy_size`, `split_on_calls_fallback`
@@ -209,7 +209,7 @@ profiles:
   - type: LoopEncodeSemantics
     iterations: 1
     probability: 25
-    semantics: { add: true, sub: true, and: true, xor: true, or: true, not: true, neg: true }
+    semantics: { add: true, sub: true, and: true, xor: true }
     bitwidths: { bit8: true, bit16: true, bit32: true, bit64: true }
   - type: MutationEngine
     iterations: 1
@@ -289,7 +289,7 @@ Ordered, composable. All passes operate on the SSA IR. The pipeline for each fun
      ObscureConstants        — hide/encrypt constant values
      MbaPass                 — mixed boolean arithmetic (configurable semantics/bitwidths/iterations)
      MutationEngine          — instruction mutation (SSE-aware)
-     LoopEncodeSemantics     — loop-body encoding
+     LoopEncodeSemantics     — encode add/sub/and/xor as an iterative loop
      CffPass                 — control-flow flattening
      OpaquePredicatePass     — inject provably-invariant predicates
      DeadCodeInjectPass      — realistic dead-code with dataflow

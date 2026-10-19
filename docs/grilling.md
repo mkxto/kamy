@@ -69,7 +69,7 @@ The plugins repo demonstrates linking new C/C++ functions into an existing PE po
 - `ObscureConstants` — hide constant values
 - `MixedBooleanArithmetic` — MBA with configurable semantics {add, sub, and, xor, or, not, neg} × bitwidths {8, 16, 32, 64}, iterations, probability
 - `MutationEngine` — instruction mutation with SSE extension support, same semantics/bitwidth config
-- `LoopEncodeSemantics` — loop-body encoding, same config shape
+- `LoopEncodeSemantics` — loop-body encoding of {add, sub, and, xor}, same config shape (narrower op set than MBA)
 
 **7. Module-level settings observed:**
 - `ida_crasher` — anti-IDA measures
@@ -375,12 +375,15 @@ CodeDefender's config has `clear_unwind_info: false` as default — they preserv
 
 **Reasoning:** The user wants full parity with CodeDefender's public config surface from v1.
 
-**Risk:** `LoopEncodeSemantics` is underspecified — no public documentation on what it does. Likely candidates based on the name and config shape (semantics/bitwidths/iterations):
-- Encode loop iteration variables with MBA (e.g., loop counter `i` stored as MBA-encoded value, decoded each iteration)
-- Encode loop-carried values (accumulator, state) with per-iteration key rotation
-- Likely operates on backedge-reachable instructions in the SSA IR
-
-Need to either reverse-engineer from CodeDefender's output or design our own loop encoding scheme. The config structure (same `semantics` and `bitwidths` fields as MBA) suggests it's MBA applied specifically to loop-carried data.
+**Resolved (was underspecified).** `LoopEncodeSemantics` encodes a single binary
+operation (`add`, `sub`, `and`, `xor`) as an iterative loop computing the same
+result by carry/bit propagation, so the native op never appears in the output.
+Confirmed from a protected sample: `a + b` lowers to a ripple-carry adder
+(`carry = a&b; a = a^b; b = carry<<1;` looped until `b == 0`, XOR emitted as
+`(a|b)-(a&b)`). The op set is narrower than MBA — `{add, sub, and, xor}` only, no
+`or`/`not`/`neg`. See research.md §2.8. The earlier guess (MBA applied to
+loop-carried data) was wrong: the loop *is* the operation, not a wrapper around
+existing loops.
 
 **Pass ordering (based on CodeDefender configs):**
 ```
@@ -778,4 +781,4 @@ Implementation-detail level (resolve during build, not blocking architecture):
 - Instruction selector implementation (table-driven vs pattern matching)
 - Thread safety model for rayon parallelism (what's shared, what's per-function)
 - SaaS architecture (when the time comes)
-- LoopEncodeSemantics reverse-engineering or original design
+- ~~LoopEncodeSemantics reverse-engineering or original design~~ — resolved: encode add/sub/and/xor as carry/bit-propagation loops (research.md §2.8, D13)
