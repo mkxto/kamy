@@ -162,20 +162,21 @@ multi-toolchain member set in `github.com/mkxto/kamy-corpus` (pinned by
 binary to a committed golden record blessed from the original and reports SSA
 lift/lower coverage beside the pass/fail verdict. Open tool, not a CI gate (D33).
 
-| Member | Toolchain | Oracle | verify | coverage ssa/reloc/reject |
-|--------|-----------|--------|--------|---------------------------|
-| console_fibmix | rustc | stdio | ✅ PASS | 0 / 203 / 146 |
-| gui_msgbox | msvc (cl) | winapi link-shim trace | ✅ PASS | 0 / 394 / 131 |
-| dll_strutil | msvc (cl) | loader / pure exports | ✅ PASS | 0 / 266 / 96 |
-| kernel32 (vendored) | prebuilt | loader / pure exports | ✅ PASS | 0 / 1276 / 433 |
+| Member | Toolchain | Oracle | verify | SSA / reloc / reject | coverage |
+|--------|-----------|--------|--------|----------------------|----------|
+| console_fibmix | rustc | stdio | ✅ PASS | 0 / 203 / 146 | 0/349 |
+| gui_msgbox | msvc (cl) | winapi link-shim trace | ✅ PASS | 0 / 394 / 131 | 0/525 |
+| dll_strutil | msvc (cl) | loader / pure exports | ✅ PASS | 0 / 266 / 96 | 0/362 |
+| kernel32 (vendored) | prebuilt | loader / pure exports | ✅ PASS | 0 / 1276 / 433 | 0/1709 |
 
 - gui trace comes from a build-time winapi link-shim (no DLL injection):
   `MessageBoxW|hello world`, `MessageBoxW|second`.
 - dll members run under a loader that maps a uniquely-named copy — defeating the
   KnownDLLs short-circuit so kernel32's real bytes execute — and calls curated
   pure exports (`MulDiv(6,7,3)=14`, `lstrlenW=5`, `kamy_fnv("abc")=440920331`).
-- `ssa_lowered=0` because `--no-transform` relocates verbatim; the metric climbs
-  as SSA-forcing transforms land. Totals match the Rejection-rates table.
+- Coverage = SSA-lowered / total; **relocated and rejected are both not-covered**
+  (verbatim relocation is not SSA coverage). `--no-transform` lowers 0 via SSA, so
+  coverage reads 0% today and climbs as SSA-forcing transforms land.
 - Negative-tested: a tampered golden makes `verify` exit non-zero and flag the
   diverging member (the oracle is not a tautology).
 - `corpus build` needs the toolchains (cl via `vcvars64.bat` / rustc; clang-cl
