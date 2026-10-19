@@ -62,7 +62,7 @@ pub(crate) fn lift_neg(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState)
     emit_arith_flags(b, s, result, zero, a, true);
 
     let is_zero = b.emit(IrOp::IsZero, &[a], IrType::I8);
-    let cf_inv = b.emit(IrOp::Not, &[is_zero], IrType::I8);
+    let cf_inv = b.emit(IrOp::BoolNot, &[is_zero], IrType::I8);
     s.set_flag(X86Flag::Cf, cf_inv);
 
     write_operand(insn, 0, result, ty, b, s);
@@ -164,7 +164,7 @@ pub(crate) fn lift_mul(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState)
     write_gpr_at_width(Gpr::Rdx, hi, ty, b, s);
 
     let hi_nz = b.emit(IrOp::IsZero, &[hi], IrType::I8);
-    let cf = b.emit(IrOp::Not, &[hi_nz], IrType::I8);
+    let cf = b.emit(IrOp::BoolNot, &[hi_nz], IrType::I8);
     s.set_flag(X86Flag::Cf, cf);
     s.set_flag(X86Flag::Of, cf);
     undef_flags(b, s, &[X86Flag::Zf, X86Flag::Sf, X86Flag::Pf, X86Flag::Af]);
@@ -190,7 +190,7 @@ fn lift_imul_1op(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
     write_gpr_at_width(Gpr::Rdx, hi, ty, b, s);
 
     let hi_nz = b.emit(IrOp::IsZero, &[hi], IrType::I8);
-    let cf = b.emit(IrOp::Not, &[hi_nz], IrType::I8);
+    let cf = b.emit(IrOp::BoolNot, &[hi_nz], IrType::I8);
     s.set_flag(X86Flag::Cf, cf);
     s.set_flag(X86Flag::Of, cf);
     undef_flags(b, s, &[X86Flag::Zf, X86Flag::Sf, X86Flag::Pf, X86Flag::Af]);
@@ -206,7 +206,7 @@ fn lift_imul_2op(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
     let sign = b.emit(IrOp::Sar, &[result, bits_m1], ty);
     let diff = b.emit(IrOp::Xor, &[hi, sign], ty);
     let is_z = b.emit(IrOp::IsZero, &[diff], IrType::I8);
-    let cf = b.emit(IrOp::Not, &[is_z], IrType::I8);
+    let cf = b.emit(IrOp::BoolNot, &[is_z], IrType::I8);
     s.set_flag(X86Flag::Cf, cf);
     s.set_flag(X86Flag::Of, cf);
     undef_flags(b, s, &[X86Flag::Zf, X86Flag::Sf, X86Flag::Pf, X86Flag::Af]);
@@ -226,7 +226,7 @@ fn lift_imul_3op(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
     let sign = b.emit(IrOp::Sar, &[result, bits_m1], ty);
     let diff = b.emit(IrOp::Xor, &[hi, sign], ty);
     let is_z = b.emit(IrOp::IsZero, &[diff], IrType::I8);
-    let cf = b.emit(IrOp::Not, &[is_z], IrType::I8);
+    let cf = b.emit(IrOp::BoolNot, &[is_z], IrType::I8);
     s.set_flag(X86Flag::Cf, cf);
     s.set_flag(X86Flag::Of, cf);
     undef_flags(b, s, &[X86Flag::Zf, X86Flag::Sf, X86Flag::Pf, X86Flag::Af]);

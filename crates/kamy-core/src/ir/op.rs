@@ -73,6 +73,12 @@ pub enum IrOp {
     // --- conditional ---
     Select,
     SetIf,
+    /// Logical negation of a 0/1 flag boolean → I8 (`x == 0`). Distinct from
+    /// bitwise [`IrOp::Not`]: the condition algebra (`cond.rs`) and flag
+    /// inversions keep the flag-value invariant that every flag SSA value is
+    /// exactly 0 or 1, which bitwise one's-complement would break (`!1 == 0xFE`
+    /// stays truthy under `test;jnz`).
+    BoolNot,
 
     // --- memory ---
     Load,

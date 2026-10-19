@@ -741,6 +741,19 @@ fn select_inst(
             out.push(Instruction::with1(not_code(ty), dest_reg).unwrap());
         }
 
+        IrOp::BoolNot => {
+            let dest = inst.dest.unwrap();
+            let src = inst.args[0];
+            let dest_reg = reg_of(alloc, dest, IrType::I8);
+            let src_reg = reg_of(alloc, src, IrType::I8);
+            if dest_reg != src_reg {
+                out.push(Instruction::with2(mov_code(IrType::I8), dest_reg, src_reg).unwrap());
+            }
+            // Logical not of a 0/1 flag boolean: flip the low bit only, keeping
+            // the value in {0,1}. Bitwise `not` would make it 0xFE/0xFF.
+            out.push(Instruction::with2(Code::Xor_rm8_imm8, dest_reg, 1i32).unwrap());
+        }
+
         IrOp::Shl | IrOp::Shr | IrOp::Sar | IrOp::Rol | IrOp::Ror => {
             let dest = inst.dest.unwrap();
             let src = inst.args[0];
@@ -1567,6 +1580,62 @@ mod tests {
             mnemonics.contains(&iced_x86::Mnemonic::Cmp),
             "a subtract comparison must lower to `cmp a,b`, not `test`: {mnemonics:?}"
         );
+    }
+
+    #[test]
+    fn bool_not_lowers_to_xor_one_not_bitwise() {
+        // A logical flag negation must flip only the low bit so the 0/1
+        // invariant survives: `not` would yield 0xFE/0xFF, staying truthy
+        // under `test;jnz` and making every negated/compound branch
+        // unconditional.
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let v0 = func.alloc_value();
+        let v1 = func.alloc_value();
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![
+                Inst {
+                    dest: Some(v0),
+                    op: IrOp::Undef,
+                    args: vec![],
+                    ty: IrType::I8,
+                },
+                Inst {
+                    dest: Some(v1),
+                    op: IrOp::BoolNot,
+                    args: vec![v0],
+                    ty: IrType::I8,
+                },
+            ],
+            term: IrTerminator::Ret,
+        });
+        let mut assignments = HashMap::new();
+        assignments.insert(v0, PhysReg::Gpr(Gpr::Rcx));
+        assignments.insert(v1, PhysReg::Gpr(Gpr::Rcx));
+        let alloc = RegAllocation {
+            assignments,
+            copies: vec![],
+            edge_copies: HashMap::new(),
+            flag_scratch: None,
+        };
+        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
+        assert!(
+            instrs
+                .iter()
+                .all(|i| i.mnemonic() != iced_x86::Mnemonic::Not),
+            "BoolNot must not lower to bitwise `not`: {:?}",
+            instrs.iter().map(|i| i.mnemonic()).collect::<Vec<_>>()
+        );
+        let xor = instrs
+            .iter()
+            .find(|i| i.mnemonic() == iced_x86::Mnemonic::Xor)
+            .expect("BoolNot lowers through xor");
+        assert_eq!(xor.immediate(1), 1, "logical not flips the low bit");
     }
 
     #[test]

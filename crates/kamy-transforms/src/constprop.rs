@@ -30,6 +30,7 @@ fn fold(op: &IrOp, vals: &[u64], ty: IrType, arg_ty: Option<IrType>) -> Option<u
         IrOp::Or => Some((vals[0] | vals[1]) & m),
         IrOp::Xor => Some((vals[0] ^ vals[1]) & m),
         IrOp::Not => Some((!vals[0]) & m),
+        IrOp::BoolNot => Some((vals[0] == 0) as u64),
         IrOp::Shl => {
             let shift = vals[1] % ty.bits() as u64;
             Some((vals[0] << shift) & m)
