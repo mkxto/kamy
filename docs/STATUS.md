@@ -102,6 +102,27 @@ Living document. Updated as work lands.
    cross-call span. A blanket "Copy every volatile-sourced `mov`" perturbs
    allocation enough to clobber loop-carried values (regressed hex formatting), so
    the split must be targeted.
+8. ✅ **FIXED — SSA construction dropped the loop back-edge phi argument (#24).**
+   When a loop header was processed before its back-edge (body) predecessor in
+   RPO, the header phi captured the body's unresolved entry `Undef` placeholder;
+   resolving the body later rewrote only the body block, so the header phi (in a
+   *different* block) kept the dead `Undef` → iteration 2+ dereferenced a garbage
+   loop-invariant pointer (AV). Fix (`kamy-lift/src/ssa.rs`): placeholder
+   resolution now threads the back-edge phi arg across *all* blocks, not just the
+   resolving one. Regression test lowers the exact `strnlen` loop and asserts no
+   `Undef` reaches a phi arg. Flipped `gui_msgbox` to PASS.
+9. ✅ **FIXED — linear-scan liveness truncated loop-crossing values (#24).** Live
+   ranges came from a value's *syntactic* last use over a DFS block order, so a
+   value live across a loop back-edge — a loop-carried phi value or a
+   loop-invariant value used inside the loop — was freed at its textually-last use
+   and its register reused by a later-ordered in-loop block, clobbering it
+   mid-loop (corrupted the ucrt `write_integer` hex nibble loop: wrong digits +
+   non-hex bytes). Fix (`kamy-codegen/src/regalloc.rs`): liveness is a real
+   backward SSA dataflow to a fixpoint and each interval is the convex hull of
+   every point where the value is live, so loop-crossing values stay reserved for
+   the whole loop. Sound regardless of block order (collapsing holes only
+   over-reserves). Regression test asserts a loop-invariant value stays live
+   through the latch terminator. Took the runnable corpus 3/22 → 11/22.
 
 ## Phase 3 — SEH & CET (D31: correctness before obfuscation)
 
@@ -166,28 +187,28 @@ verdict. Open tool, not a CI gate (D33).
 
 | Member | Toolchain | Oracle | verify | SSA / reloc / reject | coverage |
 |--------|-----------|--------|--------|----------------------|----------|
-| console_cfg | msvc (cl) | stdio | ❌ FAIL | 151 / 0 / 377 | 151/528 (28.6%) |
-| console_cfg_lto | msvc (cl) | stdio | ❌ FAIL | 151 / 0 / 377 | 151/528 (28.6%) |
-| console_eh | msvc (cl) | stdio | ❌ FAIL | 147 / 0 / 377 | 147/524 (28.1%) |
-| console_fibmix | rustc | stdio | ✅ PASS | 40 / 1 / 308 | 40/349 (11.5%) |
-| console_fp | msvc (cl) | stdio | ❌ FAIL | 135 / 0 / 348 | 135/483 (28.0%) |
-| console_seh | msvc (cl) | stdio | ❌ FAIL | 136 / 0 / 344 | 136/480 (28.3%) |
-| console_sse | msvc (cl) | stdio | ❌ FAIL | 134 / 0 / 344 | 134/478 (28.0%) |
-| console_sse_lto | msvc (cl) | stdio | ❌ FAIL | 134 / 0 / 344 | 134/478 (28.0%) |
-| console_sse_minsize | msvc (cl) | stdio | ❌ FAIL | 134 / 0 / 344 | 134/478 (28.0%) |
-| console_sse_od | msvc (cl) | stdio | ❌ FAIL | 136 / 0 / 343 | 136/479 (28.4%) |
-| console_switch | msvc (cl) | stdio | ❌ FAIL | 134 / 0 / 344 | 134/478 (28.0%) |
-| console_tls | msvc (cl) | stdio | ❌ FAIL | 134 / 0 / 344 | 134/478 (28.0%) |
-| dll_abi | msvc (cl) | loader | ❌ FAIL | 116 / 0 / 248 | 116/364 (31.9%) |
-| dll_adx | clang-cl | loader | ❌ FAIL | 115 / 0 / 252 | 115/367 (31.3%) |
-| dll_asm | clang-cl | loader | ❌ FAIL | 115 / 0 / 252 | 115/367 (31.3%) |
-| dll_atomic | msvc (cl) | loader | ❌ FAIL | 112 / 0 / 250 | 112/362 (30.9%) |
-| dll_bmi1 | clang-cl | loader | ❌ FAIL | 118 / 0 / 252 | 118/370 (31.9%) |
-| dll_bmi2 | msvc (cl) | loader | ❌ FAIL | 116 / 0 / 247 | 116/363 (32.0%) |
-| dll_bmi2_minsize | msvc (cl) | loader | ❌ FAIL | 116 / 0 / 247 | 116/363 (32.0%) |
-| dll_strutil | msvc (cl) | loader | ❌ FAIL | 115 / 0 / 247 | 115/362 (31.8%) |
-| gui_msgbox | msvc (cl) | gui link-shim trace | ❌ FAIL | 145 / 0 / 380 | 145/525 (27.6%) |
-| kernel32 (vendored) | prebuilt | loader | ✅ PASS | 295 / 2 / 1412 | 295/1709 (17.3%) |
+| console_cfg | msvc (cl) | stdio | ❌ FAIL | 145 / 0 / 383 | 145/528 (27.5%) |
+| console_cfg_lto | msvc (cl) | stdio | ❌ FAIL | 145 / 0 / 383 | 145/528 (27.5%) |
+| console_eh | msvc (cl) | stdio | ❌ FAIL | 143 / 0 / 381 | 143/524 (27.3%) |
+| console_fibmix | rustc | stdio | ✅ PASS | 37 / 1 / 311 | 37/349 (10.6%) |
+| console_fp | msvc (cl) | stdio | ✅ PASS | 131 / 0 / 352 | 131/483 (27.1%) |
+| console_seh | msvc (cl) | stdio | ✅ PASS | 132 / 0 / 348 | 132/480 (27.5%) |
+| console_sse | msvc (cl) | stdio | ✅ PASS | 130 / 0 / 348 | 130/478 (27.2%) |
+| console_sse_lto | msvc (cl) | stdio | ✅ PASS | 130 / 0 / 348 | 130/478 (27.2%) |
+| console_sse_minsize | msvc (cl) | stdio | ✅ PASS | 130 / 0 / 348 | 130/478 (27.2%) |
+| console_sse_od | msvc (cl) | stdio | ✅ PASS | 132 / 0 / 347 | 132/479 (27.6%) |
+| console_switch | msvc (cl) | stdio | ✅ PASS | 130 / 0 / 348 | 130/478 (27.2%) |
+| console_tls | msvc (cl) | stdio | ✅ PASS | 130 / 0 / 348 | 130/478 (27.2%) |
+| dll_abi | msvc (cl) | loader | ❌ FAIL | 111 / 0 / 253 | 111/364 (30.5%) |
+| dll_adx | clang-cl | loader | ❌ FAIL | 106 / 0 / 261 | 106/367 (28.9%) |
+| dll_asm | clang-cl | loader | ❌ FAIL | 107 / 0 / 260 | 107/367 (29.2%) |
+| dll_atomic | msvc (cl) | loader | ❌ FAIL | 108 / 0 / 254 | 108/362 (29.8%) |
+| dll_bmi1 | clang-cl | loader | ❌ FAIL | 110 / 0 / 260 | 110/370 (29.7%) |
+| dll_bmi2 | msvc (cl) | loader | ❌ FAIL | 111 / 0 / 252 | 111/363 (30.6%) |
+| dll_bmi2_minsize | msvc (cl) | loader | ❌ FAIL | 111 / 0 / 252 | 111/363 (30.6%) |
+| dll_strutil | msvc (cl) | loader | ❌ FAIL | 110 / 0 / 252 | 110/362 (30.4%) |
+| gui_msgbox | msvc (cl) | gui link-shim trace | ✅ PASS | 141 / 0 / 384 | 141/525 (26.9%) |
+| kernel32 (vendored) | prebuilt | loader | ✅ PASS | 285 / 2 / 1422 | 285/1709 (16.7%) |
 
 22 members: 12 console (rustc + msvc breadth — CFG, LTO, EH, SEH, scalar/packed
 SSE, switch, TLS, and an /O2–/O1–/Od opt spread), 8 pure-export DLLs (ABI, ADX,
@@ -204,32 +225,50 @@ target features and per-member linker flags (`/guard:cf`, `/LTCG`) flow through
   pure exports (`MulDiv(6,7,3)=14`, `lstrlenW=5`, `kamy_fnv("abc")=440920331`).
 - Coverage = SSA-lowered / total; **relocated and rejected are both not-covered**.
   Verbatim relocation is banned — SSA failures are rejected in place. TOTAL
-  2929/10913 (26.8%). Rejections by reason, descending:
+  2815/10913 (25.8%). Rejections by reason, descending:
 
   | reason | count |
   |--------|-------|
-  | RegisterPressure | 4319 |
+  | RegisterPressure | 4462 |
   | SEHComplex | 1647 |
   | LiftFailure | 791 |
   | UnsupportedInstruction | 462 |
-  | CallerFrameAccess | 357 |
+  | CallerFrameAccess | 329 |
   | BadIndirectBranch | 205 |
   | ResolvableIndirect | 111 |
   | NoThunkSpace | 83 |
   | SelfRecursive | 5 |
-  | CodegenFailure | 1 |
 
   `RegisterPressure` dominates (recovery tracked in #15), `SEHComplex` follows
   from the SEH-heavy console/dll members, then `LiftFailure`. `CallerFrameAccess`
   and `fs/gs` ship as sound conservative rejects (D22) → #15 and #26, both
   `known-limitation`.
-- **2/22 PASS** (`console_fibmix`, `kernel32`). The two references stay green on
-  the #23 fixes (five SSA miscompiles: logical flag negation, the /guard:cf
-  tail-call target, RSP-chain aliasing, caller-frame access, fs/gs operands).
-  Every compiled msvc/clang-cl member FAILs; the leading known cause is the SSA
-  loop back-edge threading bug (#24), though the 20 failures are not yet
-  individually root-caused. The expanded set widens the signal across CFG, SEH,
-  SSE, TLS, atomics, and inline-asm shapes.
+- **11/22 PASS** (`console_fibmix`, `kernel32`, `gui_msgbox`, and all eight plain
+  console members: `console_fp`, `console_seh`, `console_sse{,_lto,_minsize,_od}`,
+  `console_switch`, `console_tls`). Two SSA backend root causes fixed (#24):
+  (a) SSA construction dropped the loop back-edge phi argument — the resolving
+  body block rewrote only its own uses, leaving an already-created loop-header phi
+  pointing at the body's `Undef` placeholder; resolution now threads the back-edge
+  phi arg across *all* blocks. (b) The linear-scan allocator computed live ranges
+  from a value's *syntactic* last use over a DFS block order, so a value live
+  across a loop back-edge (a loop-carried phi value or a loop-invariant value used
+  inside the loop) was freed at its textually-last use and its register reused
+  mid-loop — corrupting e.g. the ucrt `write_integer` hex nibble loop; liveness is
+  now a real backward SSA dataflow to a fixpoint, so loop-crossing values stay
+  reserved across the whole loop. Both carry regression tests
+  (`kamy-lift::ssa`, `kamy-codegen::regalloc`).
+- **11 FAIL remain, two distinct newly-surfaced miscompiles** (the #24 fix
+  unmasked them, as the RCA anticipated):
+  - **8 DLLs** (`dll_*`): every export now returns the correct value, then the
+    process AVs (`0xC0000005`) at DLL/process teardown. The crashing routine — a
+    16-byte-stride terminator/onexit table walk that calls each slot via the CFG
+    `_guard_dispatch_icall` thunk — is relocated *verbatim* (correct); it loads a
+    *garbage* callback pointer from the table, so a **lowered CRT-init function
+    stored a bad pointer** during attach. Pointer-materialization bug, not
+    liveness. Next target.
+  - **3 console** (`console_cfg`, `console_cfg_lto`, `console_eh`): crash with
+    `0xC0000409` (STATUS_STACK_BUFFER_OVERRUN) — a `/GS` security-cookie or
+    `/guard:cf` fast-fail check, specific to the CFG/EH members.
 - Negative-tested: a tampered golden makes `verify` exit non-zero and flag the
   diverging member (the oracle is not a tautology).
 - `corpus build`/`bless` need the toolchains (cl via `vcvars64.bat`, rustc, and
@@ -250,7 +289,7 @@ target features and per-member linker flags (`/guard:cf`, `/LTCG`) flow through
 | kernel32.dll SSA round-trip (2588 functions) | ✅ Verified (static) | Rebuilds via SSA (362 lowered); re-parses as valid PE, exports preserved, exception table consistent (1608/1608 RUNTIME_FUNCTIONs). DLL — not executed. |
 | aftermathlabs/bintests corpus (D25) | Not adopted |
 | backengineering/bintests `misc/jtables` — jump-table corpus (research.md §10.5) | Not adopted |
-| Runnable corpus (#7): 22 members (console/gui/dll/kernel32) | 🔶 2/22 PASS (console_fibmix, kernel32) | Expanded to 22 (12 console, 8 dll, gui, kernel32); clang-cl asm/BMI/ADX members added. Compiled msvc/clang-cl members FAIL — leading cause SSA back-edge threading (#24); coverage recovery (#15/#25). |
+| Runnable corpus (#7): 22 members (console/gui/dll/kernel32) | 🔶 11/22 PASS | #24 fixed (SSA back-edge phi threading + linear-scan loop liveness), taking 2/22 → 11/22; all plain console members + gui_msgbox now PASS. Remaining 11 FAIL are two newly-surfaced miscompiles: DLL teardown garbage callback pointer (8 dll_*) and `/GS`/`/guard:cf` fast-fail (console_cfg/cfg_lto/eh). |
 
 ## Rejection rates
 
