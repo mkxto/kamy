@@ -39,6 +39,15 @@ pub(crate) fn native_inline_fallback(
         );
         state.unsupported = true;
     }
+    if insn.rflags_read() != 0 {
+        // The raw bytes consume an incoming rflags bit (adc/sbb/adcx/adox/rcl/…),
+        // a dependency SSA does not thread for a NativeInline: the flag-producing
+        // instruction is then DCE'd and the flag the bytes read is garbage
+        // (issue #23: bmi1_tzcnt's `cmp rcx,1; adc rcx,0` guard was dropped, so
+        // `tzcnt` saw 73 and returned 0). Reject; the function relocates verbatim
+        // with its flags intact (D22).
+        state.unsupported = true;
+    }
     let mut factory = InstructionInfoFactory::new();
     let info = factory.info(insn);
 
