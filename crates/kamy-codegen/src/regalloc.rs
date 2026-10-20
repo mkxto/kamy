@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use kamy_core::RejectionReason;
 use kamy_core::ir::{
-    BlockId, Gpr, Inst, IrFunction, IrOp, IrTerminator, IrType, PhysReg, ValueId, XmmReg,
+    BlockId, Gpr, IrFunction, IrOp, IrTerminator, IrType, PhysReg, ValueId, XmmReg,
 };
 
 #[derive(Debug, Clone)]
@@ -208,20 +208,6 @@ fn interval_bump(
     hi.entry(v).and_modify(|e| *e = (*e).max(pt)).or_insert(pt);
 }
 
-/// Values an instruction reads: its SSA args, plus — for a `NativeInline` that
-/// reads physical registers — the value pinned to each read register.
-fn inst_reads(inst: &Inst, pin_reg_val: &HashMap<PhysReg, ValueId>) -> Vec<ValueId> {
-    let mut u = inst.args.clone();
-    if let IrOp::NativeInline(native) = &inst.op {
-        for r in &native.reads {
-            if let Some(&v) = pin_reg_val.get(r) {
-                u.push(v);
-            }
-        }
-    }
-    u
-}
-
 /// Live intervals over the linearized `order`. Liveness is a real backward
 /// SSA dataflow (to a fixpoint, so back edges are honored): a value live across
 /// a loop — a loop-carried phi value or a loop-invariant value defined before
@@ -233,7 +219,10 @@ fn inst_reads(inst: &Inst, pin_reg_val: &HashMap<PhysReg, ValueId>) -> Vec<Value
 /// The earlier syntactic last-use heuristic truncated loop-crossing values at
 /// their textually-last use, so a later-ordered in-loop block could reuse the
 /// register mid-loop and clobber the live value (issue #24).
-fn compute_live_intervals(func: &IrFunction, order: &[BlockId]) -> Vec<LiveInterval> {
+fn compute_live_intervals(
+    func: &IrFunction,
+    order: &[BlockId],
+) -> (Vec<LiveInterval>, Vec<(PhysReg, usize, usize)>) {
     let n = order.len();
     let mut pos: HashMap<BlockId, usize> = HashMap::new();
     for (i, &b) in order.iter().enumerate() {
@@ -242,9 +231,15 @@ fn compute_live_intervals(func: &IrFunction, order: &[BlockId]) -> Vec<LiveInter
 
     let mut def_pt: HashMap<ValueId, usize> = HashMap::new();
     let mut ty_of: HashMap<ValueId, IrType> = HashMap::new();
-    let mut pinned_of: HashMap<ValueId, PhysReg> = HashMap::new();
-    let mut pin_reg_val: HashMap<PhysReg, ValueId> = HashMap::new();
     let mut call_points: Vec<usize> = Vec::new();
+    // Physical write registers of each `NativeInline`, reserved over the native's
+    // own linear point. The raw native bytes write these registers *at* the
+    // native, so that point must be reserved against any non-pinned value live
+    // across it, or those bytes clobber the value. Keyed off the native op —
+    // not the write-Undef values the lifter emits after it — because a write
+    // whose register is never read again is dead, and DCE strips it before
+    // regalloc, which would silently drop the reservation.
+    let mut native_write_pins: Vec<(PhysReg, usize, usize)> = Vec::new();
 
     for (bi, &bid) in order.iter().enumerate() {
         let block = func.block(bid);
@@ -258,15 +253,14 @@ fn compute_live_intervals(func: &IrFunction, order: &[BlockId]) -> Vec<LiveInter
             if matches!(inst.op, IrOp::Call { .. } | IrOp::CallIndirect) {
                 call_points.push(pt);
             }
+            if let IrOp::NativeInline(native) = &inst.op {
+                for w in &native.writes {
+                    native_write_pins.push((*w, pt, pt));
+                }
+            }
             if let Some(dest) = inst.dest {
                 def_pt.entry(dest).or_insert(pt);
                 ty_of.entry(dest).or_insert(inst.ty);
-                if let IrOp::NativeInline(native) = &inst.op {
-                    if let Some(&w) = native.writes.first() {
-                        pinned_of.entry(dest).or_insert(w);
-                        pin_reg_val.entry(w).or_insert(dest);
-                    }
-                }
             }
         }
     }
@@ -295,7 +289,7 @@ fn compute_live_intervals(func: &IrFunction, order: &[BlockId]) -> Vec<LiveInter
             defined.insert(phi.dest);
         }
         for inst in &block.insts {
-            for v in inst_reads(inst, &pin_reg_val) {
+            for &v in &inst.args {
                 if !defined.contains(&v) {
                     use_set[bi].insert(v);
                 }
@@ -358,7 +352,7 @@ fn compute_live_intervals(func: &IrFunction, order: &[BlockId]) -> Vec<LiveInter
         let phi_off = block.phis.len();
         for (ii, inst) in block.insts.iter().enumerate() {
             let pt = linear_point(bi, phi_off + ii);
-            for v in inst_reads(inst, &pin_reg_val) {
+            for &v in &inst.args {
                 interval_bump(&mut lo, &mut hi, v, pt);
             }
         }
@@ -395,14 +389,14 @@ fn compute_live_intervals(func: &IrFunction, order: &[BlockId]) -> Vec<LiveInter
                 ty: ty_of[&vid],
                 start,
                 end,
-                pinned: pinned_of.get(&vid).copied(),
+                pinned: None,
                 crosses_call,
             }
         })
         .collect();
 
     intervals.sort_by_key(|iv| (iv.start, iv.value.0));
-    intervals
+    (intervals, native_write_pins)
 }
 
 /// True iff a *used* flag op can be re-established at its consumer by
@@ -449,7 +443,7 @@ pub fn allocate_registers(
     reg_pins: &HashMap<ValueId, PhysReg>,
 ) -> Result<RegAllocation, RejectionReason> {
     let order = block_order(func);
-    let mut intervals = compute_live_intervals(func, &order);
+    let (mut intervals, native_write_pins) = compute_live_intervals(func, &order);
     for iv in &mut intervals {
         if rsp_pinned.contains(&iv.value) {
             iv.pinned = Some(PhysReg::Gpr(Gpr::Rsp));
@@ -461,11 +455,14 @@ pub fn allocate_registers(
     // Physical registers reserved by pinned intervals, with their ranges. A
     // non-pinned value must not occupy one while its own range overlaps: a later
     // pin would otherwise have to move it mid-life, which the single-assignment
-    // lowering cannot express.
-    let pins: Vec<(PhysReg, usize, usize)> = intervals
+    // lowering cannot express. `native_write_pins` adds the point-reservations
+    // for each `NativeInline`'s physical write registers so the raw native bytes
+    // never clobber a value the allocator parked across the native.
+    let mut pins: Vec<(PhysReg, usize, usize)> = intervals
         .iter()
         .filter_map(|iv| iv.pinned.map(|p| (p, iv.start, iv.end)))
         .collect();
+    pins.extend(native_write_pins);
 
     let mut avail_gprs: Vec<Gpr> = VOLATILE_GPRS.to_vec();
     let mut avail_xmms: Vec<XmmReg> = VOLATILE_XMMS
@@ -1127,6 +1124,90 @@ mod tests {
         );
     }
 
+    // A `NativeInline` re-emits raw bytes that read/write fixed physical
+    // registers. The lifter pins the read values to the read regs and the
+    // write-Undef to the write reg; regalloc must honor those pins and must not
+    // park a value live across the native in the native's write register.
+    #[test]
+    fn native_inline_pins_reads_writes_and_spares_live_across() {
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let across = func.alloc_value(); // defined before, used after the native
+        let rcx_v = func.alloc_value(); // read value pinned to RCX
+        let rdx_v = func.alloc_value(); // read value pinned to RDX
+        let nv = func.alloc_value(); // dead NativeInline dest
+        let rax_v = func.alloc_value(); // write-Undef pinned to RAX
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![
+                Inst {
+                    dest: Some(across),
+                    op: IrOp::Const(10),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(rcx_v),
+                    op: IrOp::Undef,
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(rdx_v),
+                    op: IrOp::Undef,
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(nv),
+                    op: IrOp::NativeInline(NativeInst {
+                        bytes: vec![0x90],
+                        reads: vec![PhysReg::Gpr(Gpr::Rcx), PhysReg::Gpr(Gpr::Rdx)],
+                        writes: vec![PhysReg::Gpr(Gpr::Rax)],
+                    }),
+                    args: vec![rcx_v, rdx_v],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(rax_v),
+                    op: IrOp::Undef,
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: None,
+                    op: IrOp::Use,
+                    args: vec![across],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: None,
+                    op: IrOp::Use,
+                    args: vec![rax_v],
+                    ty: IrType::I64,
+                },
+            ],
+            term: IrTerminator::Ret,
+        });
+        let mut pins = HashMap::new();
+        pins.insert(rcx_v, PhysReg::Gpr(Gpr::Rcx));
+        pins.insert(rdx_v, PhysReg::Gpr(Gpr::Rdx));
+        pins.insert(rax_v, PhysReg::Gpr(Gpr::Rax));
+        let alloc = allocate_registers(&func, &CALLEE_SAVED_GPRS, &HashSet::new(), &pins).unwrap();
+        assert_eq!(alloc.assignments[&rcx_v], PhysReg::Gpr(Gpr::Rcx));
+        assert_eq!(alloc.assignments[&rdx_v], PhysReg::Gpr(Gpr::Rdx));
+        assert_eq!(alloc.assignments[&rax_v], PhysReg::Gpr(Gpr::Rax));
+        // `across` is live over the native, so it must not land in the write reg
+        // (RAX) the raw bytes clobber, nor in either read reg.
+        assert_ne!(alloc.assignments[&across], PhysReg::Gpr(Gpr::Rax));
+        assert_ne!(alloc.assignments[&across], PhysReg::Gpr(Gpr::Rcx));
+        assert_ne!(alloc.assignments[&across], PhysReg::Gpr(Gpr::Rdx));
+    }
+
     // Issue #24: a value defined before a loop and used inside it is live across
     // the back-edge, so its interval must reach the latch's terminator. The old
     // syntactic last-use heuristic ended it at the in-body use, letting a later
@@ -1227,7 +1308,7 @@ mod tests {
         });
 
         let order = block_order(&func);
-        let intervals = compute_live_intervals(&func, &order);
+        let (intervals, _) = compute_live_intervals(&func, &order);
         let inv_iv = intervals
             .iter()
             .find(|iv| iv.value == inv)

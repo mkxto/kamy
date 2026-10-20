@@ -67,14 +67,35 @@ pub(crate) fn native_inline_fallback(
         }
     }
 
-    let read_vals: Vec<ValueId> = reads
-        .iter()
-        .map(|r| match r {
+    // The raw bytes read fixed physical registers, so each read value must sit
+    // in its read register. Pin it there; if it is already pinned elsewhere (the
+    // same value aliased into two registers, e.g. after `mov rbx,rax`), copy it
+    // into a fresh value pinned to this register — one value cannot hold two
+    // pins. Reads are built before the native so the copies precede it.
+    let mut read_vals: Vec<ValueId> = Vec::with_capacity(reads.len());
+    for r in &reads {
+        let v = match r {
             PhysReg::Gpr(g) => state.get_gpr(*g),
             PhysReg::Xmm(x) => state.get_xmm(*x),
             PhysReg::Flag(f) => state.get_flag(*f),
-        })
-        .collect();
+        };
+        match state.reg_pins.get(&v).copied() {
+            Some(p) if p == *r => read_vals.push(v),
+            None => {
+                state.reg_pins.insert(v, *r);
+                read_vals.push(v);
+            }
+            Some(_) => {
+                let ty = match r {
+                    PhysReg::Xmm(_) => IrType::I128,
+                    _ => IrType::I64,
+                };
+                let copy = builder.emit(IrOp::Copy, &[v], ty);
+                state.reg_pins.insert(copy, *r);
+                read_vals.push(copy);
+            }
+        }
+    }
 
     let native = NativeInst {
         bytes: insn_bytes.to_vec(),
@@ -85,18 +106,26 @@ pub(crate) fn native_inline_fallback(
     tracing::trace!(mnemonic = ?insn.mnemonic(), "native passthrough");
     builder.emit(IrOp::NativeInline(native), &read_vals, IrType::I64);
 
+    // The raw bytes write fixed physical registers. Each write value is a fresh
+    // single-def Undef pinned to its write register, so a later op reading that
+    // register reads it where the native actually wrote it. (The native point
+    // itself is reserved against clobber in regalloc, independent of this pin,
+    // since a write never read again is dead and gets DCE'd before regalloc.)
     for phys in &writes {
         match phys {
             PhysReg::Gpr(g) => {
                 let v = builder.emit(IrOp::Undef, &[], IrType::I64);
+                state.reg_pins.insert(v, *phys);
                 state.set_gpr(*g, v);
             }
             PhysReg::Xmm(x) => {
                 let v = builder.emit(IrOp::Undef, &[], IrType::I128);
+                state.reg_pins.insert(v, *phys);
                 state.set_xmm(*x, v);
             }
             PhysReg::Flag(f) => {
                 let v = builder.emit(IrOp::Undef, &[], IrType::I8);
+                state.reg_pins.insert(v, *phys);
                 state.set_flag(*f, v);
             }
         }
