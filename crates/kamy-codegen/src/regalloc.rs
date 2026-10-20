@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use kamy_core::RejectionReason;
 use kamy_core::ir::{
-    BlockId, Gpr, IrFunction, IrOp, IrTerminator, IrType, PhysReg, ValueId, XmmReg,
+    BlockId, Gpr, Inst, IrFunction, IrOp, IrTerminator, IrType, PhysReg, ValueId, XmmReg,
 };
 
 #[derive(Debug, Clone)]
@@ -198,99 +198,204 @@ fn linear_point(block_index: usize, inst_index: usize) -> usize {
     block_index * 1024 + inst_index
 }
 
+fn interval_bump(
+    lo: &mut HashMap<ValueId, usize>,
+    hi: &mut HashMap<ValueId, usize>,
+    v: ValueId,
+    pt: usize,
+) {
+    lo.entry(v).and_modify(|e| *e = (*e).min(pt)).or_insert(pt);
+    hi.entry(v).and_modify(|e| *e = (*e).max(pt)).or_insert(pt);
+}
+
+/// Values an instruction reads: its SSA args, plus — for a `NativeInline` that
+/// reads physical registers — the value pinned to each read register.
+fn inst_reads(inst: &Inst, pin_reg_val: &HashMap<PhysReg, ValueId>) -> Vec<ValueId> {
+    let mut u = inst.args.clone();
+    if let IrOp::NativeInline(native) = &inst.op {
+        for r in &native.reads {
+            if let Some(&v) = pin_reg_val.get(r) {
+                u.push(v);
+            }
+        }
+    }
+    u
+}
+
+/// Live intervals over the linearized `order`. Liveness is a real backward
+/// SSA dataflow (to a fixpoint, so back edges are honored): a value live across
+/// a loop — a loop-carried phi value or a loop-invariant value defined before
+/// the loop and used inside it — stays live from the loop header through the
+/// latch's back-edge terminator. Each interval is the convex hull (min start,
+/// max end) of every linear point where the value is defined, used, or live,
+/// which is sound for single-interval linear scan regardless of block order:
+/// collapsing holes only over-reserves a register, never under-reserves it.
+/// The earlier syntactic last-use heuristic truncated loop-crossing values at
+/// their textually-last use, so a later-ordered in-loop block could reuse the
+/// register mid-loop and clobber the live value (issue #24).
 fn compute_live_intervals(func: &IrFunction, order: &[BlockId]) -> Vec<LiveInterval> {
-    let mut defs: HashMap<ValueId, (usize, IrType, Option<PhysReg>)> = HashMap::new();
-    let mut last_use: HashMap<ValueId, usize> = HashMap::new();
+    let n = order.len();
+    let mut pos: HashMap<BlockId, usize> = HashMap::new();
+    for (i, &b) in order.iter().enumerate() {
+        pos.insert(b, i);
+    }
+
+    let mut def_pt: HashMap<ValueId, usize> = HashMap::new();
+    let mut ty_of: HashMap<ValueId, IrType> = HashMap::new();
+    let mut pinned_of: HashMap<ValueId, PhysReg> = HashMap::new();
+    let mut pin_reg_val: HashMap<PhysReg, ValueId> = HashMap::new();
     let mut call_points: Vec<usize> = Vec::new();
-    // Each phi dest is written by an edge copy at every predecessor's terminator;
-    // its register must be reserved across those points, back-edges included.
-    let mut phi_dest_edges: HashMap<ValueId, Vec<usize>> = HashMap::new();
 
     for (bi, &bid) in order.iter().enumerate() {
         let block = func.block(bid);
-
         for (pi, phi) in block.phis.iter().enumerate() {
-            let pt = linear_point(bi, pi);
-            defs.entry(phi.dest).or_insert((pt, phi.ty, None));
+            def_pt.entry(phi.dest).or_insert(linear_point(bi, pi));
+            ty_of.entry(phi.dest).or_insert(phi.ty);
         }
-
-        let phi_offset = block.phis.len();
-
+        let phi_off = block.phis.len();
         for (ii, inst) in block.insts.iter().enumerate() {
-            let pt = linear_point(bi, phi_offset + ii);
+            let pt = linear_point(bi, phi_off + ii);
             if matches!(inst.op, IrOp::Call { .. } | IrOp::CallIndirect) {
                 call_points.push(pt);
             }
             if let Some(dest) = inst.dest {
-                let pinned = match &inst.op {
-                    IrOp::NativeInline(native) => native.writes.first().copied(),
-                    _ => None,
-                };
-                defs.entry(dest).or_insert((pt, inst.ty, pinned));
-            }
-            for arg in &inst.args {
-                last_use.insert(*arg, pt);
-            }
-            if let IrOp::NativeInline(native) = &inst.op {
-                for r in &native.reads {
-                    for (&vid, &(_, _, pinned)) in &defs {
-                        if pinned == Some(*r) {
-                            last_use
-                                .entry(vid)
-                                .and_modify(|e| *e = (*e).max(pt))
-                                .or_insert(pt);
-                        }
+                def_pt.entry(dest).or_insert(pt);
+                ty_of.entry(dest).or_insert(inst.ty);
+                if let IrOp::NativeInline(native) = &inst.op {
+                    if let Some(&w) = native.writes.first() {
+                        pinned_of.entry(dest).or_insert(w);
+                        pin_reg_val.entry(w).or_insert(dest);
                     }
                 }
             }
         }
+    }
 
-        let term_pt = linear_point(bi, phi_offset + block.insts.len());
-        if let IrTerminator::Branch { cond, .. } = &block.term {
-            last_use.insert(*cond, term_pt);
+    // Per-block use/def for liveness. `use_set` holds upward-exposed uses (read
+    // before any in-block def); phi destinations are defined at block entry and
+    // phi arguments are consumed on the predecessor edge, not read in the block.
+    let mut use_set: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut def_set: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut edge_use: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let succ_idx: Vec<Vec<usize>> = order
+        .iter()
+        .map(|&bid| {
+            successors(&func.block(bid).term)
+                .iter()
+                .filter_map(|s| pos.get(s).copied())
+                .collect()
+        })
+        .collect();
+
+    for (bi, &bid) in order.iter().enumerate() {
+        let block = func.block(bid);
+        let mut defined: HashSet<ValueId> = HashSet::new();
+        for phi in &block.phis {
+            def_set[bi].insert(phi.dest);
+            defined.insert(phi.dest);
         }
-
-        for succ in successors(&block.term) {
-            let target = func.block(succ);
-            for phi in &target.phis {
-                phi_dest_edges.entry(phi.dest).or_default().push(term_pt);
+        for inst in &block.insts {
+            for v in inst_reads(inst, &pin_reg_val) {
+                if !defined.contains(&v) {
+                    use_set[bi].insert(v);
+                }
+            }
+            if let Some(d) = inst.dest {
+                def_set[bi].insert(d);
+                defined.insert(d);
+            }
+        }
+        if let IrTerminator::Branch { cond, .. } = &block.term {
+            if !defined.contains(cond) {
+                use_set[bi].insert(*cond);
+            }
+        }
+        for s in successors(&block.term) {
+            for phi in &func.block(s).phis {
                 for (pred, val) in &phi.args {
                     if *pred == bid {
-                        last_use
-                            .entry(*val)
-                            .and_modify(|e| *e = (*e).max(term_pt))
-                            .or_insert(term_pt);
+                        edge_use[bi].insert(*val);
                     }
                 }
             }
         }
     }
 
-    for (dest, pts) in &phi_dest_edges {
-        let minp = *pts.iter().min().unwrap();
-        let maxp = *pts.iter().max().unwrap();
-        if let Some(d) = defs.get_mut(dest) {
-            d.0 = d.0.min(minp);
+    let mut live_in: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut live_out: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bi in (0..n).rev() {
+            let mut new_out = edge_use[bi].clone();
+            for &s in &succ_idx[bi] {
+                new_out.extend(live_in[s].iter().copied());
+            }
+            let mut new_in = use_set[bi].clone();
+            for &v in &new_out {
+                if !def_set[bi].contains(&v) {
+                    new_in.insert(v);
+                }
+            }
+            if new_out != live_out[bi] {
+                live_out[bi] = new_out;
+                changed = true;
+            }
+            if new_in != live_in[bi] {
+                live_in[bi] = new_in;
+                changed = true;
+            }
         }
-        last_use
-            .entry(*dest)
-            .and_modify(|e| *e = (*e).max(maxp))
-            .or_insert(maxp);
     }
 
-    let mut intervals: Vec<LiveInterval> = defs
-        .into_iter()
-        .map(|(vid, (start, ty, pinned))| {
-            let end = last_use.get(&vid).copied().unwrap_or(start);
-            // A value defined before a call and used after must survive it; only
-            // callee-saved registers (or RSP) are preserved across a CALL.
+    let mut lo: HashMap<ValueId, usize> = HashMap::new();
+    let mut hi: HashMap<ValueId, usize> = HashMap::new();
+    for (&v, &p) in &def_pt {
+        interval_bump(&mut lo, &mut hi, v, p);
+    }
+    for (bi, &bid) in order.iter().enumerate() {
+        let block = func.block(bid);
+        let phi_off = block.phis.len();
+        for (ii, inst) in block.insts.iter().enumerate() {
+            let pt = linear_point(bi, phi_off + ii);
+            for v in inst_reads(inst, &pin_reg_val) {
+                interval_bump(&mut lo, &mut hi, v, pt);
+            }
+        }
+        let term_pt = linear_point(bi, phi_off + block.insts.len());
+        if let IrTerminator::Branch { cond, .. } = &block.term {
+            interval_bump(&mut lo, &mut hi, *cond, term_pt);
+        }
+        for s in successors(&block.term) {
+            for phi in &func.block(s).phis {
+                for (pred, val) in &phi.args {
+                    if *pred == bid {
+                        interval_bump(&mut lo, &mut hi, *val, term_pt);
+                    }
+                }
+            }
+        }
+        let start_pt = linear_point(bi, 0);
+        for &v in &live_in[bi] {
+            interval_bump(&mut lo, &mut hi, v, start_pt);
+        }
+        for &v in &live_out[bi] {
+            interval_bump(&mut lo, &mut hi, v, term_pt);
+        }
+    }
+
+    let mut intervals: Vec<LiveInterval> = def_pt
+        .keys()
+        .map(|&vid| {
+            let start = lo[&vid];
+            let end = hi[&vid];
             let crosses_call = call_points.iter().any(|&c| start < c && c < end);
             LiveInterval {
                 value: vid,
-                ty,
+                ty: ty_of[&vid],
                 start,
                 end,
-                pinned,
+                pinned: pinned_of.get(&vid).copied(),
                 crosses_call,
             }
         })
@@ -1019,6 +1124,122 @@ mod tests {
         assert!(
             alloc.copies.is_empty(),
             "no mid-life register move should be emitted"
+        );
+    }
+
+    // Issue #24: a value defined before a loop and used inside it is live across
+    // the back-edge, so its interval must reach the latch's terminator. The old
+    // syntactic last-use heuristic ended it at the in-body use, letting a later
+    // block reuse the register mid-loop and clobber the live value.
+    #[test]
+    fn loop_invariant_value_lives_across_back_edge() {
+        // b0: inv=Undef, seed=Undef -> b1
+        // b1 header: cur=phi(seed, cur2); c=IsZero(cur); branch -> b3(exit):b2(body)
+        // b2 body: t=Add(cur,inv); one=Const(1); cur2=Sub(cur,one); Use(t) -> b1
+        // b3: ret
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let inv = func.alloc_value();
+        let seed = func.alloc_value();
+        let cur = func.alloc_value();
+        let c = func.alloc_value();
+        let t = func.alloc_value();
+        let one = func.alloc_value();
+        let cur2 = func.alloc_value();
+
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts: vec![
+                Inst {
+                    dest: Some(inv),
+                    op: IrOp::Undef,
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(seed),
+                    op: IrOp::Undef,
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+            ],
+            term: IrTerminator::Jump(BlockId(1)),
+        });
+        func.blocks.push(IrBlock {
+            id: BlockId(1),
+            phis: vec![Phi {
+                dest: cur,
+                ty: IrType::I64,
+                args: vec![(BlockId(0), seed), (BlockId(2), cur2)],
+            }],
+            insts: vec![Inst {
+                dest: Some(c),
+                op: IrOp::IsZero,
+                args: vec![cur],
+                ty: IrType::I8,
+            }],
+            term: IrTerminator::Branch {
+                cond: c,
+                taken: BlockId(3),
+                not_taken: BlockId(2),
+            },
+        });
+        func.blocks.push(IrBlock {
+            id: BlockId(2),
+            phis: vec![],
+            insts: vec![
+                Inst {
+                    dest: Some(t),
+                    op: IrOp::Add,
+                    args: vec![cur, inv],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(one),
+                    op: IrOp::Const(1),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(cur2),
+                    op: IrOp::Sub,
+                    args: vec![cur, one],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: None,
+                    op: IrOp::Use,
+                    args: vec![t],
+                    ty: IrType::I64,
+                },
+            ],
+            term: IrTerminator::Jump(BlockId(1)),
+        });
+        func.blocks.push(IrBlock {
+            id: BlockId(3),
+            phis: vec![],
+            insts: vec![],
+            term: IrTerminator::Ret,
+        });
+
+        let order = block_order(&func);
+        let intervals = compute_live_intervals(&func, &order);
+        let inv_iv = intervals
+            .iter()
+            .find(|iv| iv.value == inv)
+            .expect("inv has an interval");
+        let b2 = func.block(BlockId(2));
+        let b2_idx = order.iter().position(|&b| b == BlockId(2)).unwrap();
+        let latch_term = linear_point(b2_idx, b2.phis.len() + b2.insts.len());
+        assert!(
+            inv_iv.end >= latch_term,
+            "loop-invariant value must stay live through the back-edge: end={} latch_term={}",
+            inv_iv.end,
+            latch_term
         );
     }
 }
