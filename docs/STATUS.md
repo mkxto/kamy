@@ -226,53 +226,58 @@ target features and per-member linker flags (`/guard:cf`, `/LTCG`) flow through
   pure exports (`MulDiv(6,7,3)=14`, `lstrlenW=5`, `kamy_fnv("abc")=440920331`).
 - Coverage = SSA-lowered / total; **relocated and rejected are both not-covered**.
   Verbatim relocation is banned — SSA failures are rejected in place. TOTAL
-  2853/11262 (25.3%). Rejections by reason, descending:
+  2113/11388 (18.6%) — down from 25.3% because the call-argument ABI pin and the
+  C++-EH-runtime / `/GS` rejects trade coverage for soundness (D22: correctness
+  first; recovery tracked under #15/#31). Rejections by reason, descending:
 
   | reason | count |
   |--------|-------|
-  | RegisterPressure | 4462 |
-  | SEHComplex | 1647 |
-  | LiftFailure | 791 |
-  | UnsupportedInstruction | 462 |
-  | CallerFrameAccess | 329 |
-  | BadIndirectBranch | 205 |
-  | ResolvableIndirect | 111 |
-  | NoThunkSpace | 83 |
-  | SelfRecursive | 5 |
+  | SEHComplex | 3992 |
+  | RegisterPressure | 3576 |
+  | UnsupportedInstruction | 714 |
+  | LiftFailure | 557 |
+  | CallerFrameAccess | 218 |
+  | BadIndirectBranch | 101 |
+  | ResolvableIndirect | 72 |
+  | NoThunkSpace | 35 |
+  | SelfRecursive | 10 |
 
-  `RegisterPressure` dominates (recovery tracked in #15), `SEHComplex` follows
-  from the SEH-heavy console/dll members, then `LiftFailure`. `CallerFrameAccess`
-  and `fs/gs` ship as sound conservative rejects (D22) → #15 and #26, both
-  `known-limitation`.
-- **12/23 PASS** (`console_fibmix`, `console_jtable`, `kernel32`, `gui_msgbox`,
-  and all eight plain console members: `console_fp`, `console_seh`,
-  `console_sse{,_lto,_minsize,_od}`, `console_switch`, `console_tls`).
-  `console_jtable` is the recovered-switch runtime oracle — its 16-case `vm`
-  lowers to a tableless compare ladder (`relocated` = 0 corpus-wide). Two SSA
-  backend root causes fixed (#24):
-  (a) SSA construction dropped the loop back-edge phi argument — the resolving
-  body block rewrote only its own uses, leaving an already-created loop-header phi
-  pointing at the body's `Undef` placeholder; resolution now threads the back-edge
-  phi arg across *all* blocks. (b) The linear-scan allocator computed live ranges
-  from a value's *syntactic* last use over a DFS block order, so a value live
-  across a loop back-edge (a loop-carried phi value or a loop-invariant value used
-  inside the loop) was freed at its textually-last use and its register reused
-  mid-loop — corrupting e.g. the ucrt `write_integer` hex nibble loop; liveness is
-  now a real backward SSA dataflow to a fixpoint, so loop-crossing values stay
-  reserved across the whole loop. Both carry regression tests
-  (`kamy-lift::ssa`, `kamy-codegen::regalloc`).
-- **11 FAIL remain, two distinct newly-surfaced miscompiles** (the #24 fix
-  unmasked them, as the RCA anticipated):
-  - **8 DLLs** (`dll_*`): every export now returns the correct value, then the
-    process AVs (`0xC0000005`) at DLL/process teardown. The crashing routine — a
-    16-byte-stride terminator/onexit table walk that calls each slot via the CFG
-    `_guard_dispatch_icall` thunk — is relocated *verbatim* (correct); it loads a
-    *garbage* callback pointer from the table, so a **lowered CRT-init function
-    stored a bad pointer** during attach. Pointer-materialization bug, not
-    liveness. Next target.
-  - **3 console** (`console_cfg`, `console_cfg_lto`, `console_eh`): crash with
-    `0xC0000409` (STATUS_STACK_BUFFER_OVERRUN) — a `/GS` security-cookie or
-    `/guard:cf` fast-fail check, specific to the CFG/EH members.
+  `SEHComplex` now leads: it also carries the C++-EH-runtime cluster left verbatim
+  so exception dispatch stays correct. `RegisterPressure` follows (recovery tracked
+  in #15). `CallerFrameAccess` and `fs/gs` ship as sound conservative rejects (D22)
+  → #15 and #26, both `known-limitation`.
+- **21/23 PASS.** `#23` (the residual corpus miscompiles the #24 fix unmasked) is
+  resolved down to the unimplemented CFG/EH phase. Fixes, each a standalone commit:
+  - **DLL teardown (8 `dll_*`) — call-argument ABI pin.** The root cause was *not*
+    pointer materialization: a lowered CRT cleanup called `FlsFree(dwTlsIndex)`, but
+    a call argument whose value crossed a block boundary was pinned on the pre-SSA
+    block-entry placeholder; SSA resolution rewrote the call's arg to the real value
+    and orphaned the pin, so the allocator parked the index in R11 and left `-1`
+    (the compare constant) in RCX → `FlsFree(-1)`. The FLS index then stayed
+    registered and its callback dangled into the unmapped module at process exit
+    (`0xC0000005`). SSA now transfers the pin to the resolved value. Flipped 6
+    `dll_*` directly; a general call-arg soundness fix.
+  - **#8 NativeInline operand pinning (`dll_asm`).** Read/write operands of a raw
+    re-emitted instruction are now pinned to their physical registers (copy-out on
+    aliasing; write regs reserved across the native point). `#8` closed.
+  - **`dll_bmi1` `bmi1_tzcnt`.** A NativeInline `adc` reads the carry flag, a
+    dependency SSA does not thread, so the `cmp` producer was DCE'd and `tzcnt` saw
+    garbage (returned 0). NativeInline that reads `rflags` now rejects (verbatim).
+  - **`dll_abi` — corpus-oracle bug.** The loader's call shim dropped every argument
+    past the fifth, so `abi_many`'s sixth parameter read uninitialized stack and the
+    member was non-deterministic; its `79` golden was blessed from that garbage. The
+    loader now passes all six; golden re-blessed to `91`.
+  - **`console_eh` — C++ exception runtime.** A C++ throw dispatches through the
+    `__CxxFrameHandler` personality and the functions it reaches (FindHandler,
+    FH4::TryBlockMap4, catch/continuation helpers); relocating any of them
+    miscompiles handler lookup → unhandled → fast-fail. The personality cluster is
+    now left verbatim when user code dispatches through it (non-EH images keep full
+    coverage). A `/GS` cookie-stamp reject (`xor r,rsp`) also landed.
+- **2 FAIL remain — `console_cfg`, `console_cfg_lto`** (`/EHsc` **+ `/guard:cf`**).
+  `console_eh` (same source, no CFG) passes, so the residual is the Control-Flow-
+  Guard + C++ EH dispatch path: a layout-sensitive miscompile that needs CFG-table
+  / unwind reconstruction. That is a later phase (D31 / CFG), not yet built; these
+  stay rejected-incomplete until then.
 - Negative-tested: a tampered golden makes `verify` exit non-zero and flag the
   diverging member (the oracle is not a tautology).
 - `corpus build`/`bless` need the toolchains (cl via `vcvars64.bat`, rustc, and
@@ -293,7 +298,7 @@ target features and per-member linker flags (`/guard:cf`, `/LTCG`) flow through
 | kernel32.dll SSA round-trip (2588 functions) | ✅ Verified (static) | Rebuilds via SSA (362 lowered); re-parses as valid PE, exports preserved, exception table consistent (1608/1608 RUNTIME_FUNCTIONs). DLL — not executed. |
 | aftermathlabs/bintests corpus (D25) | Not adopted |
 | backengineering/bintests `misc/jtables` — jump-table corpus (research.md §10.5) | Not adopted |
-| Runnable corpus (#7): 23 members (console/gui/dll/kernel32) | 🔶 12/23 PASS | #24 fixed (SSA back-edge phi threading + linear-scan loop liveness) took 2→11; recovered switches now lower to a tableless compare ladder (verbatim move removed, `relocated`=0) with `console_jtable` as the runtime oracle (12th PASS). Remaining 11 FAIL: DLL teardown garbage callback pointer (8 dll_*) and `/GS`/`/guard:cf` fast-fail (console_cfg/cfg_lto/eh). |
+| Runnable corpus (#7): 23 members (console/gui/dll/kernel32) | 🔶 21/23 PASS | #23 residual miscompiles fixed: cross-block call-arg ABI pin (DLL teardown, 8 dll_*), #8 NativeInline operand pinning (dll_asm), rflags-reader reject (dll_bmi1 tzcnt), loader six-arg fix + re-blessed dll_abi golden, and leaving the C++ EH runtime verbatim (console_eh). Remaining 2 FAIL (console_cfg/cfg_lto) are `/EHsc`+`/guard:cf`; the CFG+EH dispatch path needs CFG-table/unwind reconstruction (D31/CFG phase, not built). |
 
 ## Rejection rates
 
