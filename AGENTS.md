@@ -36,6 +36,27 @@ divergence justified only in a commit/report, is prohibited.
 - Correctness first, then six-month maintainability, then speed. In the hot
   per-function path, avoid needless allocation and 
 
+## Agent tooling
+
+Headless triage commands are the inner loop for finding miscompiles; they run
+without a debugger and decide pass/fail themselves. Use each for its job:
+
+- `kamy corpus verify` / `corpus doctor` — regression and health across the
+  corpus.
+- `kamy bisect --expect-exit` — localize a miscompile to the minimal culprit
+  function set.
+- `kamy dump --rva --stage` — inspect a function's IR (`regalloc` for the
+  lowered form that feeds codegen).
+- `kamy explain-reject` — report why a function was rejected.
+- `kamy protect --ssa-identity [--only-rva/--reject-rva]` — exercise the full
+  pipeline as an identity transform on a chosen function set.
+
+**Hard rule.** To localize a miscompile use `kamy bisect`; to inspect IR use
+`kamy dump`. x64dbg MCP is deep-dive-only — interactive inspection of a single
+already-isolated culprit, **never** the batch pass/fail loop.
+
+See `docs/tooling.md` for the full command reference and workflow.
+
 ## Code style
 
 - **Self-explanatory code.** Names carry intent; comments do not restate them.
