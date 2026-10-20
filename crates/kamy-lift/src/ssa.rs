@@ -75,7 +75,7 @@ pub fn construct_ssa(result: &mut LiftResult) {
                 let old = result.block_entry[bi][r];
                 let new = result.block_exit[pred_idx][r];
                 if old != new {
-                    replace_in_block(&mut result.func.blocks[bi], old, new);
+                    resolve_entry(&mut result.func, bi, old, new);
                     propagate_exit(&mut result.block_exit[bi], old, new);
                 }
             }
@@ -89,7 +89,7 @@ pub fn construct_ssa(result: &mut LiftResult) {
 
                 if all_same {
                     if old != first_val {
-                        replace_in_block(&mut result.func.blocks[bi], old, first_val);
+                        resolve_entry(&mut result.func, bi, old, first_val);
                         propagate_exit(&mut result.block_exit[bi], old, first_val);
                     }
                 } else {
@@ -104,9 +104,9 @@ pub fn construct_ssa(result: &mut LiftResult) {
                         ty,
                         args: phi_args,
                     });
-                    // The back-edge arg may reference `old`; rewriting it here turns
+                    // The back-edge arg may reference `old`; threading it here turns
                     // a loop-carried pass-through into a proper self-referential phi.
-                    replace_in_block(&mut result.func.blocks[bi], old, new_vid);
+                    resolve_entry(&mut result.func, bi, old, new_vid);
                     propagate_exit(&mut result.block_exit[bi], old, new_vid);
                 }
             }
@@ -121,6 +121,28 @@ fn propagate_exit(exit: &mut [ValueId; 38], old: ValueId, new: ValueId) {
     for e in exit.iter_mut() {
         if *e == old {
             *e = new;
+        }
+    }
+}
+
+/// Resolve a block-entry placeholder to its incoming definition. Besides rewriting
+/// uses inside the resolving block, the placeholder may already survive as a
+/// back-edge phi argument in an earlier-processed loop header: that header's phi
+/// lives in a *different* block, so its argument must be rewritten here too. Entry
+/// placeholders are unique per block/register, so a global phi-arg rewrite only
+/// touches genuine references (issue #24).
+fn resolve_entry(func: &mut IrFunction, bi: usize, old: ValueId, new: ValueId) {
+    replace_in_block(&mut func.blocks[bi], old, new);
+    for (j, block) in func.blocks.iter_mut().enumerate() {
+        if j == bi {
+            continue;
+        }
+        for phi in &mut block.phis {
+            for (_, v) in &mut phi.args {
+                if *v == old {
+                    *v = new;
+                }
+            }
         }
     }
 }
@@ -436,5 +458,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Issue #24: a loop-invariant register carried through a separate body block
+    // must not leave the body's entry placeholder (an Undef) as the header phi's
+    // back-edge argument. Models the strnlen-shaped loop from the issue.
+    #[test]
+    fn loop_invariant_reg_threads_back_edge_phi() {
+        let mut next_val = 0u32;
+        let mut alloc = || {
+            let v = ValueId(next_val);
+            next_val += 1;
+            v
+        };
+
+        let b0_ptr = alloc();
+        let b1_ptr = alloc();
+        let b2_ptr = alloc();
+        let b3_ptr = alloc();
+        let header_load = alloc();
+        let header_cond = alloc();
+        let body_load = alloc();
+
+        let mut b0_entry = [alloc(); 38];
+        b0_entry[0] = b0_ptr;
+        let b0_exit = b0_entry;
+
+        let mut b1_entry = [alloc(); 38];
+        b1_entry[0] = b1_ptr;
+        let b1_exit = b1_entry;
+
+        let mut b2_entry = [alloc(); 38];
+        b2_entry[0] = b2_ptr;
+        let b2_exit = b2_entry;
+
+        let mut b3_entry = [alloc(); 38];
+        b3_entry[0] = b3_ptr;
+        let b3_exit = b3_entry;
+
+        let blocks = vec![
+            IrBlock {
+                id: BlockId(0),
+                phis: vec![],
+                insts: vec![undef_inst(b0_ptr, IrType::I64)],
+                term: IrTerminator::Jump(BlockId(1)),
+            },
+            IrBlock {
+                id: BlockId(1),
+                phis: vec![],
+                insts: vec![
+                    undef_inst(b1_ptr, IrType::I64),
+                    Inst {
+                        dest: Some(header_load),
+                        op: IrOp::Add,
+                        args: vec![b1_ptr, b1_ptr],
+                        ty: IrType::I64,
+                    },
+                    Inst {
+                        dest: Some(header_cond),
+                        op: IrOp::Const(0),
+                        args: vec![],
+                        ty: IrType::I8,
+                    },
+                ],
+                term: IrTerminator::Branch {
+                    cond: header_cond,
+                    taken: BlockId(2),
+                    not_taken: BlockId(3),
+                },
+            },
+            IrBlock {
+                id: BlockId(2),
+                phis: vec![],
+                insts: vec![
+                    undef_inst(b2_ptr, IrType::I64),
+                    Inst {
+                        dest: Some(body_load),
+                        op: IrOp::Add,
+                        args: vec![b2_ptr, b2_ptr],
+                        ty: IrType::I64,
+                    },
+                ],
+                term: IrTerminator::Jump(BlockId(1)),
+            },
+            IrBlock {
+                id: BlockId(3),
+                phis: vec![],
+                insts: vec![undef_inst(b3_ptr, IrType::I64)],
+                term: IrTerminator::Ret,
+            },
+        ];
+
+        let mut result = LiftResult {
+            func: IrFunction {
+                entry: BlockId(0),
+                blocks,
+                next_value: next_val,
+            },
+            block_entry: vec![
+                make_entry(&b0_entry),
+                make_entry(&b1_entry),
+                make_entry(&b2_entry),
+                make_entry(&b3_entry),
+            ],
+            block_exit: vec![b0_exit, b1_exit, b2_exit, b3_exit],
+            rsp_chain: std::collections::HashSet::new(),
+            reg_pins: std::collections::HashMap::new(),
+            unsupported: false,
+        };
+
+        construct_ssa(&mut result);
+
+        for block in &result.func.blocks {
+            for phi in &block.phis {
+                for &(_, v) in &phi.args {
+                    assert_ne!(
+                        v, b2_ptr,
+                        "body entry placeholder leaked into a phi back-edge arg"
+                    );
+                }
+            }
+        }
+
+        let header_phi = result.func.blocks[1]
+            .phis
+            .iter()
+            .find(|phi| {
+                phi.args
+                    .iter()
+                    .any(|&(bid, v)| bid == BlockId(0) && v == b0_ptr)
+            })
+            .expect("header should carry a phi for the loop-invariant pointer");
+
+        let back_arg = header_phi
+            .args
+            .iter()
+            .find(|&&(bid, _)| bid == BlockId(2))
+            .map(|&(_, v)| v)
+            .expect("header phi must have a back-edge argument from the body");
+        assert_eq!(
+            back_arg, header_phi.dest,
+            "loop-invariant back-edge arg must be the self-referential phi, not Undef"
+        );
     }
 }
