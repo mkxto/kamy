@@ -1,0 +1,22 @@
+[package]
+name = "kamy-triage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+kamy-core.workspace = true
+kamy-pe.workspace = true
+kamy-disasm.workspace = true
+kamy-lift.workspace = true
+kamy-transforms.workspace = true
+kamy-codegen.workspace = true
+kamy-link.workspace = true
+kamy-run.workspace = true
