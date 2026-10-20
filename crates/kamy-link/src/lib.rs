@@ -223,8 +223,20 @@ fn uses_unsupported_flags(func: &IrFunction) -> bool {
 /// (by a constant) chain and matching phis that thread the stack pointer and
 /// frame pointer. Used to reject such functions (D22) because the generated
 /// callee-saved prologue shifts RSP out from under those accesses.
+///
+/// Also true for a /GS stack-cookie function (#23): the cookie is framed by
+/// xoring the live stack pointer into it (`xor rax, rsp`), which no ordinary
+/// code does. The generated prologue shifts RSP, so the epilogue's
+/// `__security_check_cookie` fast-fails (0xC0000409); reject instead.
 fn accesses_caller_frame(func: &IrFunction, rsp_chain: &HashSet<kamy_core::ir::ValueId>) -> bool {
     use kamy_core::ir::{IrOp, ValueId};
+    if func.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .any(|i| matches!(i.op, IrOp::Xor) && i.args.iter().any(|a| rsp_chain.contains(a)))
+    }) {
+        return true;
+    }
 
     let mut consts: HashMap<ValueId, i64> = HashMap::new();
     for b in &func.blocks {
@@ -813,5 +825,41 @@ mod tests {
         assert_eq!(begin, 0x5000);
         assert_eq!(end, 0x5040);
         assert_eq!(unwind, xdata_rva + 0x8);
+    }
+
+    #[test]
+    fn rejects_gs_cookie_xor_with_rsp() {
+        use kamy_core::ir::{
+            BlockId, Inst, IrBlock, IrFunction, IrOp, IrTerminator, IrType, ValueId,
+        };
+
+        let rsp = ValueId(0);
+        let other = ValueId(1);
+        let cookie = ValueId(2);
+        let dest = ValueId(3);
+
+        let make = |a: ValueId, b: ValueId| IrFunction {
+            entry: BlockId(0),
+            next_value: 4,
+            blocks: vec![IrBlock {
+                id: BlockId(0),
+                phis: vec![],
+                insts: vec![Inst {
+                    dest: Some(dest),
+                    op: IrOp::Xor,
+                    args: vec![a, b],
+                    ty: IrType::I64,
+                }],
+                term: IrTerminator::Ret,
+            }],
+        };
+
+        let mut rsp_chain: HashSet<ValueId> = HashSet::new();
+        rsp_chain.insert(rsp);
+
+        // xor with the live stack pointer: the cookie framing → reject.
+        assert!(accesses_caller_frame(&make(cookie, rsp), &rsp_chain));
+        // ordinary xor (no rsp_chain arg) → not rejected.
+        assert!(!accesses_caller_frame(&make(cookie, other), &rsp_chain));
     }
 }
