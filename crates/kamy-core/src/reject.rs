@@ -16,10 +16,6 @@ pub enum RejectionReason {
     /// is not yet implemented (D24 layer 0). Import/forwarder thunks are
     /// skipped, not rejected under this reason.
     ResolvableIndirect,
-    /// Indirect jump recovered as a jump table (D24 layer 2). The targets are
-    /// known, but moving the function needs table re-emission/retargeting, which
-    /// is not yet implemented, so it stays in place.
-    RecoverableSwitch,
     /// Instruction the lifter can neither model nor safely pass through verbatim.
     UnsupportedInstruction,
     /// Lifter error such as malformed code or data-in-code confusion.
@@ -90,7 +86,6 @@ impl RejectionReason {
             Self::NoThunkSpace => "NoThunkSpace",
             Self::BadIndirectBranch => "BadIndirectBranch",
             Self::ResolvableIndirect => "ResolvableIndirect",
-            Self::RecoverableSwitch => "RecoverableSwitch",
             Self::UnsupportedInstruction => "UnsupportedInstruction",
             Self::LiftFailure => "LiftFailure",
             Self::SehComplex => "SEHComplex",

@@ -49,6 +49,30 @@ fn gpr64(r: Register) -> Option<Register> {
     r.is_gpr().then(|| r.full_register())
 }
 
+fn reg_to_gpr(r: Register) -> Option<kamy_core::ir::Gpr> {
+    use Register::*;
+    use kamy_core::ir::Gpr;
+    Some(match r {
+        RAX => Gpr::Rax,
+        RCX => Gpr::Rcx,
+        RDX => Gpr::Rdx,
+        RBX => Gpr::Rbx,
+        RSP => Gpr::Rsp,
+        RBP => Gpr::Rbp,
+        RSI => Gpr::Rsi,
+        RDI => Gpr::Rdi,
+        R8 => Gpr::R8,
+        R9 => Gpr::R9,
+        R10 => Gpr::R10,
+        R11 => Gpr::R11,
+        R12 => Gpr::R12,
+        R13 => Gpr::R13,
+        R14 => Gpr::R14,
+        R15 => Gpr::R15,
+        _ => return Option::None,
+    })
+}
+
 fn is_indirect_reg_jmp(i: &Instruction) -> bool {
     i.mnemonic() == Mnemonic::Jmp && i.op0_kind() == OpKind::Register
 }
@@ -191,19 +215,54 @@ fn imm_reg_op(ins: &Instruction, index: Register) -> Option<u64> {
         .then(|| ins.immediate(1))
 }
 
+/// Registers holding the same value as the table index at dispatch: the index
+/// register plus the source of any `mov index, src` copy feeding it (fixpoint).
+/// The index bound (`and`/`cmp`) is often on the source register before a
+/// `mov eax, ecx` renames it into the table-load index, so the bound must be
+/// looked for on the whole copy-equivalence set, not just the index register.
+fn index_equiv_regs(
+    instrs: &[Instruction],
+    index: Register,
+) -> std::collections::HashSet<Register> {
+    let mut set = std::collections::HashSet::new();
+    set.insert(index);
+    loop {
+        let mut changed = false;
+        for ins in instrs {
+            if !is_reg_copy(ins) {
+                continue;
+            }
+            if let (Some(d), Some(s)) = (gpr64(ins.op0_register()), gpr64(ins.op1_register())) {
+                if set.contains(&d) && set.insert(s) {
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    set
+}
+
 fn bound_count(instrs: &[Instruction], index: Register) -> Option<u64> {
+    let equiv = index_equiv_regs(instrs, index);
     for ins in instrs {
         match ins.mnemonic() {
             Mnemonic::And => {
-                if let Some(mask) = imm_reg_op(ins, index) {
-                    if mask > 0 && mask & (mask + 1) == 0 {
-                        return Some(mask + 1);
+                for &r in &equiv {
+                    if let Some(mask) = imm_reg_op(ins, r) {
+                        if mask > 0 && mask & (mask + 1) == 0 {
+                            return Some(mask + 1);
+                        }
                     }
                 }
             }
             Mnemonic::Cmp | Mnemonic::Sub => {
-                if let Some(imm) = imm_reg_op(ins, index) {
-                    return imm.checked_add(1);
+                for &r in &equiv {
+                    if let Some(imm) = imm_reg_op(ins, r) {
+                        return imm.checked_add(1);
+                    }
                 }
             }
             _ => {}
@@ -299,16 +358,9 @@ pub(crate) fn detect_switch(
                 entries.push(Rva::new(tgt_rva));
             }
 
-            // LLVM retargets the `lea`; MSVC retargets the table load.
-            let dispatch = if base_is_image { load } else { lea };
-            let dispatch_rva = Rva::new((dispatch.ip() - module.image_base) as u32);
-
             Some(kamy_core::SwitchTable {
-                dispatch_rva,
-                table_rva: Rva::new(table_rva),
-                base_va,
-                base_is_image,
-                count: count as u32,
+                index_reg: reg_to_gpr(index)?,
+                dispatch_rva: Rva::new((load.ip() - module.image_base) as u32),
                 entries,
             })
         })();
@@ -384,8 +436,8 @@ mod tests {
         assert_eq!(tables.len(), 1);
         let (jmp_end, table) = &tables[0];
         assert_eq!(*jmp_end, 0x1013);
-        assert_eq!(table.entries.len() as u32, table.count);
-        assert!(!table.base_is_image);
+        assert_eq!(table.entries.len(), 4);
+        assert_eq!(table.index_reg, kamy_core::ir::Gpr::Rcx);
         let mut got: Vec<u32> = table.entries.iter().map(|r| r.get()).collect();
         got.sort_unstable();
         got.dedup();
@@ -403,8 +455,8 @@ mod tests {
         let tables = detect_switch(&m, &decode(&code), 0x1000, 0x1100);
         assert_eq!(tables.len(), 1);
         let (_, table) = &tables[0];
-        assert_eq!(table.entries.len() as u32, table.count);
-        assert!(!table.base_is_image);
+        assert_eq!(table.entries.len(), 4);
+        assert_eq!(table.index_reg, kamy_core::ir::Gpr::Rcx);
         let mut got: Vec<u32> = table.entries.iter().map(|r| r.get()).collect();
         got.sort_unstable();
         got.dedup();
@@ -426,7 +478,7 @@ mod tests {
         let tables = detect_switch(&m, &decode(&code), 0x1000, 0x1100);
         assert_eq!(tables.len(), 1);
         let (_, table) = &tables[0];
-        assert_eq!(table.count, 4);
+        assert_eq!(table.entries.len(), 4);
         let got: Vec<u32> = table.entries.iter().map(|r| r.get()).collect();
         assert_eq!(got, [0x1013, 0x1018, 0x1013, 0x1018]);
         let mut distinct = got.clone();

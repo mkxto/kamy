@@ -48,37 +48,23 @@ pub enum Terminator {
     Unknown,
 }
 
-/// Recovered switch-dispatch table (D24 layer 2, research.md §10.5).
+/// Recovered switch dispatch (D24 layer 2, research.md §10.5), lowered to a
+/// tableless compare ladder (no table survives in the output, matching
+/// CodeDefender — see docs/code_defender.md §"Switch / jump-table handling").
 ///
-/// Both canonical x86-64 forms collapse to this descriptor so a moved
-/// function's table can be re-emitted and its dispatch retargeted (Phase B):
-///
-/// * LLVM table-relative — `entries` are signed `i32` deltas from `base_va`
-///   (which equals the table VA); the dispatch `lea reg,[rip+table]` at
-///   `dispatch_rva` is retargeted to the relocated table VA.
-/// * MSVC module-base — `entries` are unsigned image-base RVAs and `base_va`
-///   is the image base; the dispatch `mov r,[base+idx*4+table]` at
-///   `dispatch_rva` carries the table as its displacement, retargeted to the
-///   relocated table RVA.
-///
-/// `entries` is in table order with duplicates preserved (`len == count`), so
-/// the new table is rebuilt slot-for-slot; distinct targets are surfaced as the
-/// switch block's `successors`.
+/// The lifter reads `index_reg` at dispatch and emits `index == k → entries[k]`
+/// as ordinary conditional branches to the case blocks; the final value falls
+/// through to `entries[last]` (the preceding bound check guarantees the index is
+/// in range). `entries[i]` is the case target for index value `i`, in table
+/// order with duplicates preserved; distinct targets are the switch block's
+/// `successors`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwitchTable {
-    /// Instruction whose memory displacement selects the table (LLVM `lea`,
-    /// MSVC `mov`); the linker retargets this operand to the relocated table.
+    /// Register holding the zero-based switch index at dispatch.
+    pub index_reg: crate::ir::Gpr,
+    /// RVA of the table-load instruction (`mov r,[base+index*4+table]`); the
+    /// lifter stops there and replaces the dispatch tail with the ladder.
     pub dispatch_rva: Rva,
-    /// Original table location in the image.
-    pub table_rva: Rva,
-    /// Absolute base the entries are measured from: the table VA (LLVM) or the
-    /// image base (MSVC).
-    pub base_va: u64,
-    /// `true` = MSVC module-base RVA entries; `false` = LLVM table-relative
-    /// signed `i32` deltas.
-    pub base_is_image: bool,
-    /// Entry count from the index bound (`cmp imm`+1 or mask `2^k`).
-    pub count: u32,
-    /// Case targets in table order, duplicates preserved (`len == count`).
+    /// Case target per index value (`entries[i]` = target for index `i`).
     pub entries: Vec<Rva>,
 }

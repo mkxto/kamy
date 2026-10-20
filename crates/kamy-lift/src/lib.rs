@@ -71,6 +71,11 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
     let mut reg_pins: std::collections::HashMap<ValueId, kamy_core::ir::PhysReg> =
         std::collections::HashMap::new();
     let mut unsupported = false;
+    // Rung blocks synthesized for recovered switch dispatches are appended after
+    // the CFG blocks; their pass-through SSA snapshots are collected here and
+    // pushed after the main loop so block_entry/block_exit stay index-aligned
+    // with block ids.
+    let mut ladder_entries: Vec<[ValueId; 38]> = Vec::new();
 
     let mut builder = IrBuilder::new(&mut ir_func, BlockId(0));
 
@@ -86,6 +91,11 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
             None => &[],
         };
         let ip = module.image_base + u64::from(bb.start.get());
+        let switch_table = match &bb.terminator {
+            Terminator::Switch { table } => Some(table.clone()),
+            _ => None,
+        };
+        let mut switch_index: Option<ValueId> = None;
 
         let mut last_cond: Option<ValueId> = None;
         let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
@@ -94,6 +104,16 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
             let insn = decoder.decode();
             if insn.is_invalid() {
                 break;
+            }
+            // A recovered switch dispatch lowers to a compare ladder, not a table
+            // load + indirect jmp. Capture the index before the table-load (which
+            // may reuse the index register) and stop; the terminator emits the
+            // ladder.
+            if let Some(tbl) = &switch_table {
+                if insn.ip() == module.image_base + u64::from(tbl.dispatch_rva.get()) {
+                    switch_index = Some(lift_state.get_gpr(tbl.index_reg));
+                    break;
+                }
             }
             let end_pos = decoder.position();
             let insn_bytes = &bytes[start_pos..end_pos];
@@ -136,7 +156,24 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
                     builder.set_terminator(IrTerminator::Unreachable);
                 }
             }
-            Terminator::Indirect { .. } | Terminator::Switch { .. } | Terminator::Unknown => {
+            Terminator::Switch { table } => {
+                let exit_snap = lift_state.snapshot();
+                let built = switch_index.is_some_and(|idx| {
+                    build_switch_ladder(
+                        &mut builder,
+                        block_id,
+                        idx,
+                        &table.entries,
+                        &rva_to_block,
+                        &exit_snap,
+                        &mut ladder_entries,
+                    )
+                });
+                if !built {
+                    builder.set_terminator(IrTerminator::Unreachable);
+                }
+            }
+            Terminator::Indirect { .. } | Terminator::Unknown => {
                 builder.set_terminator(IrTerminator::Unreachable);
             }
         }
@@ -147,6 +184,10 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
         // keys. Call-return and ret-value pins may occur in any block.
         reg_pins.extend(&lift_state.reg_pins);
         unsupported |= lift_state.unsupported;
+    }
+    for snap in &ladder_entries {
+        block_entry.push(*snap);
+        block_exit.push(*snap);
     }
     if ir_func
         .blocks
@@ -167,6 +208,64 @@ pub fn lift_function(module: &Module, func: &Function, cc: &dyn CallingConvLooku
         reg_pins,
         unsupported,
     }
+}
+
+/// Lower a recovered switch dispatch to a tableless compare ladder: each rung
+/// tests `index == k`, falling through (the *not-taken* edge) to `entries[k]`
+/// and continuing on the *taken* edge (`index != k`) to the next rung; the final
+/// rung's taken edge is `entries[last]` (the preceding bound check guarantees the
+/// index is in range, so no table survives). Making the next rung the taken edge
+/// keeps the rungs contiguous in the allocator's DFS block order, so the index's
+/// live range stays tight (it does not span the case blocks). Fresh rung blocks
+/// are appended; their pass-through snapshots go to `ladder_entries`. Returns
+/// false (reject) when a case target has no block.
+fn build_switch_ladder(
+    builder: &mut IrBuilder,
+    dispatch: BlockId,
+    idx: ValueId,
+    entries: &[kamy_core::Rva],
+    rva_to_block: &HashMap<u32, BlockId>,
+    exit_snap: &[ValueId; 38],
+    ladder_entries: &mut Vec<[ValueId; 38]>,
+) -> bool {
+    let targets = entries
+        .iter()
+        .map(|r| rva_to_block.get(&r.get()).copied())
+        .collect::<Option<Vec<BlockId>>>();
+    let Some(targets) = targets else {
+        return false;
+    };
+    let n = targets.len();
+    if n == 0 {
+        return false;
+    }
+    if n == 1 {
+        builder.switch_to(dispatch);
+        builder.set_terminator(IrTerminator::Jump(targets[0]));
+        return true;
+    }
+    let mut cur = dispatch;
+    for (k, &case) in targets.iter().enumerate().take(n - 1) {
+        builder.switch_to(cur);
+        let kval = builder.emit(IrOp::Const(k as u64), &[], IrType::I64);
+        let diff = builder.emit(IrOp::Sub, &[idx, kval], IrType::I64);
+        let eq = builder.emit(IrOp::IsZero, &[diff], IrType::I8);
+        let ne = builder.emit(IrOp::BoolNot, &[eq], IrType::I8);
+        let next = if k + 1 < n - 1 {
+            let nb = builder.new_block();
+            ladder_entries.push(*exit_snap);
+            nb
+        } else {
+            targets[n - 1]
+        };
+        builder.set_terminator(IrTerminator::Branch {
+            cond: ne,
+            taken: next,
+            not_taken: case,
+        });
+        cur = next;
+    }
+    true
 }
 
 fn dispatch(
@@ -814,6 +913,111 @@ mod tests {
         assert!(
             !ni.reads.is_empty() || !ni.writes.is_empty(),
             "NativeInline should have reads or writes populated"
+        );
+    }
+
+    #[test]
+    fn switch_lowers_to_tableless_compare_ladder() {
+        // Dispatch block @0x1000:
+        //   83 F9 02             cmp ecx, 2
+        //   48 8D 15 00 10 00 00 lea rdx,[rip+0x1000]   (dead; disp irrelevant)
+        //   48 63 0C 8A          movsxd rcx,[rdx+rcx*4]  <- dispatch_rva 0x100A
+        //   48 01 D1             add rcx, rdx
+        //   FF E1                jmp rcx
+        // case0 @0x1013: B8 0A 00 00 00 C3  mov eax,10; ret
+        // case1 @0x1019: B8 14 00 00 00 C3  mov eax,20; ret
+        // case2 @0x101F: B8 1E 00 00 00 C3  mov eax,30; ret
+        let code = vec![
+            0x83, 0xF9, 0x02, 0x48, 0x8D, 0x15, 0x00, 0x10, 0x00, 0x00, 0x48, 0x63, 0x0C, 0x8A,
+            0x48, 0x01, 0xD1, 0xFF, 0xE1, 0xB8, 0x0A, 0x00, 0x00, 0x00, 0xC3, 0xB8, 0x14, 0x00,
+            0x00, 0x00, 0xC3, 0xB8, 0x1E, 0x00, 0x00, 0x00, 0xC3,
+        ];
+        let rva = Rva::new(TEXT_RVA);
+        let section = Section {
+            name: ".text".into(),
+            rva,
+            virtual_size: code.len() as u32,
+            data: code,
+            flags: SectionFlags {
+                read: true,
+                write: false,
+                execute: true,
+            },
+        };
+        let c0 = Rva::new(TEXT_RVA + 0x13);
+        let c1 = Rva::new(TEXT_RVA + 0x19);
+        let c2 = Rva::new(TEXT_RVA + 0x1F);
+        let table = kamy_core::SwitchTable {
+            index_reg: Gpr::Rcx,
+            dispatch_rva: Rva::new(TEXT_RVA + 0x0A),
+            entries: vec![c0, c1, c2],
+        };
+        let case = |s: Rva, e: u32| BasicBlock {
+            start: s,
+            end: Rva::new(e),
+            successors: vec![],
+            terminator: Terminator::Return,
+        };
+        let func = Function {
+            entry: rva,
+            blocks: vec![
+                BasicBlock {
+                    start: rva,
+                    end: c0,
+                    successors: vec![c0, c1, c2],
+                    terminator: Terminator::Switch { table },
+                },
+                case(c0, TEXT_RVA + 0x19),
+                case(c1, TEXT_RVA + 0x1F),
+                case(c2, TEXT_RVA + 0x25),
+            ],
+        };
+        let module = Module {
+            image_base: BASE,
+            machine: Machine::X64,
+            entry_point: Some(rva),
+            sections: vec![section],
+            symbols: vec![],
+            relocations: vec![],
+            functions: vec![func.clone()],
+        };
+
+        let mut ir = lift_function(&module, &func, &Win64Default);
+        assert!(!ir.unsupported, "a recovered switch must lift");
+        assert!(
+            !ir.func
+                .blocks
+                .iter()
+                .any(|b| matches!(b.term, IrTerminator::Unreachable)),
+            "no unresolved control flow should remain"
+        );
+        // Dispatch block is the first ladder rung: a conditional branch, not an
+        // indirect/table jump.
+        assert!(matches!(
+            ir.func.blocks[0].term,
+            IrTerminator::Branch { .. }
+        ));
+        // Three cases → two equality rungs (idx==0, idx==1); the last falls
+        // through. One fresh rung block is appended past the 4 CFG blocks.
+        assert_eq!(ir.func.blocks.len(), 5);
+        assert_eq!(ir.block_entry.len(), ir.func.blocks.len());
+        assert_eq!(ir.block_exit.len(), ir.func.blocks.len());
+        let iszero = ir
+            .func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i.op, IrOp::IsZero))
+            .count();
+        assert!(iszero >= 2, "expected >=2 equality tests, got {iszero}");
+        // No table reference survives: the dispatch keeps no indirect jump.
+        construct_ssa(&mut ir);
+        assert!(
+            !ir.func
+                .blocks
+                .iter()
+                .any(|b| matches!(b.term, IrTerminator::Unreachable)),
+            "SSA construction must preserve the ladder"
         );
     }
 }
