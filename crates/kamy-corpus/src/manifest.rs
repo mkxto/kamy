@@ -42,6 +42,8 @@ pub struct Member {
     #[serde(default)]
     pub flags: Vec<String>,
     #[serde(default)]
+    pub link_flags: Vec<String>,
+    #[serde(default)]
     pub link_shim: bool,
     #[serde(default)]
     pub prebuilt: Option<String>,

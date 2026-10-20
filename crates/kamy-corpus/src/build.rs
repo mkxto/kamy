@@ -145,6 +145,7 @@ mod win {
         }
         parts.push(quote(source));
 
+        let mut link_args: Vec<String> = Vec::new();
         if member.kind == MemberKind::Dll {
             parts.push("/LD".to_string());
             parts.push(format!("/Fe:{}", out.display()));
@@ -154,10 +155,16 @@ mod win {
             parts.push(quote(&shim));
             parts.push(format!("/I{}", quote(&corpus_root.join("winshim"))));
             parts.push("/Fe:".to_string() + &out.display().to_string());
-            parts.push("/link".to_string());
-            parts.push("/SUBSYSTEM:CONSOLE".to_string());
+            link_args.push("/SUBSYSTEM:CONSOLE".to_string());
         } else {
             parts.push(format!("/Fe:{}", out.display()));
+        }
+        for lf in &member.link_flags {
+            link_args.push(lf.clone());
+        }
+        if !link_args.is_empty() {
+            parts.push("/link".to_string());
+            parts.extend(link_args);
         }
 
         let build_cmd = parts.join(" ");
