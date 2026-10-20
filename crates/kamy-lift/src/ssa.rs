@@ -75,7 +75,7 @@ pub fn construct_ssa(result: &mut LiftResult) {
                 let old = result.block_entry[bi][r];
                 let new = result.block_exit[pred_idx][r];
                 if old != new {
-                    resolve_entry(&mut result.func, bi, old, new);
+                    resolve_entry(&mut result.func, &mut result.reg_pins, bi, old, new);
                     propagate_exit(&mut result.block_exit[bi], old, new);
                 }
             }
@@ -89,7 +89,7 @@ pub fn construct_ssa(result: &mut LiftResult) {
 
                 if all_same {
                     if old != first_val {
-                        resolve_entry(&mut result.func, bi, old, first_val);
+                        resolve_entry(&mut result.func, &mut result.reg_pins, bi, old, first_val);
                         propagate_exit(&mut result.block_exit[bi], old, first_val);
                     }
                 } else {
@@ -106,7 +106,7 @@ pub fn construct_ssa(result: &mut LiftResult) {
                     });
                     // The back-edge arg may reference `old`; threading it here turns
                     // a loop-carried pass-through into a proper self-referential phi.
-                    resolve_entry(&mut result.func, bi, old, new_vid);
+                    resolve_entry(&mut result.func, &mut result.reg_pins, bi, old, new_vid);
                     propagate_exit(&mut result.block_exit[bi], old, new_vid);
                 }
             }
@@ -131,7 +131,25 @@ fn propagate_exit(exit: &mut [ValueId; 38], old: ValueId, new: ValueId) {
 /// lives in a *different* block, so its argument must be rewritten here too. Entry
 /// placeholders are unique per block/register, so a global phi-arg rewrite only
 /// touches genuine references (issue #24).
-fn resolve_entry(func: &mut IrFunction, bi: usize, old: ValueId, new: ValueId) {
+///
+/// A placeholder carries a `reg_pins` entry when a lift-time consumer required it
+/// in a fixed register — a call argument bound to its ABI register, or a
+/// NativeInline read. For a cross-block value that binding lives on the
+/// placeholder, not on the incoming definition, so transfer it to `new` or the
+/// pin is orphaned and the allocator is free to place the argument off its ABI
+/// register (issue #23: `FlsFree(dwTlsIndex)` received `-1`). Keep any pin `new`
+/// already has: a distinct required register for the same value is a real
+/// conflict the allocator resolves (reject), never silently overwritten.
+fn resolve_entry(
+    func: &mut IrFunction,
+    reg_pins: &mut std::collections::HashMap<ValueId, PhysReg>,
+    bi: usize,
+    old: ValueId,
+    new: ValueId,
+) {
+    if let Some(&p) = reg_pins.get(&old) {
+        reg_pins.entry(new).or_insert(p);
+    }
     replace_in_block(&mut func.blocks[bi], old, new);
     for (j, block) in func.blocks.iter_mut().enumerate() {
         if j == bi {
@@ -292,6 +310,84 @@ mod tests {
         let add_inst = &result.func.blocks[1].insts[1];
         assert_eq!(add_inst.args[0], add_result);
         assert_eq!(add_inst.args[1], add_result);
+    }
+
+    #[test]
+    fn cross_block_arg_pin_transfers_to_resolved_value() {
+        // A call argument pinned to its ABI register in block 1 names that block's
+        // RCX entry placeholder; SSA resolves the placeholder to the value defined
+        // in block 0. The pin must follow to the resolved value, or the allocator
+        // is free to place the argument off RCX (issue #23: FlsFree got -1).
+        let entry_gpr0 = ValueId(0);
+        let succ_entry_gpr0 = ValueId(1);
+        let add_result = ValueId(2);
+        let const5 = ValueId(3);
+
+        let mut block_entry_0 = [ValueId(100); 38];
+        block_entry_0[0] = entry_gpr0;
+        let mut block_exit_0 = block_entry_0;
+        block_exit_0[0] = add_result;
+        let mut block_entry_1 = [ValueId(200); 38];
+        block_entry_1[0] = succ_entry_gpr0;
+        let block_exit_1 = block_entry_1;
+
+        let blocks = vec![
+            IrBlock {
+                id: BlockId(0),
+                phis: vec![],
+                insts: vec![
+                    undef_inst(entry_gpr0, IrType::I64),
+                    Inst {
+                        dest: Some(const5),
+                        op: IrOp::Const(5),
+                        args: vec![],
+                        ty: IrType::I64,
+                    },
+                    Inst {
+                        dest: Some(add_result),
+                        op: IrOp::Add,
+                        args: vec![entry_gpr0, const5],
+                        ty: IrType::I64,
+                    },
+                ],
+                term: IrTerminator::Jump(BlockId(1)),
+            },
+            IrBlock {
+                id: BlockId(1),
+                phis: vec![],
+                insts: vec![Inst {
+                    dest: Some(ValueId(4)),
+                    op: IrOp::Call { target: 0x1000 },
+                    args: vec![succ_entry_gpr0],
+                    ty: IrType::I64,
+                }],
+                term: IrTerminator::Ret,
+            },
+        ];
+
+        let mut reg_pins = std::collections::HashMap::new();
+        reg_pins.insert(succ_entry_gpr0, PhysReg::Gpr(Gpr::Rcx));
+        let mut result = LiftResult {
+            func: IrFunction {
+                entry: BlockId(0),
+                blocks,
+                next_value: 5,
+            },
+            block_entry: vec![make_entry(&block_entry_0), make_entry(&block_entry_1)],
+            block_exit: vec![block_exit_0, block_exit_1],
+            rsp_chain: std::collections::HashSet::new(),
+            reg_pins,
+            unsupported: false,
+        };
+
+        construct_ssa(&mut result);
+
+        assert_eq!(result.func.blocks[1].insts[0].args[0], add_result);
+        assert_eq!(
+            result.reg_pins.get(&add_result),
+            Some(&PhysReg::Gpr(Gpr::Rcx)),
+            "the ABI-register pin must transfer to the resolved cross-block value"
+        );
     }
 
     #[test]
