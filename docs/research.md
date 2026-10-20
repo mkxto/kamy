@@ -461,22 +461,24 @@ bounds) and register-value analysis for masked forms.
    target.exe 30 → 19; switch fixture recovers 16/16 cases exactly. The `and`
    mask (layer 3) variant is handled by the same bound logic (count `2^k`), so
    no separate layer 3 pass is needed yet.
-   **Phase B — re-emit/retarget (DONE).** The linker re-emits each table into a
-   read-only `.kamytb` section placed before the moved code (new table VA known
-   pre-relocation) and retargets the dispatch operand — LLVM `lea`→new table VA,
-   MSVC `mov` disp→new table RVA — overriding `BlockEncoder`'s RIP fixup via
-   `set_memory_displacement64`. Entries are recomputed from an original→new
-   address map built from `BlockEncoder`'s returned instruction offsets (LLVM
-   signed i32 delta, MSVC image RVA); any unmapped target, rewritten
-   instruction, or i32 overflow keeps the function rejected (reject-on-ambiguity,
-   closing BLARE2's documented gap, §10.5 L458-461). Runtime-verified: `sw.prot`
-   exit 34, target round-trip `acc=0x97a61ac866cf61c7` exit 7; kernel32 MSVC form
-   (incl. one function with four tables) rebuilds with consistent `.pdata`.
-   `RecoverableSwitch` → 0, but `moved` rises only modestly (target 202→203,
-   kernel32 1274→1276, `sw` +2) because most recovered-switch functions carry
-   orthogonal **out-of-scope** blockers: SEH unwind (`SEHComplex`, D31), a
-   noreturn/data-in-code tail leaving an `Unknown` block (`LiftFailure`, the
-   §10.2 residual), or a genuine second register dispatch (`BadIndirectBranch`).
+   **Phase B — tableless compare ladder (DONE, replaces re-emit/retarget).**
+   Verbatim movement is banned, so a table-carrying body is not relocated as-is.
+   Instead the lifter expands `Terminator::Switch` into a compare ladder: each
+   rung tests `index == k`, falling through to `entries[k]` and continuing on the
+   taken edge to the next rung (so the allocator's DFS block order keeps the rungs
+   contiguous and the index's live range tight), with the final rung falling
+   through to `entries[last]` — the bound check guarantees the index is in range.
+   The dispatch tail (table load + indirect `jmp`) is dropped, so **no table
+   survives**; the function then SSA-lowers like any other (rejecting in place on
+   an orthogonal blocker). The bound search follows `mov index, src` register
+   copies, so a `cmp ecx,15` before `mov eax,ecx; …[rax*4]` is recognized. The
+   `.kamytb` section, table re-emission/retarget, and `RecoverableSwitch` are
+   removed. Runtime-verified: the `console_jtable` corpus member's 16-case `vm`
+   recovers, lowers to the ladder, and reproduces its accumulator over 20,000
+   iterations (`relocated` = 0 corpus-wide). This matches CodeDefender, which
+   likewise removes the table and lowers the switch to a compare ladder
+   (docs/code_defender.md §"Switch / jump-table handling"); the computed-`jmp`/pad
+   obfuscation on top is a separate Phase-4 transform.
 
 Dynamic vtable tail-calls remain honest rejections — protecting them is
 runtime-tier (Phase 7) territory, not static recovery.

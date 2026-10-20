@@ -142,7 +142,7 @@ Living document. Updated as work lands.
 | MutationEngine | Not started |
 | LoopEncodeSemantics | Not started (design settled: add/sub/and/xor as carry/bit-propagation loops — research.md §2.8) |
 | Per-function config profiles + symbol matching | Not started |
-| Jump table recovery & retargeting (D24) | Layers 0 + 2 (detect + **retarget**) done | Layer 0: `jmp [rip+slot]` classified at discovery; link skips import thunks, reports in-image static-ptr as `ResolvableIndirect`. Layer 2 detect: per-function use-def DAG + petgraph VF2 (research.md §10.5) recovers the table (bound-or-reject, in-range cross-check) and tags `Terminator::Switch`. **Phase B (retarget):** recovery materializes case bodies as blocks; the linker re-emits each table into a read-only `.kamytb` section and retargets the dispatch (LLVM `lea`→new table VA; MSVC `mov` disp→new table RVA), overriding `BlockEncoder`'s RIP fixup via an original→new address map from the encoder's instruction offsets. Runtime-verified: the `sw` fixture dispatch moves and `sw.prot` prints `acc=0xade56742d39ef7e2` (exit 34); target round-trip `acc=0x97a61ac866cf61c7` (exit 7); kernel32 MSVC form (incl. a 4-table function) rebuilds. `RecoverableSwitch`→0. Coverage rises modestly (target 202→203, kernel32 1274→1276, `sw` +2) because most recovered-switch functions carry orthogonal **out-of-scope** blockers — SEH unwind (`SEHComplex`, D31), noreturn/data-in-code tails (`LiftFailure`, §10.2 residual), or a genuine second register dispatch (`BadIndirectBranch`). |
+| Jump table recovery & lowering (D24) | Layers 0 + 2 (detect + **tableless ladder**) done | Layer 0: `jmp [rip+slot]` classified at discovery; link skips import thunks, reports in-image static-ptr as `ResolvableIndirect`. Layer 2 detect: per-function use-def DAG + petgraph VF2 (research.md §10.5) recovers the table (bound-or-reject following index copies, in-range cross-check) and tags `Terminator::Switch`. **Lowering:** the lifter expands the dispatch into a tableless compare ladder (`index==k → entries[k]`); the function SSA-lowers like any other and **no table survives** (matching CodeDefender). Verbatim table-retarget (`.kamytb`, `build_switch_body`, `RecoverableSwitch`) removed. Runtime-verified by `console_jtable`. |
 | Trampoline stub obfuscation (D29: flavor diversification + junk fill + direct-call re-pointing) | Not started |
 
 ## Phase 5 — Advanced Passes
@@ -192,6 +192,7 @@ verdict. Open tool, not a CI gate (D33).
 | console_eh | msvc (cl) | stdio | ❌ FAIL | 143 / 0 / 381 | 143/524 (27.3%) |
 | console_fibmix | rustc | stdio | ✅ PASS | 37 / 1 / 311 | 37/349 (10.6%) |
 | console_fp | msvc (cl) | stdio | ✅ PASS | 131 / 0 / 352 | 131/483 (27.1%) |
+| console_jtable | rustc | stdio | ✅ PASS | 38 / 0 / 311 | 38/349 (10.9%) |
 | console_seh | msvc (cl) | stdio | ✅ PASS | 132 / 0 / 348 | 132/480 (27.5%) |
 | console_sse | msvc (cl) | stdio | ✅ PASS | 130 / 0 / 348 | 130/478 (27.2%) |
 | console_sse_lto | msvc (cl) | stdio | ✅ PASS | 130 / 0 / 348 | 130/478 (27.2%) |
@@ -210,8 +211,8 @@ verdict. Open tool, not a CI gate (D33).
 | gui_msgbox | msvc (cl) | gui link-shim trace | ✅ PASS | 141 / 0 / 384 | 141/525 (26.9%) |
 | kernel32 (vendored) | prebuilt | loader | ✅ PASS | 285 / 2 / 1422 | 285/1709 (16.7%) |
 
-22 members: 12 console (rustc + msvc breadth — CFG, LTO, EH, SEH, scalar/packed
-SSE, switch, TLS, and an /O2–/O1–/Od opt spread), 8 pure-export DLLs (ABI, ADX,
+23 members: 13 console (rustc + msvc breadth — CFG, LTO, EH, SEH, scalar/packed
+SSE, switch, a jump-table ladder, TLS, and an /O2–/O1–/Od opt spread), 8 pure-export DLLs (ABI, ADX,
 BMI1/BMI2, atomics, inline asm, strutil), the gui link-shim, and vendored
 kernel32. The clang-cl members (`dll_adx`, `dll_asm`, `dll_bmi1`) carry GNU
 extended inline asm and explicit BMI/ADX opcodes; their `-mbmi`/`-mbmi2`/`-madx`
@@ -225,7 +226,7 @@ target features and per-member linker flags (`/guard:cf`, `/LTCG`) flow through
   pure exports (`MulDiv(6,7,3)=14`, `lstrlenW=5`, `kamy_fnv("abc")=440920331`).
 - Coverage = SSA-lowered / total; **relocated and rejected are both not-covered**.
   Verbatim relocation is banned — SSA failures are rejected in place. TOTAL
-  2815/10913 (25.8%). Rejections by reason, descending:
+  2853/11262 (25.3%). Rejections by reason, descending:
 
   | reason | count |
   |--------|-------|
@@ -243,9 +244,12 @@ target features and per-member linker flags (`/guard:cf`, `/LTCG`) flow through
   from the SEH-heavy console/dll members, then `LiftFailure`. `CallerFrameAccess`
   and `fs/gs` ship as sound conservative rejects (D22) → #15 and #26, both
   `known-limitation`.
-- **11/22 PASS** (`console_fibmix`, `kernel32`, `gui_msgbox`, and all eight plain
-  console members: `console_fp`, `console_seh`, `console_sse{,_lto,_minsize,_od}`,
-  `console_switch`, `console_tls`). Two SSA backend root causes fixed (#24):
+- **12/23 PASS** (`console_fibmix`, `console_jtable`, `kernel32`, `gui_msgbox`,
+  and all eight plain console members: `console_fp`, `console_seh`,
+  `console_sse{,_lto,_minsize,_od}`, `console_switch`, `console_tls`).
+  `console_jtable` is the recovered-switch runtime oracle — its 16-case `vm`
+  lowers to a tableless compare ladder (`relocated` = 0 corpus-wide). Two SSA
+  backend root causes fixed (#24):
   (a) SSA construction dropped the loop back-edge phi argument — the resolving
   body block rewrote only its own uses, leaving an already-created loop-header phi
   pointing at the body's `Undef` placeholder; resolution now threads the back-edge
@@ -289,7 +293,7 @@ target features and per-member linker flags (`/guard:cf`, `/LTCG`) flow through
 | kernel32.dll SSA round-trip (2588 functions) | ✅ Verified (static) | Rebuilds via SSA (362 lowered); re-parses as valid PE, exports preserved, exception table consistent (1608/1608 RUNTIME_FUNCTIONs). DLL — not executed. |
 | aftermathlabs/bintests corpus (D25) | Not adopted |
 | backengineering/bintests `misc/jtables` — jump-table corpus (research.md §10.5) | Not adopted |
-| Runnable corpus (#7): 22 members (console/gui/dll/kernel32) | 🔶 11/22 PASS | #24 fixed (SSA back-edge phi threading + linear-scan loop liveness), taking 2/22 → 11/22; all plain console members + gui_msgbox now PASS. Remaining 11 FAIL are two newly-surfaced miscompiles: DLL teardown garbage callback pointer (8 dll_*) and `/GS`/`/guard:cf` fast-fail (console_cfg/cfg_lto/eh). |
+| Runnable corpus (#7): 23 members (console/gui/dll/kernel32) | 🔶 12/23 PASS | #24 fixed (SSA back-edge phi threading + linear-scan loop liveness) took 2→11; recovered switches now lower to a tableless compare ladder (verbatim move removed, `relocated`=0) with `console_jtable` as the runtime oracle (12th PASS). Remaining 11 FAIL: DLL teardown garbage callback pointer (8 dll_*) and `/GS`/`/guard:cf` fast-fail (console_cfg/cfg_lto/eh). |
 
 ## Rejection rates
 
@@ -322,25 +326,25 @@ blocks** so a switch function relocates as one unit. `BadIndirectBranch` dropped
 (kernel32 9 → **6**, target.exe 30 → **19**). On the runnable fixture all 16
 cases recover exactly and `sw.prot` reproduces `acc=0xade56742d39ef7e2` (exit 34).
 
-**Phase B — retarget (landed).** The linker re-emits each recovered table into a
-read-only `.kamytb` section laid out *before* the moved code (so the new table
-VA is known pre-relocation) and redirects the dispatch operand — LLVM `lea` →
-new table VA, MSVC `mov` displacement → new table RVA — overriding
-`BlockEncoder`'s RIP auto-fixup. Entries are recomputed per form (LLVM signed
-i32 delta `new_target_va - new_table_va`; MSVC `new_target_rva`) from an
-original→new address map built out of `BlockEncoder`'s returned instruction
-offsets; any unmapped target, rewritten-instruction offset, or i32 overflow
-keeps the function rejected (`RecoverableSwitch`, reject-on-ambiguity, D24/§10.5).
-Runtime-verified: both round-trips reproduce their accumulators (`sw` exit 34,
-target `acc=0x97a61ac866cf61c7` exit 7); the kernel32 MSVC form (including a
-single function carrying four tables) rebuilds and re-parses with a consistent
-`.pdata` (not executed here — DLL).
+**Tableless compare-ladder lowering (supersedes Phase B retarget).** A recovered
+switch is no longer relocated verbatim with a rebuilt table — verbatim movement
+is banned, so moving a table-carrying body without lowering it violated that
+rule. Instead the lifter expands `Terminator::Switch` into a compare ladder:
+each rung tests `index == k` (falling through to `entries[k]`, continuing on the
+taken edge to the next rung so the DFS block order keeps rungs contiguous and the
+index's live range tight), the final rung falls through to `entries[last]`, and
+the dispatch tail (table load + indirect `jmp`) is dropped. **No table survives**
+in the output — matching CodeDefender (docs/code_defender.md §"Switch /
+jump-table handling"). The function then lowers through SSA like any other; if it
+carries an orthogonal blocker (SEH, register pressure) it rejects in place. The
+`.kamytb` section, `build_switch_body`, table re-emission/retarget, and
+`RejectionReason::RecoverableSwitch` are all **deleted** (clean cutover). The
+recovery also now follows `mov index, src` register copies when locating the
+index bound (`cmp ecx,15` before `mov eax,ecx; …[rax*4]`), so LLVM/rustc dense
+switches whose bound renames the index are recovered.
 
-`RecoverableSwitch` is now **0** on all three binaries, but `moved` rises only
-modestly (target 202 → **203**, kernel32 1274 → **1276**, `sw` +2 including the
-fixture dispatch). Only recovered-switch functions with no other blocker move;
-the rest reject under their *true* reason, each **out of scope for Phase B**: SEH
-unwind info (`SEHComplex`, needs D31 UNWIND reconstruction), a noreturn/
-data-in-code tail that leaves an `Unknown` block (`LiftFailure`, the §10.2
-local-noreturn residual), or a genuine second register dispatch
-(`BadIndirectBranch`). Lifting those is future work, not a retarget defect.
+Runtime-verified by `console_jtable` (new corpus member): a `#[inline(never)]`
+16-case `vm` switch recovers, lowers to the ladder (`regalloc` OK), and reproduces
+its accumulator over 20,000 iterations (`relocated` = 0 corpus-wide — verbatim
+movement is gone). The computed-`jmp`/pad obfuscation CodeDefender layers on top
+is a separate Phase-4 transform.
