@@ -166,39 +166,75 @@ verdict. Open tool, not a CI gate (D33).
 
 | Member | Toolchain | Oracle | verify | SSA / reloc / reject | coverage |
 |--------|-----------|--------|--------|----------------------|----------|
-| console_fibmix | rustc | stdio | ✅ PASS | 40 / 1 / 308 | 40/349 (11%) |
-| gui_msgbox | msvc (cl) | winapi link-shim trace | ❌ FAIL (SSA #24) | 145 / 0 / 380 | 145/525 (28%) |
-| dll_strutil | msvc (cl) | loader / pure exports | ❌ FAIL (SSA #24) | 115 / 0 / 247 | 115/362 (32%) |
-| kernel32 (vendored) | prebuilt | loader / pure exports | ✅ PASS | 295 / 2 / 1412 | 295/1709 (17%) |
+| console_cfg | msvc (cl) | stdio | ❌ FAIL | 151 / 0 / 377 | 151/528 (28.6%) |
+| console_cfg_lto | msvc (cl) | stdio | ❌ FAIL | 151 / 0 / 377 | 151/528 (28.6%) |
+| console_eh | msvc (cl) | stdio | ❌ FAIL | 147 / 0 / 377 | 147/524 (28.1%) |
+| console_fibmix | rustc | stdio | ✅ PASS | 40 / 1 / 308 | 40/349 (11.5%) |
+| console_fp | msvc (cl) | stdio | ❌ FAIL | 135 / 0 / 348 | 135/483 (28.0%) |
+| console_seh | msvc (cl) | stdio | ❌ FAIL | 136 / 0 / 344 | 136/480 (28.3%) |
+| console_sse | msvc (cl) | stdio | ❌ FAIL | 134 / 0 / 344 | 134/478 (28.0%) |
+| console_sse_lto | msvc (cl) | stdio | ❌ FAIL | 134 / 0 / 344 | 134/478 (28.0%) |
+| console_sse_minsize | msvc (cl) | stdio | ❌ FAIL | 134 / 0 / 344 | 134/478 (28.0%) |
+| console_sse_od | msvc (cl) | stdio | ❌ FAIL | 136 / 0 / 343 | 136/479 (28.4%) |
+| console_switch | msvc (cl) | stdio | ❌ FAIL | 134 / 0 / 344 | 134/478 (28.0%) |
+| console_tls | msvc (cl) | stdio | ❌ FAIL | 134 / 0 / 344 | 134/478 (28.0%) |
+| dll_abi | msvc (cl) | loader | ❌ FAIL | 116 / 0 / 248 | 116/364 (31.9%) |
+| dll_adx | clang-cl | loader | ❌ FAIL | 115 / 0 / 252 | 115/367 (31.3%) |
+| dll_asm | clang-cl | loader | ❌ FAIL | 115 / 0 / 252 | 115/367 (31.3%) |
+| dll_atomic | msvc (cl) | loader | ❌ FAIL | 112 / 0 / 250 | 112/362 (30.9%) |
+| dll_bmi1 | clang-cl | loader | ❌ FAIL | 118 / 0 / 252 | 118/370 (31.9%) |
+| dll_bmi2 | msvc (cl) | loader | ❌ FAIL | 116 / 0 / 247 | 116/363 (32.0%) |
+| dll_bmi2_minsize | msvc (cl) | loader | ❌ FAIL | 116 / 0 / 247 | 116/363 (32.0%) |
+| dll_strutil | msvc (cl) | loader | ❌ FAIL | 115 / 0 / 247 | 115/362 (31.8%) |
+| gui_msgbox | msvc (cl) | gui link-shim trace | ❌ FAIL | 145 / 0 / 380 | 145/525 (27.6%) |
+| kernel32 (vendored) | prebuilt | loader | ✅ PASS | 295 / 2 / 1412 | 295/1709 (17.3%) |
+
+22 members: 12 console (rustc + msvc breadth — CFG, LTO, EH, SEH, scalar/packed
+SSE, switch, TLS, and an /O2–/O1–/Od opt spread), 8 pure-export DLLs (ABI, ADX,
+BMI1/BMI2, atomics, inline asm, strutil), the gui link-shim, and vendored
+kernel32. The clang-cl members (`dll_adx`, `dll_asm`, `dll_bmi1`) carry GNU
+extended inline asm and explicit BMI/ADX opcodes; their `-mbmi`/`-mbmi2`/`-madx`
+target features and per-member linker flags (`/guard:cf`, `/LTCG`) flow through
+`meta.yml` (`flags`, `link_flags`).
 
 - gui trace comes from a build-time winapi link-shim (no DLL injection):
   `MessageBoxW|hello world`, `MessageBoxW|second`.
 - dll members run under a loader that maps a uniquely-named copy — defeating the
-  KnownDLLs short-circuit so kernel32's real bytes execute — and calls curated
+  KnownDLLs short-circuit so kernel32's real bytes execute — and call curated
   pure exports (`MulDiv(6,7,3)=14`, `lstrlenW=5`, `kamy_fnv("abc")=440920331`).
 - Coverage = SSA-lowered / total; **relocated and rejected are both not-covered**.
   Verbatim relocation is banned — SSA failures are rejected in place. TOTAL
-  595/2945 (20%); rejects dominated by `RegisterPressure` (1102), `SEHComplex`
-  (566), `UnsupportedInstruction` (279, now incl. the fs/gs reject below).
-  Coverage fell from the pre-#23 794 because the #23 correctness fixes reject
-  conservatively rather than miscompile — recovery tracked in #15 (caller-frame
-  → concrete-RSP/frame reconstruction) and #26 (fs/gs → NativeInline passthrough),
-  both labeled `known-limitation`.
-- **#23 backend fixes (2/4 → PASS).** The corpus caught five real SSA
-  miscompiles, now fixed: logical flag negation lowered as bitwise `not`
-  (every negated/compound branch always-taken); the /guard:cf tail-call
-  dispatch target dropped from RAX; RSP snapshots (`mov rbp,rsp`) aliased to the
-  RSP-chain pin and read post-`sub` RSP; caller-frame access under the shifted
-  push prologue; and fs/gs segment operands lowered as near-null `[disp]`. The
-  last two ship as sound conservative rejects (D22): `CallerFrameAccess` →
-  #15, `fs/gs` → #26. **kernel32** (was `0xC0000409`) and **console_fibmix**
-  now PASS; **gui_msgbox**/**dll_strutil** remain blocked on the SSA loop
-  back-edge threading bug (#24).
+  2929/10913 (26.8%). Rejections by reason, descending:
+
+  | reason | count |
+  |--------|-------|
+  | RegisterPressure | 4319 |
+  | SEHComplex | 1647 |
+  | LiftFailure | 791 |
+  | UnsupportedInstruction | 462 |
+  | CallerFrameAccess | 357 |
+  | BadIndirectBranch | 205 |
+  | ResolvableIndirect | 111 |
+  | NoThunkSpace | 83 |
+  | SelfRecursive | 5 |
+  | CodegenFailure | 1 |
+
+  `RegisterPressure` dominates (recovery tracked in #15), `SEHComplex` follows
+  from the SEH-heavy console/dll members, then `LiftFailure`. `CallerFrameAccess`
+  and `fs/gs` ship as sound conservative rejects (D22) → #15 and #26, both
+  `known-limitation`.
+- **2/22 PASS** (`console_fibmix`, `kernel32`). The two references stay green on
+  the #23 fixes (five SSA miscompiles: logical flag negation, the /guard:cf
+  tail-call target, RSP-chain aliasing, caller-frame access, fs/gs operands).
+  Every compiled msvc/clang-cl member FAILs; the leading known cause is the SSA
+  loop back-edge threading bug (#24), though the 20 failures are not yet
+  individually root-caused. The expanded set widens the signal across CFG, SEH,
+  SSE, TLS, atomics, and inline-asm shapes.
 - Negative-tested: a tampered golden makes `verify` exit non-zero and flag the
   diverging member (the oracle is not a tautology).
-- `corpus build` needs the toolchains (cl via `vcvars64.bat` / rustc; clang-cl
-  skipped when absent); `corpus verify` consumes the published originals +
-  goldens and needs no compiler (D34).
+- `corpus build`/`bless` need the toolchains (cl via `vcvars64.bat`, rustc, and
+  `clang-cl` on `PATH` for the asm/BMI/ADX members); `corpus verify` consumes the
+  published originals + goldens and needs no compiler (D34).
 - **Host note:** a protection engine's outputs are inherently AV-flagged. The
   corpus work dir must be excluded from real-time AV
   (`Add-MpPreference -ExclusionPath 'C:\dev\kamy-corpus'`) or Defender
@@ -214,7 +250,7 @@ verdict. Open tool, not a CI gate (D33).
 | kernel32.dll SSA round-trip (2588 functions) | ✅ Verified (static) | Rebuilds via SSA (362 lowered); re-parses as valid PE, exports preserved, exception table consistent (1608/1608 RUNTIME_FUNCTIONs). DLL — not executed. |
 | aftermathlabs/bintests corpus (D25) | Not adopted |
 | backengineering/bintests `misc/jtables` — jump-table corpus (research.md §10.5) | Not adopted |
-| Runnable corpus (#7): console/gui/dll/kernel32 | 🔶 2/4 PASS (console, kernel32) | #23 fixed 5 SSA miscompiles; gui/dll blocked on SSA back-edge threading (#24), coverage recovery (#25). |
+| Runnable corpus (#7): 22 members (console/gui/dll/kernel32) | 🔶 2/22 PASS (console_fibmix, kernel32) | Expanded to 22 (12 console, 8 dll, gui, kernel32); clang-cl asm/BMI/ADX members added. Compiled msvc/clang-cl members FAIL — leading cause SSA back-edge threading (#24); coverage recovery (#15/#25). |
 
 ## Rejection rates
 
