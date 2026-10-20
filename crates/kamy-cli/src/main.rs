@@ -95,6 +95,10 @@ enum Command {
         /// Feed this file to the target's stdin.
         #[arg(long)]
         stdin_file: Option<PathBuf>,
+        /// Require the target's stdout to match this file (trailing whitespace
+        /// ignored). Catches wrong-output miscompiles that still exit cleanly.
+        #[arg(long)]
+        expect_stdout: Option<PathBuf>,
         /// Per-run wall-clock limit in seconds.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
@@ -201,8 +205,15 @@ fn main() -> anyhow::Result<()> {
             input,
             expect_exit,
             stdin_file,
+            expect_stdout,
             timeout,
-        } => commands::bisect::run(&input, expect_exit, stdin_file.as_deref(), timeout),
+        } => commands::bisect::run(
+            &input,
+            expect_exit,
+            stdin_file.as_deref(),
+            expect_stdout.as_deref(),
+            timeout,
+        ),
         Command::ExplainReject { input, rva } => {
             commands::explain_reject::run(&input, rva.as_deref())
         }
