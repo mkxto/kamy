@@ -18,6 +18,7 @@ pub struct Options {
     pub code_section: String,
     pub pdata_section: String,
     pub xdata_section: String,
+    pub selector: Option<kamy_core::FunctionSelector>,
 }
 
 impl Default for Options {
@@ -26,6 +27,7 @@ impl Default for Options {
             code_section: ".kamy".into(),
             pdata_section: ".kamypd".into(),
             xdata_section: ".kamyxd".into(),
+            selector: None,
         }
     }
 }
@@ -34,6 +36,7 @@ pub struct Report {
     pub moved: Vec<Rva>,
     pub rejected: Vec<(Rva, RejectionReason)>,
     pub ssa_lowered: usize,
+    pub ssa_lowered_rvas: Vec<Rva>,
 }
 
 #[derive(Clone)]
@@ -81,6 +84,11 @@ pub fn protect_with_transforms(
         functions,
         opts,
         |module, func, base, new_rva| {
+            if let Some(sel) = opts.selector.as_ref() {
+                if !sel.allows(func.entry) {
+                    return Ok((Vec::new(), Err(Some(RejectionReason::Deselected))));
+                }
+            }
             let new_va = base + u64::from(new_rva);
             match ssa_body(module, func, cc, transform, base, new_va) {
                 Ok((body, shape)) => Ok((body, Ok(shape))),
@@ -370,6 +378,7 @@ fn protect_inner(
         moved: Vec::new(),
         rejected: Vec::new(),
         ssa_lowered: 0,
+        ssa_lowered_rvas: Vec::new(),
     };
     let mut code: Vec<u8> = Vec::new();
     let mut moved: Vec<Moved> = Vec::new();
@@ -400,7 +409,10 @@ fn protect_inner(
                 };
 
                 match &shape {
-                    Ok(_) => report.ssa_lowered += 1,
+                    Ok(_) => {
+                        report.ssa_lowered += 1;
+                        report.ssa_lowered_rvas.push(cand.entry);
+                    }
                     Err(Some(reason)) => {
                         report.rejected.push((cand.entry, *reason));
                         continue;
