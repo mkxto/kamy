@@ -1,4 +1,4 @@
 # Pins the runnable differential corpus (issue #7, decision D33).
 # `kamy corpus verify --corpus <checkout>` runs against this exact revision.
 url: https://github.com/mkxto/kamy-corpus.git
-rev: 3ab965e261ab04a32df79520236bea362523181d
+rev: d9bc70d9970d3e1988203acd3415b103bcb62197
