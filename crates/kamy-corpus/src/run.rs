@@ -1,8 +1,12 @@
 //! Observe a built binary and produce a [`BehaviorRecord`]; bless and verify.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Wall-clock cap for every observed child launch (same budget as the
+/// differential harness) so a hung or crashed target is torn down.
+const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 
 use anyhow::{Context as _, Result, bail};
 
@@ -54,8 +58,6 @@ type TracedRun = (Option<i32>, Vec<u8>, Vec<u8>, Vec<String>);
 
 /// Run a gui member with a per-run `KAMY_TRACE` sink and collect its lines.
 fn run_with_trace(bin: &Path, input: &[u8], member: &Member, run_idx: u32) -> Result<TracedRun> {
-    use std::io::Write as _;
-
     let trace_file = std::env::temp_dir().join(format!(
         "kamy-trace-{}-{}-{}.txt",
         member.name,
@@ -64,17 +66,17 @@ fn run_with_trace(bin: &Path, input: &[u8], member: &Member, run_idx: u32) -> Re
     ));
     let _ = std::fs::remove_file(&trace_file);
 
-    let mut child = Command::new(bin)
-        .env("KAMY_TRACE", &trace_file)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("running {}", bin.display()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input)?;
-    }
-    let output = child.wait_with_output()?;
+    let opts = kamy_run::RunOptions {
+        exe: bin.to_path_buf(),
+        stdin: input.to_vec(),
+        env: vec![(
+            "KAMY_TRACE".to_string(),
+            trace_file.to_string_lossy().into_owned(),
+        )],
+        timeout: RUN_TIMEOUT,
+        ..kamy_run::RunOptions::default()
+    };
+    let outcome = kamy_run::run(&opts).with_context(|| format!("running {}", bin.display()))?;
 
     let trace = match std::fs::read_to_string(&trace_file) {
         Ok(text) => text.lines().map(ToString::to_string).collect(),
@@ -82,7 +84,7 @@ fn run_with_trace(bin: &Path, input: &[u8], member: &Member, run_idx: u32) -> Re
     };
     let _ = std::fs::remove_file(&trace_file);
 
-    Ok((output.status.code(), output.stdout, output.stderr, trace))
+    Ok((outcome.exit_code, outcome.stdout, outcome.stderr, trace))
 }
 
 fn observe_dll(member: &Member, bin: &Path) -> Result<BehaviorRecord> {
@@ -93,21 +95,24 @@ fn observe_dll(member: &Member, bin: &Path) -> Result<BehaviorRecord> {
 
     let mut results = Vec::with_capacity(member.exports.len());
     for export in &member.exports {
-        let mut cmd = Command::new(&loader);
-        cmd.arg(&dll).arg(&export.name).arg(&export.ret);
-        for a in &export.args {
-            cmd.arg(a);
-        }
-        let output = cmd
-            .output()
-            .with_context(|| format!("spawning loader for {}", export.name))?;
-        let ret = if output.status.success() {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        let mut args = vec![
+            dll.to_string_lossy().into_owned(),
+            export.name.clone(),
+            export.ret.clone(),
+        ];
+        args.extend(export.args.iter().cloned());
+        let opts = kamy_run::RunOptions {
+            exe: loader.clone(),
+            args,
+            timeout: RUN_TIMEOUT,
+            ..kamy_run::RunOptions::default()
+        };
+        let outcome =
+            kamy_run::run(&opts).with_context(|| format!("spawning loader for {}", export.name))?;
+        let ret = if outcome.exit_code == Some(0) {
+            String::from_utf8_lossy(&outcome.stdout).trim().to_string()
         } else {
-            format!(
-                "<loader-failed exit {}>",
-                output.status.code().unwrap_or(-1)
-            )
+            format!("<loader-failed exit {}>", outcome.exit_code.unwrap_or(-1))
         };
         results.push(DllResult {
             call: format!("{}({})", export.name, export.args.join(",")),
@@ -170,6 +175,7 @@ pub fn verify_member(
     root: &Path,
     seed: u64,
     protect: &dyn Fn(&Path, &Path) -> Result<Coverage>,
+    keep: bool,
 ) -> Result<(Vec<String>, Coverage)> {
     let original = build_member(member, root, false)?
         .with_context(|| format!("member {} has no original binary", member.name))?;
@@ -199,9 +205,52 @@ pub fn verify_member(
         .with_context(|| format!("protecting member {}", member.name))?;
 
     let observed = observe(member, &protected, seed)?;
-    let _ = std::fs::remove_file(&protected);
+    if keep {
+        tracing::info!(path = %protected.display(), "kept protected artifact");
+    } else {
+        let _ = std::fs::remove_file(&protected);
+    }
 
     Ok((crate::record::diff(&expected, &observed), coverage))
+}
+
+/// Oracle/ABI self-check for one member on its UNPROTECTED original: observe it
+/// twice to assert determinism, then diff the observation against its golden to
+/// assert the oracle reproduces its own baseline (catches ABI/oracle bugs such
+/// as a dropped call argument). Never protects the binary. Returns
+/// `(ok, messages)` where `ok` means every check passed.
+pub fn doctor_member(member: &Member, root: &Path, seed: u64) -> Result<(bool, Vec<String>)> {
+    let mut messages = Vec::new();
+
+    let bin = match build_member(member, root, false)? {
+        Some(bin) => bin,
+        None => {
+            messages.push(format!("member {} could not be built", member.name));
+            return Ok((false, messages));
+        }
+    };
+
+    let first = observe(member, &bin, seed)?;
+    let second = observe(member, &bin, seed)?;
+    if first != second {
+        messages.push("non-deterministic: observations diverge across identical runs".to_string());
+    }
+
+    let expected_path = member.expected_path();
+    if expected_path.is_file() {
+        let expected = BehaviorRecord::load(&expected_path)?;
+        let golden_diff = crate::record::diff(&expected, &first);
+        if !golden_diff.is_empty() {
+            messages.push(
+                "oracle does not reproduce its golden on the unprotected original".to_string(),
+            );
+            messages.extend(golden_diff);
+        }
+    } else {
+        messages.push("unblessed: no golden record to check against".to_string());
+    }
+
+    Ok((messages.is_empty(), messages))
 }
 
 fn provenance() -> Provenance {

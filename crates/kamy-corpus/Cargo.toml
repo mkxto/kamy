@@ -19,3 +19,4 @@ serde.workspace = true
 serde_norway.workspace = true
 tracing.workspace = true
 kamy-verify.workspace = true
+kamy-run.workspace = true

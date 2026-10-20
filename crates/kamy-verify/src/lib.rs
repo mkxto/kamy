@@ -1,10 +1,15 @@
 //! Test-vector equivalence and differential self-test harness.
 
-use anyhow::Context as _;
+use anyhow::{Context as _, Result};
 
-use std::io::Write as _;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use kamy_run::{RunOptions, run};
+
+/// Wall-clock cap applied to every corpus/differential launch so a hung or
+/// crashed target is killed instead of stalling the harness.
+const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Aggregate result of a differential run between two binaries.
 pub struct DiffReport {
@@ -49,24 +54,17 @@ impl SplitMix64 {
 }
 
 /// Spawn `binary`, feed `input` on stdin, wait, and capture observable output.
-/// Returns `(exit_code, stdout, stderr)`; `exit` is `None` on signal.
-pub fn run_capture(
-    binary: &Path,
-    input: &[u8],
-) -> std::io::Result<(Option<i32>, Vec<u8>, Vec<u8>)> {
-    let mut child = Command::new(binary)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    // Write before reading: feed the whole payload then drop stdin to signal EOF.
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input)?;
-    }
-
-    let output = child.wait_with_output()?;
-    Ok((output.status.code(), output.stdout, output.stderr))
+/// Returns `(exit_code, stdout, stderr)`; `exit` is `None` on signal. Routed
+/// through [`kamy_run::run`] for hang-kill and WER-popup suppression.
+pub fn run_capture(binary: &Path, input: &[u8]) -> Result<(Option<i32>, Vec<u8>, Vec<u8>)> {
+    let opts = RunOptions {
+        exe: binary.to_path_buf(),
+        stdin: input.to_vec(),
+        timeout: RUN_TIMEOUT,
+        ..RunOptions::default()
+    };
+    let outcome = run(&opts).with_context(|| format!("running {}", binary.display()))?;
+    Ok((outcome.exit_code, outcome.stdout, outcome.stderr))
 }
 
 /// Deterministic stdin payload for run index `run` under `seed`. Run 0 is empty;

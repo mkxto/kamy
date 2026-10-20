@@ -1,23 +1,15 @@
 //! `kamy` command-line entry point.
 //!
-//! Thin consumer of the engine library crates (grilling D15). `analyze`,
-//! `protect --no-transform`, and `verify` run today; transform-driven
-//! `protect` awaits Phase 3.
+//! Thin dispatcher: the clap surface lives here, every handler lives in
+//! [`commands`]. Each subcommand maps to a `commands::<name>::run` call.
 
-use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+mod commands;
 
-use anyhow::Context;
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
-use kamy_config::Config;
-use kamy_corpus::Coverage;
-use kamy_disasm::discover_functions;
-use kamy_pe::PeFile;
 
-/// IR-level transform applied per function at a given D28 intensity (1.0 = full,
-/// 0.0 = no-op); the linker walks a reduced-intensity ladder on register
-/// pressure.
-type TransformFn = dyn FnMut(&mut kamy_core::ir::IrFunction, f32);
+use commands::dump::StageArg;
 
 #[derive(Parser)]
 #[command(name = "kamy", version, about = "Binary-to-binary protection engine")]
@@ -72,6 +64,48 @@ enum Command {
         /// (round-trip validation path).
         #[arg(long)]
         no_transform: bool,
+        /// Protect through the SSA backend with an identity transform.
+        #[arg(long)]
+        ssa_identity: bool,
+        /// SSA-lower ONLY these function RVAs (hex, comma-separated).
+        #[arg(long)]
+        only_rva: Option<String>,
+        /// SSA-lower every function EXCEPT these RVAs (hex, comma-separated).
+        #[arg(long)]
+        reject_rva: Option<String>,
+    },
+    /// Dump a single function's IR at a chosen pipeline stage.
+    Dump {
+        /// Input PE.
+        input: PathBuf,
+        /// Entry RVA of the function to dump (hex).
+        #[arg(long)]
+        rva: String,
+        /// Pipeline stage to run up to.
+        #[arg(long, value_enum, default_value_t = StageArg::Optimize)]
+        stage: StageArg,
+    },
+    /// Delta-debug an SSA-lowering regression down to a minimal culprit set.
+    Bisect {
+        /// Input PE.
+        input: PathBuf,
+        /// Exit code a passing run must return.
+        #[arg(long)]
+        expect_exit: i32,
+        /// Feed this file to the target's stdin.
+        #[arg(long)]
+        stdin_file: Option<PathBuf>,
+        /// Per-run wall-clock limit in seconds.
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
+    /// Explain why functions were rejected by the SSA-identity protect.
+    ExplainReject {
+        /// Input PE.
+        input: PathBuf,
+        /// Report only this function's status (hex RVA).
+        #[arg(long)]
+        rva: Option<String>,
     },
     /// Test-vector equivalence check between two binaries.
     Verify {
@@ -85,7 +119,7 @@ enum Command {
         #[arg(long, default_value_t = 1000)]
         vectors: u32,
     },
-    /// Differential corpus tooling (build/bless/verify/list).
+    /// Differential corpus tooling (build/bless/verify/list/doctor).
     Corpus {
         #[command(subcommand)]
         cmd: CorpusCmd,
@@ -108,9 +142,26 @@ enum CorpusCmd {
     Verify {
         #[arg(long)]
         corpus: Option<PathBuf>,
+        /// Verify only the named member.
+        #[arg(long)]
+        member: Option<String>,
+        /// Keep protected artifacts on disk.
+        #[arg(long)]
+        keep: bool,
+        /// Compare coverage against this baseline and print the delta.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// Save the resulting coverage as a baseline here.
+        #[arg(long)]
+        write_baseline: Option<PathBuf>,
     },
     /// List corpus members and their oracle kinds.
     List {
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+    },
+    /// Oracle/ABI self-check across the corpus originals (nothing is protected).
+    Doctor {
         #[arg(long)]
         corpus: Option<PathBuf>,
     },
@@ -126,316 +177,40 @@ fn main() -> anyhow::Result<()> {
         ansi: None,
     })?;
     match cli.command {
-        Command::Analyze { input, output, .. } => analyze(&input, output.as_deref()),
+        Command::Analyze { input, output, .. } => commands::analyze::run(&input, output.as_deref()),
         Command::Protect {
             input,
             profile,
             output,
             no_transform,
+            ssa_identity,
+            only_rva,
+            reject_rva,
             ..
-        } => {
-            if no_transform {
-                return protect_identity(&input, &output);
-            }
-            let profile = profile
-                .ok_or_else(|| anyhow::anyhow!("protect requires --profile (or --no-transform)"))?;
-            protect_with_profile(&input, &output, &profile)
+        } => commands::protect::run(commands::protect::Args {
+            input,
+            profile,
+            output,
+            no_transform,
+            ssa_identity,
+            only_rva,
+            reject_rva,
+        }),
+        Command::Dump { input, rva, stage } => commands::dump::run(&input, &rva, stage),
+        Command::Bisect {
+            input,
+            expect_exit,
+            stdin_file,
+            timeout,
+        } => commands::bisect::run(&input, expect_exit, stdin_file.as_deref(), timeout),
+        Command::ExplainReject { input, rva } => {
+            commands::explain_reject::run(&input, rva.as_deref())
         }
         Command::Verify {
             original,
             protected,
             vectors,
-        } => verify(&original, &protected, vectors),
-        Command::Corpus { cmd } => corpus(cmd),
+        } => commands::verify::run(&original, &protected, vectors),
+        Command::Corpus { cmd } => commands::corpus::dispatch(cmd),
     }
-}
-
-fn corpus(cmd: CorpusCmd) -> anyhow::Result<()> {
-    match cmd {
-        CorpusCmd::Build { corpus } => kamy_corpus::build_corpus(&corpus_dir(corpus)?),
-        CorpusCmd::Bless { corpus } => kamy_corpus::bless_corpus(&corpus_dir(corpus)?),
-        CorpusCmd::Verify { corpus } => verify_corpus_cmd(&corpus_dir(corpus)?),
-        CorpusCmd::List { corpus } => kamy_corpus::list_corpus(&corpus_dir(corpus)?),
-    }
-}
-
-/// Run the differential corpus verification and surface both axes: per-member
-/// PASS/FAIL plus the SSA lift/lower coverage table and corpus totals. The
-/// command still errors if any member diverges, after coverage is printed.
-fn verify_corpus_cmd(dir: &Path) -> anyhow::Result<()> {
-    let cov = kamy_corpus::verify_corpus(dir, &|inp, outp| protect_ssa_identity(inp, outp))?;
-    print_coverage(&cov);
-    if cov.failed > 0 {
-        anyhow::bail!("{} member(s) failed verification", cov.failed);
-    }
-    Ok(())
-}
-
-/// Print the two-axis corpus report: per-member PASS/FAIL, SSA-lowered vs
-/// not-covered (relocated + rejected) with a coverage percent, the corpus
-/// TOTAL, and the merged rejection reasons sorted by count descending.
-fn print_coverage(cov: &kamy_corpus::CorpusCoverage) {
-    println!();
-    println!(
-        "coverage  {:<24} {:<7}  {:>11} {:>9} {:>8}  coverage",
-        "name", "verdict", "SSA-lowered", "relocated", "rejected"
-    );
-    let row = |name: &str, verdict: &str, c: &kamy_corpus::Coverage| {
-        let total = c.ssa_lowered + c.relocated + c.rejected;
-        let pct = if total > 0 {
-            100.0 * c.ssa_lowered as f64 / total as f64
-        } else {
-            0.0
-        };
-        println!(
-            "          {name:<24} {verdict:<7}  {:>11} {:>9} {:>8}  {}/{total} ({pct:.1}%)",
-            c.ssa_lowered, c.relocated, c.rejected, c.ssa_lowered
-        );
-    };
-    for m in &cov.members {
-        row(&m.name, if m.passed { "PASS" } else { "FAIL" }, &m.coverage);
-    }
-    row("TOTAL", "", &cov.total);
-    println!("not covered = relocated + rejected; verbatim relocation is not SSA coverage.");
-    let t = &cov.total;
-    if !t.by_reason.is_empty() {
-        let mut reasons: Vec<_> = t.by_reason.iter().collect();
-        reasons.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-        println!("rejections by reason:");
-        for (reason, count) in reasons {
-            println!("          {reason:<24} {count}");
-        }
-    }
-    println!(
-        "members={} passed={} failed={}",
-        cov.members.len(),
-        cov.passed,
-        cov.failed,
-    );
-}
-
-/// Resolve the corpus directory from `--corpus` or `KAMY_CORPUS_DIR`.
-fn corpus_dir(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    if let Some(dir) = explicit {
-        return Ok(dir);
-    }
-    std::env::var_os("KAMY_CORPUS_DIR")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("corpus dir required: pass --corpus or set KAMY_CORPUS_DIR"))
-}
-
-/// Fixed seed so the differential harness is reproducible across invocations.
-const VERIFY_SEED: u64 = 0xC0FF_EE15_D31B_A5E5;
-
-fn verify(original: &Path, protected: &Path, vectors: u32) -> anyhow::Result<()> {
-    let report = kamy_verify::differential(original, protected, vectors, VERIFY_SEED)
-        .context("running differential self-test")?;
-
-    if report.passed() {
-        println!("verify PASS: {} run(s), no mismatches", report.runs);
-        return Ok(());
-    }
-
-    tracing::error!(
-        runs = report.runs,
-        mismatches = report.mismatches.len(),
-        "verify failed"
-    );
-    for m in report.mismatches.iter().take(5) {
-        tracing::warn!(
-            run = m.run,
-            field = %m.field,
-            original = %m.original,
-            protected = %m.protected,
-            "mismatch"
-        );
-    }
-    anyhow::bail!("verify failed: protected binary diverges from original");
-}
-
-fn analyze(input: &Path, output: Option<&Path>) -> anyhow::Result<()> {
-    let bytes = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
-    let pe = PeFile::parse(&bytes).with_context(|| format!("parsing {}", input.display()))?;
-
-    let module = pe.to_module();
-    let seeds = pe.seeds();
-    let functions = discover_functions(&module, &seeds);
-    let blocks: usize = functions.iter().map(|f| f.blocks.len()).sum();
-
-    let entry = module
-        .entry_point
-        .map_or_else(|| "<none>".to_string(), |rva| rva.to_string());
-
-    let mut report = String::new();
-    writeln!(report, "image base    {:#x}", module.image_base)?;
-    writeln!(report, "entry point   {entry}")?;
-    writeln!(report, "sections      {}", module.sections.len())?;
-    writeln!(report, "symbols       {}", module.symbols.len())?;
-    writeln!(report, "relocations   {}", module.relocations.len())?;
-    writeln!(report, "discovery seeds {}", seeds.len())?;
-    writeln!(report, "functions     {}", functions.len())?;
-    writeln!(report, "basic blocks  {blocks}")?;
-
-    match output {
-        Some(path) => std::fs::write(path, report)
-            .with_context(|| format!("writing report {}", path.display()))?,
-        None => print!("{report}"),
-    }
-    Ok(())
-}
-
-/// Relocation-only protect (`protect --no-transform`, Phase 1): every function is
-/// relocated verbatim, so `ssa_lowered` is always 0. The corpus uses
-/// [`protect_ssa_identity`] instead, which runs the SSA backend.
-fn protect_pipeline(input: &Path, output: &Path) -> anyhow::Result<Coverage> {
-    let bytes = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
-    let pe = PeFile::parse(&bytes).with_context(|| format!("parsing {}", input.display()))?;
-
-    let mut module = pe.to_module();
-    let seeds = pe.seeds();
-    module.functions = discover_functions(&module, &seeds);
-
-    let (image, report) = kamy_link::protect(
-        &pe,
-        &module,
-        &module.functions,
-        &kamy_link::Options::default(),
-    )?;
-    std::fs::write(output, &image).with_context(|| format!("writing {}", output.display()))?;
-
-    let mut by_reason: std::collections::BTreeMap<String, usize> = Default::default();
-    for (_, reason) in &report.rejected {
-        *by_reason.entry(reason.tag().to_string()).or_default() += 1;
-    }
-    Ok(Coverage {
-        ssa_lowered: report.ssa_lowered,
-        relocated: report.moved.len().saturating_sub(report.ssa_lowered),
-        rejected: report.rejected.len(),
-        by_reason,
-    })
-}
-
-/// Protect through the SSA backend with an identity transform: lift → SSA →
-/// optimize → regalloc → isel → encode, applying no obfuscation. A verbatim
-/// relocation cannot miscompile, so the corpus drives this path to actually
-/// exercise the backend; `ssa_lowered` then reflects real coverage.
-fn protect_ssa_identity(input: &Path, output: &Path) -> anyhow::Result<Coverage> {
-    let bytes = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
-    let pe = PeFile::parse(&bytes).with_context(|| format!("parsing {}", input.display()))?;
-
-    let mut module = pe.to_module();
-    let seeds = pe.seeds();
-    module.functions = discover_functions(&module, &seeds);
-
-    let cc = kamy_core::ir::Win64Default;
-    let mut identity = |_: &mut kamy_core::ir::IrFunction, _: f32| {};
-    let (image, report) = kamy_link::protect_with_transforms(
-        &pe,
-        &module,
-        &module.functions,
-        &kamy_link::Options::default(),
-        &cc,
-        &mut identity,
-    )?;
-    std::fs::write(output, &image).with_context(|| format!("writing {}", output.display()))?;
-
-    let mut by_reason: std::collections::BTreeMap<String, usize> = Default::default();
-    for (_, reason) in &report.rejected {
-        *by_reason.entry(reason.tag().to_string()).or_default() += 1;
-    }
-    Ok(Coverage {
-        ssa_lowered: report.ssa_lowered,
-        relocated: report.moved.len().saturating_sub(report.ssa_lowered),
-        rejected: report.rejected.len(),
-        by_reason,
-    })
-}
-
-fn protect_identity(input: &Path, output: &Path) -> anyhow::Result<()> {
-    let cov = protect_pipeline(input, output)?;
-    tracing::info!(
-        ssa_lowered = cov.ssa_lowered,
-        rejected = cov.rejected,
-        relocated = cov.relocated,
-        "protection complete"
-    );
-    for (reason, count) in &cov.by_reason {
-        tracing::info!(reason = %reason, count, "reject summary");
-    }
-    Ok(())
-}
-
-fn protect_with_profile(input: &Path, output: &Path, profile_path: &Path) -> anyhow::Result<()> {
-    let cfg = Config::from_path(profile_path)
-        .with_context(|| format!("loading profile {}", profile_path.display()))?;
-
-    let bytes = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
-    let pe = PeFile::parse(&bytes).with_context(|| format!("parsing {}", input.display()))?;
-
-    let mut module = pe.to_module();
-    let seeds = pe.seeds();
-    module.functions = discover_functions(&module, &seeds);
-
-    let mut mba_pass: Option<kamy_transforms::MbaPass> = None;
-    for profile in &cfg.profiles {
-        for pass in &profile.passes {
-            if let kamy_config::Pass::MixedBooleanArithmetic(sp) = pass {
-                mba_pass = Some(kamy_transforms::MbaPass {
-                    config: kamy_transforms::mba::MbaConfig {
-                        iterations: sp.iterations,
-                        probability: sp.probability,
-                        semantics: kamy_transforms::mba::MbaSemantics {
-                            add: sp.semantics.add,
-                            sub: sp.semantics.sub,
-                            xor: sp.semantics.xor,
-                        },
-                        bitwidths: kamy_transforms::mba::MbaBitwidths {
-                            bit8: sp.bitwidths.bit8,
-                            bit16: sp.bitwidths.bit16,
-                            bit32: sp.bitwidths.bit32,
-                            bit64: sp.bitwidths.bit64,
-                        },
-                    },
-                    seed: 42,
-                });
-            }
-        }
-    }
-
-    let cc = kamy_core::ir::Win64Default;
-    let mut transform_fn: Box<TransformFn> = if let Some(mba) = mba_pass {
-        Box::new(
-            move |func: &mut kamy_core::ir::IrFunction, intensity: f32| {
-                mba.run_with_intensity(func, intensity);
-            },
-        )
-    } else {
-        Box::new(|_: &mut kamy_core::ir::IrFunction, _: f32| {})
-    };
-
-    let (image, report) = kamy_link::protect_with_transforms(
-        &pe,
-        &module,
-        &module.functions,
-        &kamy_link::Options::default(),
-        &cc,
-        &mut *transform_fn,
-    )?;
-
-    std::fs::write(output, &image).with_context(|| format!("writing {}", output.display()))?;
-
-    let mut by_reason: std::collections::BTreeMap<&'static str, usize> = Default::default();
-    for (_, reason) in &report.rejected {
-        *by_reason.entry(reason.tag()).or_default() += 1;
-    }
-    tracing::info!(
-        ssa_lowered = report.ssa_lowered,
-        rejected = report.rejected.len(),
-        relocated = report.moved.len(),
-        "protection complete"
-    );
-    for (reason, count) in by_reason {
-        tracing::info!(reason = %reason, count, "reject summary");
-    }
-    Ok(())
 }
