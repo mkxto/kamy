@@ -40,7 +40,7 @@ corpus verify  ─▶  bisect  ─▶  dump --stage regalloc  ─▶  x64dbg (de
 |---|---|
 | `kamy corpus verify [--member N] [--keep] [--baseline F] [--write-baseline F]` | run the differential corpus; `--keep` retains the protected artifact |
 | `kamy corpus doctor` | assert each oracle reproduces its golden on the *unprotected* original — run this first if an oracle looks wrong (catches ABI/call-shim bugs) |
-| `kamy bisect <bin> --expect-exit <n> [--stdin-file F] [--timeout S]` | isolate the miscompiling function set |
+| `kamy bisect <bin> --expect-exit <n> [--expect-stdout F] [--stdin-file F] [--timeout S]` | isolate the culprit set; a crash (any fatal exception) counts as fail, `--expect-stdout` also catches wrong-output/same-exit |
 | `kamy dump <in> --rva <hex> [--stage lift\|ssa\|optimize\|regalloc]` | one function's IR + allocation |
 | `kamy explain-reject <in> [--rva <hex>]` | why a function was left unlowered; per-function reason (not aggregate) |
 | `kamy protect <in> -o <out> --ssa-identity [--only-rva H,..] [--reject-rva H,..]` | SSA-identity protect; the rva flags force lowering on/off per function |
@@ -51,13 +51,16 @@ corpus verify  ─▶  bisect  ─▶  dump --stage regalloc  ─▶  x64dbg (de
   deselected functions (`--only-rva`/`--reject-rva`) are rejected **in place**,
   byte-identical, never relocated. If a tool ever relocates verbatim, that is a
   bug — stop and report, do not paper over it.
-- **`bisect` needs a real pass/fail signal:** the original's exit code
-  (`--expect-exit`). If the all-lowered build already passes, bisect correctly
-  reports "nothing to bisect" — the binary has no miscompile.
+- **`bisect` oracle:** the original's exit code (`--expect-exit`); a crash (AV,
+  stack overflow, any fatal exception) is an unexpected exit and counts as fail.
+  Add `--expect-stdout <file>` to also catch wrong-output miscompiles that exit
+  cleanly. If the all-lowered build already passes, bisect reports "nothing to
+  bisect" — no miscompile.
 - **Corpus tools need the checkout:** pass `--corpus <dir>` or set
   `KAMY_CORPUS_DIR`. `console_cfg`/`console_cfg_lto` are the known-FAIL members.
 - **Runner is headless by construction:** every launch goes through `kamy-run`
   (job-object, WER-popup suppressed, hang-killed) — no WER dialogs, no orphaned
-  children, safe to run in bulk and in parallel.
+  children, safe in bulk and in parallel. On a crash it reports the faulting RVA
+  + NTSTATUS for any unhandled exception, not just access violations.
 
 Full command surface and flags: `docs/tooling.md`. Decision context: `docs/grilling.md` (D22).

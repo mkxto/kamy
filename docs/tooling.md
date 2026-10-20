@@ -32,13 +32,16 @@ stage where miscompiles usually surface.
 kamy dump app.exe --rva 0x1860 --stage regalloc
 ```
 
-### `kamy bisect <input> --expect-exit <int> [--stdin-file <path>] [--timeout <secs>]`
+### `kamy bisect <input> --expect-exit <int> [--expect-stdout <path>] [--stdin-file <path>] [--timeout <secs>]`
 
 Binary-search the set of protected functions to the minimal culprit set whose
-protection changes the program's observed exit code. Each probe protects a
-candidate subset, runs the result headless, and compares against
-`--expect-exit`. `--stdin-file` feeds the run's stdin; `--timeout` defaults to
-30 seconds. Reports the culprit RVAs, candidate count, and step count.
+protection makes the program diverge. Each probe protects a candidate subset,
+runs it headless, and checks the observed exit code against `--expect-exit`; a
+crash counts as divergence (any unhandled exception terminates with its NTSTATUS
+as the exit code). Add `--expect-stdout <file>` to also require matching output
+(trailing whitespace ignored), which catches wrong-output miscompiles that still
+exit cleanly. `--stdin-file` feeds the run's stdin; `--timeout` defaults to 30
+seconds. Reports the culprit RVAs, candidate count, and step count.
 
 ```sh
 kamy bisect app.exe --expect-exit 0 --stdin-file input.bin --timeout 30
@@ -96,8 +99,9 @@ corpus verify  →  bisect  →  dump --stage regalloc  →  x64dbg (deep-dive o
 ## Crates
 
 - `kamy-run` — headless job-object runner. Launches the protected binary with
-  WER suppressed, kills it on hang, and reports the exit code plus the faulting
-  RVA (resolved from image base) on a crash.
+  WER suppressed, kills it on hang, and reports the exit code plus, on any
+  unhandled (second-chance) exception (access violation, stack overflow, …), the
+  faulting RVA (resolved from image base) and its NTSTATUS code.
 - `kamy-triage` — the triage API behind these commands: `protect_identity`,
   `dump_function`, and `bisect`.
 - Function selection lives in `kamy-core` (`FunctionSelector::{only, reject}`),
