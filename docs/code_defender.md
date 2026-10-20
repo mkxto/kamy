@@ -113,6 +113,37 @@ Evidence: `bootmgfw.efi` EP = `push rbx; sub rsp,0x20; jmp 0xa2ce3; call .belabs
 
 **No import protection:** IAT fully intact — 45 plain imports (CRT + 15 KERNEL32), no hash resolver.
 
+## Register model — spill-everything lowering (why megabyte bodies never blow up regalloc)
+
+The giant MBA bodies never hit register pressure because CodeDefender does **not** color an unbounded virtual-register graph over the function. It lowers to a fixed 15-GPR machine and treats a large stack frame as the register file. Pressure is capped *by construction*: the transform pre-spills every intermediate to memory, so the live set at any point ≈ one instruction's arity. Measured on the largest body `sub_1404C1C06` (1.79 MB, ~369k insns):
+
+| metric | value | meaning |
+|---|---|---|
+| frame size | **0x10708 = 67,336 B** | ~8,400 qword / 4,200 xmm spill slots |
+| distinct `[rsp+disp]` slots (60k-insn sample) | **1,096** | memory-backed register file, not a few locals |
+| stack-relative share of all mem operands | **95.5%** | nearly every memory touch is a spill/reload |
+| `mov` share (40k-insn window) | **44%** (17,709) | body is mostly load-slot / store-slot traffic |
+| max simultaneously-live GPRs (backward liveness, 8k window) | **16; median 8–10** | saturates the HW file, **never exceeds it** |
+| `rsp` as scratch reg | **0** | RSP is only the frame base |
+| `rbp` as scratch reg | **459** | **no frame pointer — RBP is a normal allocatable GPR** |
+| `lahf`/`sahf` (40k window) | **749 / 749** | flags snapshotted to a stack byte, not kept live |
+
+Every MBA step is a load→compute→store triple against frame slots:
+```
+mov    r9, [rsp+...var_A148]     ; load virtual-reg from frame slot
+popcnt r8w, r9w                  ; 1-3 ALU ops on scratch GPRs
+mov    [rsp+...var_A120], rcx    ; store result back to a frame slot
+```
+Flags are never a long-lived value — materialized into `ah` and folded into a stack byte, reloaded on demand (`lahf; and ah,3Fh; or ah,byte ptr [rsp+...var_9D4C]; … sahf`).
+
+**Four design choices that make pressure non-fatal:**
+1. **Memory is the register file.** Between uses, values live in frame slots; only ~2–3 are resident. 1,096 virtual regs coexist with zero pressure.
+2. **The transform pre-spills.** MBA identities are emitted as load/compute/store triples, so regalloc only ever sees a local live window — spilling is rarely even needed.
+3. **Flags are memory-backed.** Snapshot to a byte at each def, reload at each use → no long-range EFLAGS interference (a classic lifter pressure bomb).
+4. **No frame pointer.** RSP-relative addressing with a big constant frees RBP → 15 allocatable GPRs, no ABI pin.
+
+**Implication for an append-only lifter (Kamy):** a `RegisterPressure` *failure* at lower time means spill is an error path, not a fallback. CD's invariant is that pressure is never fatal — the stack is infinite. Make unbounded spill-slot allocation the default (grow the frame), emit transformed expressions in near-spilled memory-form, model flags as memory-backed state, and drop the frame pointer. Then a 369k-instruction body colors as easily as a 10-instruction one.
+
 ## Switch / jump-table handling (crackme)
 
 CodeDefender does **not** rewrite jump-table entries — it **removes the table**. The switch is lifted into the CFG and re-emitted as a linear compare ladder; every edge, including each case edge, goes through a computed `jmp rcx` to an unreferenced `jmp rel32` pad. Nothing in the image is indexed by the switch value.
@@ -183,6 +214,48 @@ The crackme left the open question of whether a large/sparse switch becomes a la
 - Every other candidate — including the large/sparse ones `ExpQuerySystemInformation` (nc176, nc174 two-level), `NtSetInformationProcess` (nc71), `BuildQueryDirectoryIrp` (nc62), `PipIsProblemReadonly` (nc54), `SeSetAuditParameter`/`_MapCmDevicePropertyToRegType` (two-level) — **keeps its original jump table verbatim**, because CD did not touch those functions.
 
 **Answer (partial):** CD does **not** convert surviving switches to ladders or trees — an untouched switch keeps its table. When CD *does* rewrite a switch-bearing function, the table (dense or sparse index) is **eliminated** in favor of the computed-slot/`cmov` dispatch, **not** rebuilt as a table and **not** expanded into a full linear ladder over every case value. **Still open:** only one rewritten switch is observable in these two samples (sparse, 4 targets). Whether a large *dense* switch would lower to a linear `cmov` chain (as the crackme's 8-way `len&7` did) or to a bisection tree is still untested — it needs a build where CD rewrites a dense-switch function.
+
+## Security structures — /GS, CFG, segments, CRT (crackme)
+
+CodeDefender's Rebuild relocates **real instructions byte-faithfully** and rewrites every dependent structure to match the new layout, so the moved `.belabs` code keeps valid stack cookies, CFG metadata, segment semantics, and CRT teardown. Verified live in `code_defender_crackme.bin`.
+
+### Segments — overrides preserved verbatim
+Relocated `.belabs` code still carries native segment-override instructions, e.g. `0x1400092a7: mov rax, gs:30h` (TEB self-pointer). Relocation re-encodes the instruction with its `0x65` GS prefix intact, so the CPU/OS resolve the segment base at runtime unchanged. CodeDefender never needs a flat-address model: `gs:`/`fs:` accesses (TEB/PEB, TLS, stack-cookie seed) survive the move with no rewriting.
+
+### /GS stack cookie — routine relocated, global pinned, reference rebased
+`__security_check_cookie` is itself relocated into `.belabs` (`0x14000904e`):
+```
+cmp  rcx, cs:__security_cookie   ; rip-rel to the global, still resolves to 0x140005000
+jnz  fail
+rol  rcx, 10h
+test cx, 0FFFFh
+jnz  short ...
+ret
+fail: jmp __report_gsfailure     ; 0x14000136c, left in .text
+```
+- The cookie **global** `__security_cookie` stays in `.data` at its original VA (`0x140005000`); the moved check function's rip-relative reference to it was rebased so it still resolves there.
+- `__report_gsfailure` (`0x14000136c`) and the per-function prologue/epilogue cookie framing (`xor rax, rsp` stamp then epilogue check) are preserved, because relocation keeps the exact stack layout and rebuilds unwind — the compare matches, no fast-fail.
+
+### CFG / LoadConfig — rewritten into a consistent state
+LoadConfig (`_load_config_used`, `0x140006000`, Size `0x140`) after protection:
+
+| field | value | meaning |
+|---|---|---|
+| `SecurityCookie` | `0x140005000` | points at the untouched `.data` cookie |
+| `GuardCFCheckFunctionPointer` | `0x1400031a0` | → `_guard_check_icall_nop` |
+| `GuardCFDispatchFunctionPointer` | `0x1400031b0` | → `_guard_dispatch_icall_nop` (`jmp rax`) |
+| `GuardCFFunctionTable` | `0x140003518`, count **1** | lone target `0x140001e27` (valid, in `.text`) |
+| `GuardFlags` | `0x100` | `CF_INSTRUMENTED` only — **`CF_FUNCTION_TABLE_PRESENT` (0x400) not set** |
+
+- Both CF fptr slots resolve to the **nop** thunks (`_guard_dispatch_icall_nop` = `jmp rax`, no bitmap lookup), so an indirect call through `jmp cs:__guard_dispatch_icall_fptr` does not validate its target against a table.
+- The guard function table is kept **minimal and internally valid** (1 entry pointing at live `.text`), and `GuardFlags` omits `FUNCTION_TABLE_PRESENT` — the metadata never contradicts the relocated layout. The only indirect jump in 6.4 MB of `.belabs` is `jmp cs:__guard_dispatch_icall_fptr`.
+- Net: CodeDefender ships a CFG-aware image whose LoadConfig is rewritten to a non-enforcing, consistent state rather than left describing the pre-move layout.
+
+### CRT — relocated verbatim, tables stay correct
+The full CRT startup/teardown machinery is present and consistent: `_initterm`/`_initterm_e` (`0x14000218c`/`0x140002192`), `_register_onexit_function` (`0x1400021e0`), `_crt_atexit` (`0x1400021e6`), `_initialize_onexit_table` (`0x1400021da`), `_register_thread_local_exe_atexit_callback` (`0x1400021c2`). CRT startup is relocated as faithful bytes (EP → `.belabs` payload → `jmp` original CRT start). Because the init/onexit routines are copied rather than recompiled, the function pointers they materialize and store into the initterm/onexit/terminator tables are correct VAs, so the teardown walk runs cleanly.
+
+### Takeaway
+A complete, rebaseable reference model plus byte-faithful relocation keeps these structures valid: code moves without changing instruction semantics (segments and cookie framing survive), the cookie global is pinned while its rip-relative references are rebased, and the CFG/LoadConfig directory is rewritten to a consistent non-enforcing state instead of left stale.
 
 ## Observed section maps
 
