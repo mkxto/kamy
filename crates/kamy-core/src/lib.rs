@@ -10,6 +10,7 @@ pub mod ir;
 mod module;
 mod reject;
 mod reloc;
+mod selector;
 mod symbol;
 
 pub use addr::Rva;
@@ -17,4 +18,5 @@ pub use cfg::{BasicBlock, Function, SwitchTable, Terminator};
 pub use module::{Machine, Module, Section, SectionFlags};
 pub use reject::RejectionReason;
 pub use reloc::{RelocKind, Relocation};
+pub use selector::FunctionSelector;
 pub use symbol::{Symbol, SymbolKind};

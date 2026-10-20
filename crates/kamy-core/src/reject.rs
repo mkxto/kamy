@@ -42,6 +42,10 @@ pub enum RejectionReason {
     /// would land on the pushed registers; rejected until shrink-wrapping
     /// reuses the function's own register saves (D5).
     CallerFrameAccess,
+    /// Excluded from SSA lowering by an explicit [`crate::FunctionSelector`]
+    /// (bisection / `--only-rva` / `--reject-rva` tooling): left byte-identical
+    /// in place. Not an engine limitation.
+    Deselected,
 
     // --- Target reject taxonomy (CodeDefender parity). Documented for a precise
     // breakdown; producers for several of these are not wired yet.
@@ -96,6 +100,7 @@ impl RejectionReason {
             Self::UnsupportedFlags => "UnsupportedFlags",
             Self::SelfRecursive => "SelfRecursive",
             Self::CallerFrameAccess => "CallerFrameAccess",
+            Self::Deselected => "Deselected",
             Self::FallthroughToFunction => "FallthroughToFunction",
             Self::FarJump => "FarJump",
             Self::InvalidCall => "InvalidCall",
