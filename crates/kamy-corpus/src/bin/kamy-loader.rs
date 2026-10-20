@@ -200,10 +200,18 @@ mod win {
                         std::mem::transmute(proc_addr);
                     f(vals[0], vals[1], vals[2], vals[3])
                 }
-                _ => {
+                5 => {
                     let f: extern "system" fn(Usize, Usize, Usize, Usize, Usize) -> Usize =
                         std::mem::transmute(proc_addr);
                     f(vals[0], vals[1], vals[2], vals[3], vals[4])
+                }
+                _ => {
+                    // Exactly six is the widest the corpus exercises (abi_many);
+                    // more args would silently drop the tail, so refuse instead.
+                    assert_eq!(vals.len(), 6, "loader supports at most 6 call arguments");
+                    let f: extern "system" fn(Usize, Usize, Usize, Usize, Usize, Usize) -> Usize =
+                        std::mem::transmute(proc_addr);
+                    f(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5])
                 }
             }
         }
