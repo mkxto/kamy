@@ -350,6 +350,9 @@ fn protect_inner(
     let runtime_fns = pe.runtime_functions();
     let import_slots: std::collections::HashSet<u32> =
         pe.import_slots().iter().map(|r| r.get()).collect();
+    let funcs_by_entry: HashMap<u32, &Function> =
+        functions.iter().map(|f| (f.entry.get(), f)).collect();
+    let eh_runtime = eh_runtime_functions(module, &runtime_fns, &funcs_by_entry);
 
     let mut report = Report {
         moved: Vec::new(),
@@ -364,7 +367,7 @@ fn protect_inner(
     ordered.sort_by_key(|f| f.entry.get());
     for func in ordered {
         let _s = tracing::debug_span!("function", addr = %func.entry).entered();
-        match classify(module, func, &runtime_fns, &import_slots) {
+        match classify(module, func, &runtime_fns, &import_slots, &eh_runtime) {
             Ok(cand) => {
                 pad_to_align(&mut code, FUNCTION_ALIGN);
                 let new_rva = code_rva + code.len() as u32;
@@ -530,10 +533,20 @@ fn classify(
     func: &Function,
     runtime_fns: &[kamy_pe::RuntimeFunction],
     import_slots: &std::collections::HashSet<u32>,
+    eh_runtime: &std::collections::HashSet<u32>,
 ) -> Result<Candidate, Option<RejectionReason>> {
     let entry = func.entry;
     if !module.is_executable(entry) {
         return Err(None);
+    }
+    // The C++ exception runtime (the __CxxFrameHandler personality and everything
+    // it calls during dispatch — FindHandler, FH4::TryBlockMap4, the catch/unwind
+    // helpers) must stay verbatim: relocating any of it miscompiles handler lookup
+    // so a thrown exception goes unhandled and the process fast-fails. Scope-table
+    // / unwind reconstruction is D31 (not built); until then leave the runtime in
+    // place (D22, reject-on-ambiguity).
+    if eh_runtime.contains(&entry.get()) {
+        return Err(Some(RejectionReason::SehComplex));
     }
     let end = func
         .blocks
@@ -650,6 +663,106 @@ fn reloc_in_range(module: &Module, start: u32, end: u32) -> bool {
         .relocations
         .iter()
         .any(|r| r.rva.get() >= start && r.rva.get() < end)
+}
+
+/// UNWIND_INFO exception-handler RVA, or `None` when the record carries no
+/// language handler. Layout: `[ver|flags, prolog, codes, frame]` then
+/// `codes`-slot unwind array (padded to an even slot count), then — iff
+/// `UNW_FLAG_EHANDLER|UHANDLER` — the 4-byte handler RVA.
+fn unwind_handler_rva(module: &Module, unwind: Rva) -> Option<u32> {
+    let b = module.bytes_at(unwind)?;
+    let flags = b.first()? >> 3;
+    if flags & 0x3 == 0 {
+        return None;
+    }
+    let count = *b.get(2)? as usize;
+    let off = 4 + ((count + 1) & !1) * 2;
+    let slice = b.get(off..off + 4)?;
+    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+/// Functions that must stay verbatim because the module dispatches C++ exceptions
+/// through them: the `__CxxFrameHandler` personality cluster — the personality and
+/// everything it reaches by a direct `call`/`jmp` or an address-taken function
+/// pointer (its catch funnels and continuation helpers are guard-dispatched
+/// indirectly, so a direct-call walk alone misses them). Relocating any of it
+/// miscompiles handler lookup so a throw goes unhandled and the process
+/// fast-fails (scope-table / unwind reconstruction is D31, not built).
+///
+/// The set is empty unless some *user* function (one outside the runtime cluster)
+/// actually names a C++ personality as its unwind handler — i.e. the image has a
+/// real `try`/`catch`. SEH-only, `/GS`-only and exception-free images (whose
+/// static CRT still contains the dormant runtime) keep moving everything, so their
+/// coverage is untouched. A personality is taken to be C++ when its reachable
+/// cluster is non-trivial; the small `__C_specific_handler` / `__GSHandlerCheck`
+/// clusters stay movable.
+fn eh_runtime_functions(
+    module: &Module,
+    runtime_fns: &[kamy_pe::RuntimeFunction],
+    funcs_by_entry: &HashMap<u32, &Function>,
+) -> std::collections::HashSet<u32> {
+    use std::collections::HashSet;
+    let base = module.image_base;
+    let reach = |seed: u32| -> HashSet<u32> {
+        let mut reached = HashSet::new();
+        let mut stack = vec![seed];
+        while let Some(rva) = stack.pop() {
+            if !reached.insert(rva) {
+                continue;
+            }
+            let Some(func) = funcs_by_entry.get(&rva) else {
+                continue;
+            };
+            for insn in function_instructions(module, func) {
+                let mut follow = |target: u64| {
+                    if target >= base {
+                        let t = (target - base) as u32;
+                        if funcs_by_entry.contains_key(&t) && !reached.contains(&t) {
+                            stack.push(t);
+                        }
+                    }
+                };
+                if insn.is_call_near() || insn.is_jmp_short_or_near() {
+                    follow(insn.near_branch_target());
+                }
+                if insn.is_ip_rel_memory_operand() {
+                    follow(insn.memory_displacement64());
+                }
+            }
+        }
+        reached
+    };
+
+    // The C++ personality's cluster is the whole FH3/FH4 dispatch runtime; the
+    // __C_specific_handler / __GSHandlerCheck clusters are one or two helpers.
+    const CXX_CLUSTER_MIN: usize = 4;
+    let personalities: HashSet<u32> = runtime_fns
+        .iter()
+        .filter_map(|rf| unwind_handler_rva(module, rf.unwind))
+        .filter(|h| funcs_by_entry.contains_key(h))
+        .collect();
+
+    let mut cxx_personalities: HashSet<u32> = HashSet::new();
+    let mut runtime: HashSet<u32> = HashSet::new();
+    for &p in &personalities {
+        let cluster = reach(p);
+        if cluster.len() >= CXX_CLUSTER_MIN {
+            cxx_personalities.insert(p);
+            runtime.extend(cluster);
+        }
+    }
+
+    // Only leave the runtime verbatim when real user code dispatches through it —
+    // a function with a C++ personality handler that is not itself the runtime.
+    let user_dispatches = runtime_fns.iter().any(|rf| {
+        unwind_handler_rva(module, rf.unwind).is_some_and(|h| cxx_personalities.contains(&h))
+            && !runtime.contains(&rf.begin.get())
+    });
+    if user_dispatches {
+        runtime
+    } else {
+        HashSet::new()
+    }
 }
 
 fn unwind_flags(module: &Module, unwind: Rva) -> u8 {
