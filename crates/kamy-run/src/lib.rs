@@ -10,7 +10,7 @@
 //!   `None`).
 //! * [`run_traced`] launches the target under a lightweight debug loop
 //!   (`DEBUG_ONLY_THIS_PROCESS`). It observes the image base from the process
-//!   creation event and, on the first-chance access violation, reports the
+//!   creation event and, on the first unhandled (second-chance) exception,
 //!   faulting address together with the module-relative RVA in
 //!   [`RunOutcome::fault`]. This is slower but tells the caller *where* the
 //!   protected image crashed.
@@ -51,7 +51,6 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{PCWSTR, PWSTR};
 
-const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const EXCEPTION_BREAKPOINT: u32 = 0x8000_0003;
 
 /// How to launch a target process.
@@ -66,7 +65,10 @@ pub struct RunOptions {
     pub timeout: Duration,
 }
 
-/// A first-chance access violation observed under [`run_traced`].
+/// An unhandled (second-chance) fault observed under [`run_traced`]: the first
+/// exception the target did not handle, of any kind (access violation, stack
+/// overflow, illegal instruction, `__fastfail`, …). [`Fault::code`] is the
+/// NTSTATUS.
 #[derive(Clone, Copy, Debug)]
 pub struct Fault {
     pub code: u32,
@@ -95,8 +97,10 @@ pub fn run(opts: &RunOptions) -> Result<RunOutcome> {
 
 /// Run the target under a debug loop that reports the first faulting RVA.
 ///
-/// On the first-chance `EXCEPTION_ACCESS_VIOLATION`, [`RunOutcome::fault`] is
-/// populated with the faulting address and its offset from the image base.
+/// On the first unhandled (second-chance) exception of any kind,
+/// [`RunOutcome::fault`] is populated with the faulting address and its offset
+/// from the image base. First-chance exceptions are passed to the target's own
+/// handlers, so SEH that recovers is not reported as a fault.
 pub fn run_traced(opts: &RunOptions) -> Result<RunOutcome> {
     execute(opts, true)
 }
@@ -483,7 +487,17 @@ fn debug_loop(
             EXCEPTION_DEBUG_EVENT => {
                 let ex = unsafe { ev.u.Exception };
                 let code = ex.ExceptionRecord.ExceptionCode.0 as u32;
-                if code == EXCEPTION_ACCESS_VIOLATION {
+                if ex.dwFirstChance != 0 {
+                    // First chance: the initial debugger breakpoint is expected;
+                    // every other exception goes to the target's own handlers.
+                    let disp = if code == EXCEPTION_BREAKPOINT {
+                        DBG_CONTINUE.0
+                    } else {
+                        DBG_EXCEPTION_NOT_HANDLED.0
+                    };
+                    continue_event(&ev, disp)?;
+                } else {
+                    // Second chance: unhandled and fatal. Record where it died.
                     let address = ex.ExceptionRecord.ExceptionAddress as usize as u64;
                     outcome.fault = Some(Fault {
                         code,
@@ -495,12 +509,6 @@ fn debug_loop(
                         let _ = TerminateJobObject(hjob.get(), 1);
                     }
                     break;
-                } else if code == EXCEPTION_BREAKPOINT {
-                    // Initial / debugger breakpoints: swallow and continue.
-                    continue_event(&ev, DBG_CONTINUE.0)?;
-                } else {
-                    // Let the target's own handlers see other exceptions.
-                    continue_event(&ev, DBG_EXCEPTION_NOT_HANDLED.0)?;
                 }
             }
             EXIT_PROCESS_DEBUG_EVENT => {
