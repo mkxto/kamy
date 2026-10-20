@@ -1,17 +1,17 @@
 # AGENTS.md
 
-Operating guide for agents working in this repository. Not a feature overview —
-read `README.md` for that, and the documents below for design intent.
+Operating guide for agents working.
 
 ## Source of truth
 
 Design is settled in `docs/`. Treat these as authoritative; do not relitigate
 decisions already made there.
 
-- `docs/grilling.md` — decision log **D1–D27**. Every decision is load-bearing.
+- `docs/grilling.md` - decision log **D1–D27**. Every decision is load-bearing.
   Cite the relevant `Dn` when a change depends on one.
-- `docs/architecture.md` — pipeline, IR layering, config schema.
-- `docs/research.md` — prior art and techniques.
+- `docs/architecture.md` - pipeline, IR layering, config schema.
+- `docs/research.md` - prior art and techniques.
+- `docs/STATUS.md` - current project status, in phases & milestones
 
 If code and a decision disagree, the decision wins.
 
@@ -34,7 +34,7 @@ divergence justified only in a commit/report, is prohibited.
 - Do not model data that has no producer and no consumer yet. Introduce a type
   when the code that fills it and the code that reads it both exist.
 - Correctness first, then six-month maintainability, then speed. In the hot
-  per-function path, avoid needless allocation and copying.
+  per-function path, avoid needless allocation and 
 
 ## Code style
 
