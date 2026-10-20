@@ -112,6 +112,6 @@ evaluate many functions; that is what `corpus verify` and `bisect` are for.
 
 ## Skill
 
-A repo-local skill directory (`.omp/skills`, `skills`, `.claude/skills`) is not
-present, so no `kamy-triage` skill file ships with the repo. Packaging this
-workflow as a skill is a harness-side follow-up.
+This workflow ships as a repo-local skill at
+`.omp/skills/kamy-triage/SKILL.md`; it auto-triggers on miscompile / corpus-FAIL
+/ coverage-regression tasks and points back to this document.
