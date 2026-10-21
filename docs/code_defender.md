@@ -6,14 +6,15 @@ Commercial Windows PE obfuscator (Aftermath Labs, codedefender.io), x86-64 + ARM
 Analyze (refs/CFG/unwind, safe-reject)  →  Transform (composable passes)  →  Rebuild (native PE)
 ```
 
-Marker: appended **`.belabs`** sections. Observed across two samples this analysis is grounded on:
+Marker: appended obfuscator sections (default name **`.belabs`**; rebranded builds rename them — e.g. `vgc.ac`). Observed across the samples this analysis is grounded on:
 
-| sample | profile | transform enabled |
-|---|---|---|
-| `HelloWorld-Injected.exe` | light | import protection only |
-| `code_defender_crackme.bin` | heavy | mutation + MBA + control-flow indirection (+ CFG). No VM, no import protection. |
+| sample | type | profile | transform enabled |
+|---|---|---|---|
+| `HelloWorld-Injected.exe` | EXE | light | import protection only (inject model) |
+| `code_defender_crackme.bin` | EXE | heavy | mutation + MBA + control-flow indirection (+ CFG). No VM, no import protection. |
+| `cheat.bin` (StealthVGC) | **DLL** | heavy | mutation + MBA + control-flow indirection (+ CFG). No VM, no import protection. Rebranded (`vgc.ac`), **selective per-function**. |
 
-Transforms are **composable and per-build** — neither sample enabled every pass, and neither enabled virtualization (the vendor offers it).
+Transforms are **composable and per-build** — no sample enabled every pass, and none enabled virtualization (the vendor offers it).
 
 ## Two operation models — Transform vs Inject
 
@@ -29,6 +30,8 @@ CodeDefender operates in two distinct modes, and the PE layout tells them apart:
 | new dependencies | none | resolved at runtime (PEB-walk + MurmurHash2), **no new IAT entry** |
 
 The RW runtime-state `.belabs` is therefore a **signature of the inject model**, not of transformation. In the Injected sample the payload (`sub_140007000`) builds `"user32.dll"`/`"Hello World!"` on the stack, walks `Ldr->InLoadOrderModuleList`, hashes module + export names with MurmurHash2 (`0x5BD1E995`), resolves `MessageBoxA`, and calls it — `user32.dll` never appears in the import table. That injected code is wired in through the init array, which is exactly what the RW section exists to hold.
+
+**Correction (third sample, `cheat.bin`):** an RW obfuscator section is **not** exclusive to the inject model. The transform-only `cheat.bin` also ships an RW `vgc.ac`, but it holds a **single pre-initialized code pointer** (read once at init, `mov rax, cs:off_…; mov [r8+0F8h], rax`) — not an init-callback `[begin,end)` registry. So RW *presence* alone does not imply inject; the discriminator is the **init-callback array + loader loop** (begin/end bounds over `[payload, original_start]`), which only the inject build has.
 
 ---
 
@@ -84,7 +87,7 @@ A complete, rebaseable reference model is also what lets CodeDefender keep `.tex
 
 ## Entrypoint handling
 
-CodeDefender hides the original entrypoint by **redirecting** it, not by TLS or header tricks. `AddressOfEntryPoint` stays a valid pointer into `.text`; the code there is CodeDefender's loader, which runs a payload first and reaches the original OEP indirectly — so the real entry is no longer the EP.
+CodeDefender hides the original entrypoint by **redirecting** it, not by TLS or header tricks. `AddressOfEntryPoint` stays a valid pointer — into `.text` for the EXE/EFI samples (landing on a loader stub), or **directly into the appended code section** for the DLL sample (landing on the moved+mutated original entry). The code reached runs a payload first and/or is the relocated entry itself — so the real entry is no longer at a recognizable `.text` OEP.
 
 | mechanic | sample | effect |
 |---|---|---|
@@ -92,10 +95,13 @@ CodeDefender hides the original entrypoint by **redirecting** it, not by TLS or 
 | init-callback array | HelloWorld-Injected | EP → loader loop over `[payload, original_start]`; the real entry is an anonymous array element reached by computed iteration (strongest form) |
 | control-flow indirection at EP | crackme, `bootmgfw.efi` | stub uses the `jmp` / `call;jmp reg` continuation idiom — tracing from the EP is obfuscated |
 | section-name blanking around EP | `ntoskrnl2.exe` | the section holding the EP has its **name zeroed** — breaks section-name EP heuristics |
+| EP → appended-section entry (DLL) | `cheat.bin` | `AddressOfEntryPoint` points *into* the obfuscator code section at the moved+mutated `_DllMainCRTStartup`; no `.text` trampoline fronts it. The `call <body>; jmp rbx` stub still exists in `.text` but is demoted to a residual/internal path |
 
 Evidence: `bootmgfw.efi` EP = `push rbx; sub rsp,0x20; jmp 0xa2ce3; call .belabs:0x10ba366` (payload), then `jmp rbx`.
 
-**Not used (these samples):** no **TLS callbacks** (TLS directory absent in all six research binaries); no `AddressOfEntryPoint=0` / forwarder trick.
+Evidence (`cheat.bin`, DLL): EP RVA `0x10b003e` is inside the appended `vgc.ac` code section and `jmp`s straight into the 381 KB MBA `_DllMainCRTStartup` body (`rcx`/`rdx`/`r8` = hinst/reason/reserved spilled, `reason==1` test, single `ret`). **Why no `.text` stub:** an EXE entry (`mainCRTStartup`) is fire-and-forget (`ExitProcess`), so CD fronts it with a `call payload; jmp orig` trampoline; a DLL entry is a *returnable* `DllMain`, so CD just repoints `AddressOfEntryPoint` at the relocated entry and lets it `ret` to the loader — nothing to sequence. The enabling condition is a **transform-only** build: no injected pre-entry payload to run first (the RW section holds a lone pointer, not an init array).
+
+**Not used (these samples):** no **TLS callbacks** (TLS directory absent in all research binaries, `cheat.bin` included); no `AddressOfEntryPoint=0` / forwarder trick.
 
 **Not universal — target-dependent:** `ntoskrnl2.exe` (protected kernel) keeps its EP **byte-identical** to clean `ntoskrnl.exe` — `KiSystemStartup` is *not* hijacked; internal functions are protected and the OEP is left intact. EP redirection is applied to the usermode crackme and the boot manager, skipped for the kernel entry.
 
@@ -280,7 +286,20 @@ A complete, rebaseable reference model plus byte-faithful relocation keeps these
 
 Payload resolves `user32!MessageBoxA` via PEB `InLoadOrderModuleList` + MurmurHash2 (`0x5BD1E995`) — no IAT landmark.
 
-> **`.belabs` layout is per-build, not fixed — 2 to 3 sections observed (possibly more).** Roles seen: **R-X** relocated code (always); **RW** runtime state (init-array/resolver builds); **R** rebuilt directories *or* `.xdata`. Crackme = 2 (R-X code + R `.xdata`); Injected = 3 (adds RW state + R directories). Do not assume a fixed count or that the second `.belabs` is writable.
+### cheat.bin (StealthVGC) — DLL, transform-only, rebranded `vgc.ac`
+| VA | section | flags | serves |
+|---|---|---|---|
+| `0x1000` | `.text` | R-X | **903** surviving functions (811 real + 76 tiny + 16 residual→code stubs), 244 KB — selective transform, `.text` **not** vacated |
+| `0x3d000`–`0x60000` | `.idata`/`.rdata`/`.data`/`.rsrc` | R/RW | IAT (104 imports, intact), consts, resources |
+| `0x61000` | **`vgc.ac`** | R-- | rebuilt **Base-reloc** directory |
+| `0x64000` | **`vgc.ac`** | **RW** | **runtime state** — a *single* pre-init code pointer (not an init array) |
+| `0x65000` | **`vgc.ac`** | R-X | **17.7 MB** relocated+mutated PIC code (2942 funcs, incl. the EP/`DllMain` body) |
+| `0x114b000` | `.pdata` | R | regenerated unwind (5120 `RUNTIME_FUNCTION`s) |
+| `0x115a000` | **`vgc.ac`** | R | **`.xdata`** unwind for relocated code |
+
+Four `vgc.ac` sections (R-- dirs, RW state, R-X code, R `.xdata`); the EP lands in the R-X one. IAT fully intact (KERNEL32 89 / USER32 9 / WININET 6, no hash resolver); relocations 931 total, only **1** into the code section (PIC); CFG non-enforcing (`GuardFlags=0x100`, dispatch→nop thunk) — same consistent-but-neutered state as the crackme. Only **1** residual jump-table switch survives; no VM dispatcher (895 `jmp reg` + 2086 `call reg` are the computed-continuation idiom, spread across registers, with a lone `__guard_dispatch_icall_fptr`). Confirmed CodeDefender via forged CodeView (`RSDS`, Age 3, name `"Protected by StealthVGC"`, not a `.pdb`).
+
+> **Obfuscator-section layout is per-build, not fixed — 2 to 4 sections observed, and the name may be rebranded (`.belabs` default, `vgc.ac` in `cheat.bin`).** Roles seen: **R-X** relocated code (always); **RW** runtime state (inject *or* transform); **R** rebuilt directories *and/or* `.xdata`. Crackme = 2 (R-X code + R `.xdata`); Injected = 3 (adds RW state + R directories); `cheat.bin` = 4 (R dirs + RW state + R-X code + R `.xdata`). Do not assume a fixed count, a fixed name, or that an RW section implies the inject model.
 
 #### How the RW runtime-state `.belabs` works
 It is a **CRT-style initializer table** (`_initterm_e` shape), not a scratch heap. The RW `.belabs` stores the bounds of a startup callback array:
@@ -295,9 +314,11 @@ array (.rdata): [0x27f0] = payload  sub_140007000
 
 The hijacked EP (`start` = `sub_14000152d`) walks `[begin,end)` calling each `callback(argc,argv,envp)`; a nonzero return triggers `__fastfail` (`int 29h`). The **payload runs first** (shows the MessageBox); the **final callback is the original CRT start**, which runs the program and exits — so control never returns to the loader. The bounds sit in a *writable* section because CodeDefender models them like the MSVC CRT initializer iterators (`__xi_a`/`__xi_z`). The crackme has no equivalent: it hijacks the EP inline (`sub rsp; call payload; jmp orig_start`) with no array, loader, or writable state.
 
+`cheat.bin` sits between the two: transform-only (no init array, like the crackme) yet still shipping an RW `vgc.ac` — but holding just **one** pre-initialized code pointer, read once and stored into a runtime struct field (`mov [r8+0F8h], rax`), not a `[begin,end)` iterator. So the RW section's *presence* does not distinguish the models; its *shape* (lone pointer vs begin/end bounds + loader loop) does.
+
 ---
 
 ## Reversing notes
-- **Markers:** appended `.belabs` section(s); EP = `sub rsp; call <.belabs>; jmp <orig start>`; `.pdata`-only residual `.text` stubs.
+- **Markers:** appended obfuscator section(s) — name `.belabs` or rebranded (`vgc.ac`); forged CodeView debug entry (`RSDS`, Age 3, non-`.pdb` name, e.g. `"Protected by StealthVGC"`); EP = `.text` `sub rsp; call <code sec>; jmp <orig start>` (EXE/EFI) **or** `AddressOfEntryPoint` pointing straight into the code section at a mutated `DllMain` (DLL); `.pdata`-only residual `.text` stubs.
 - **Weaknesses (as configured in these samples):** everything is **native** — no VM bytecode to lift. Mutation is MBA, mechanically simplifiable to identities; the heavy profile is tedious (state smeared across a large stack frame, indirect continuations) but not opaque. Light profiles leave the IAT fully visible.
 - **Strengths:** complete rebuild (clean/compact `.text`, rebuilt directories, valid SEH/CFG), composable transforms, and — where enabled — hash-resolved imports that erase IAT landmarks.
