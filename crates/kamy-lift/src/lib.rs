@@ -715,8 +715,7 @@ pub(crate) fn write_operand(
                     };
                     state.set_gpr(gpr, stored);
                 } else {
-                    let extended = builder.emit(IrOp::Zext, &[val], IrType::I64);
-                    state.set_gpr(gpr, extended);
+                    write_gpr_sub64(gpr, val, ty, builder, state);
                 }
             }
         }
@@ -726,6 +725,30 @@ pub(crate) fn write_operand(
         }
         _ => {}
     }
+}
+
+/// Store `val` (of sub-64-bit width `ty`) into physical GPR `gpr` honoring x86
+/// partial-register semantics: a 32-bit write clears bits 63:32, but an 8- or
+/// 16-bit write leaves the register's upper bits intact. Modeling the narrow
+/// write as a plain zero-extension would silently drop those high bytes.
+pub(crate) fn write_gpr_sub64(
+    gpr: Gpr,
+    val: ValueId,
+    ty: IrType,
+    builder: &mut IrBuilder,
+    state: &mut LiftState,
+) {
+    let stored = if ty == IrType::I32 {
+        builder.emit(IrOp::Zext, &[val], IrType::I64)
+    } else {
+        let old = state.get_gpr(gpr);
+        let keep = !((1u64 << ty.bits()) - 1);
+        let mask = builder.emit(IrOp::Const(keep), &[], IrType::I64);
+        let hi = builder.emit(IrOp::And, &[old, mask], IrType::I64);
+        let lo = builder.emit(IrOp::Zext, &[val], IrType::I64);
+        builder.emit(IrOp::Or, &[hi, lo], IrType::I64)
+    };
+    state.set_gpr(gpr, stored);
 }
 
 #[cfg(test)]
@@ -1028,6 +1051,50 @@ mod tests {
                 .iter()
                 .any(|b| matches!(b.term, IrTerminator::Unreachable)),
             "SSA construction must preserve the ladder"
+        );
+    }
+
+    /// An 8-bit register write preserves the destination's upper bits, so
+    /// `mov eax, 0x11223344; mov al, 0x99` must leave RAX == 0x11223399, not a
+    /// zero-extended 0x99. Modeling the narrow write as a plain zero-extension
+    /// silently discards the high bytes (the dormant partial-register bug).
+    #[test]
+    fn sub_register_write_preserves_upper_bits() {
+        // B8 44 33 22 11  mov eax, 0x11223344
+        // B0 99           mov al, 0x99
+        // C3              ret
+        let code = [0xB8, 0x44, 0x33, 0x22, 0x11, 0xB0, 0x99, 0xC3];
+        let (module, func) = single_block_module(&code, Terminator::Return);
+        let ir = lift_function(&module, &func, &Win64Default);
+
+        assert_eq!(ir.func.blocks.len(), 1);
+        let block = &ir.func.blocks[0];
+        let rax_out = ir.block_exit[0][0];
+
+        let type_mask = |ty: IrType| -> u64 {
+            match ty {
+                IrType::I64 | IrType::I128 => u64::MAX,
+                _ => (1u64 << ty.bits()) - 1,
+            }
+        };
+        let mut vals: std::collections::HashMap<ValueId, u64> = std::collections::HashMap::new();
+        for inst in &block.insts {
+            let Some(dest) = inst.dest else { continue };
+            let a = |i: usize| vals[&inst.args[i]];
+            let v = match &inst.op {
+                IrOp::Undef => 0,
+                IrOp::Const(c) => *c,
+                IrOp::Zext | IrOp::Trunc => a(0),
+                IrOp::And => a(0) & a(1),
+                IrOp::Or => a(0) | a(1),
+                other => panic!("unexpected op in mov sequence: {other:?}"),
+            };
+            vals.insert(dest, v & type_mask(inst.ty));
+        }
+
+        assert_eq!(
+            vals[&rax_out], 0x1122_3399,
+            "mov al must merge into the live-in EAX, preserving bits 31:8"
         );
     }
 }

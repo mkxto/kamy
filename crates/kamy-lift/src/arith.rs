@@ -436,8 +436,7 @@ fn write_gpr_at_width(gpr: Gpr, val: ValueId, ty: IrType, b: &mut IrBuilder, s: 
     if ty == IrType::I64 {
         s.set_gpr(gpr, val);
     } else {
-        let ext = b.emit(IrOp::Zext, &[val], IrType::I64);
-        s.set_gpr(gpr, ext);
+        crate::write_gpr_sub64(gpr, val, ty, b, s);
     }
 }
 
