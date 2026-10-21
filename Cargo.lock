@@ -237,6 +237,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "kamy-analysis",
  "kamy-config",
  "kamy-core",
  "kamy-corpus",

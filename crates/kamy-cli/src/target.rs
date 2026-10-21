@@ -4,7 +4,8 @@
 
 use std::collections::HashSet;
 
-use kamy_config::SymbolSelector;
+use kamy_analysis::CallGraph;
+use kamy_config::{Group, SymbolSelector};
 use kamy_core::{Function, Rva};
 
 /// Match a `*`/`?` wildcard `pattern` against `text` (`*` any run, `?` one
@@ -43,23 +44,49 @@ pub(crate) fn resolve_targets(
     selectors: &[SymbolSelector],
     functions: &[Function],
     label: &impl Fn(Rva) -> String,
+    groups: &[Group],
+    cg: &CallGraph,
 ) -> HashSet<Rva> {
     let entries: Vec<(Rva, String)> = functions
         .iter()
         .map(|f| (f.entry, label(f.entry)))
         .collect();
     let mut out = HashSet::new();
+    let mut active: HashSet<String> = HashSet::new();
+    resolve_into(
+        selectors,
+        &entries,
+        functions,
+        groups,
+        cg,
+        &mut active,
+        &mut out,
+    );
+    out
+}
+
+/// Recursive core; `active` guards against `!Group` reference cycles.
+#[allow(clippy::too_many_arguments)]
+fn resolve_into(
+    selectors: &[SymbolSelector],
+    entries: &[(Rva, String)],
+    functions: &[Function],
+    groups: &[Group],
+    cg: &CallGraph,
+    active: &mut HashSet<String>,
+    out: &mut HashSet<Rva>,
+) {
     for sel in selectors {
         match sel {
             SymbolSelector::Name(name) => {
-                for (rva, lbl) in &entries {
+                for (rva, lbl) in entries {
                     if lbl == name {
                         out.insert(*rva);
                     }
                 }
             }
             SymbolSelector::Pattern(pat) => {
-                for (rva, lbl) in &entries {
+                for (rva, lbl) in entries {
                     if glob_match(pat, lbl) {
                         out.insert(*rva);
                     }
@@ -71,9 +98,22 @@ pub(crate) fn resolve_targets(
                     out.insert(rva);
                 }
             }
+            SymbolSelector::TopXref(n) => {
+                for (rva, _) in cg.top_xref(*n) {
+                    out.insert(rva);
+                }
+            }
+            SymbolSelector::Group(name) => {
+                if !active.insert(name.clone()) {
+                    continue;
+                }
+                if let Some(g) = groups.iter().find(|g| &g.name == name) {
+                    resolve_into(&g.symbols, entries, functions, groups, cg, active, out);
+                }
+                active.remove(name);
+            }
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -117,7 +157,7 @@ mod tests {
             SymbolSelector::Pattern("helper_*".into()),
             SymbolSelector::Address(0x2000),
         ];
-        let got = resolve_targets(&sels, &funcs, &label);
+        let got = resolve_targets(&sels, &funcs, &label, &[], &CallGraph::default());
         let expected: HashSet<Rva> = [0x1000, 0x1040, 0x2000].into_iter().map(Rva::new).collect();
         assert_eq!(got, expected);
     }
@@ -127,7 +167,47 @@ mod tests {
         let funcs = vec![func(0x1000), func(0x2000)];
         let label = |rva: Rva| format!("sub_{:x}", rva.get());
         // Pattern targeting still works with the fallback labels.
-        let got = resolve_targets(&[SymbolSelector::Pattern("sub_2*".into())], &funcs, &label);
+        let got = resolve_targets(
+            &[SymbolSelector::Pattern("sub_2*".into())],
+            &funcs,
+            &label,
+            &[],
+            &CallGraph::default(),
+        );
         assert_eq!(got, [Rva::new(0x2000)].into_iter().collect());
+    }
+
+    #[test]
+    fn group_selector_expands_and_guards_cycles() {
+        let funcs = vec![func(0x1000), func(0x2000)];
+        let label = |rva: Rva| match rva.get() {
+            0x1000 => "main".to_string(),
+            other => format!("sub_{other:x}"),
+        };
+        let groups = vec![
+            Group {
+                name: "a".into(),
+                symbols: vec![
+                    SymbolSelector::Name("main".into()),
+                    SymbolSelector::Group("b".into()),
+                ],
+            },
+            // `b` references `a` back: the cycle guard must terminate.
+            Group {
+                name: "b".into(),
+                symbols: vec![
+                    SymbolSelector::Pattern("sub_2*".into()),
+                    SymbolSelector::Group("a".into()),
+                ],
+            },
+        ];
+        let got = resolve_targets(
+            &[SymbolSelector::Group("a".into())],
+            &funcs,
+            &label,
+            &groups,
+            &CallGraph::default(),
+        );
+        assert_eq!(got, [0x1000, 0x2000].into_iter().map(Rva::new).collect());
     }
 }

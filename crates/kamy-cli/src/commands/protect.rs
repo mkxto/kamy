@@ -1,10 +1,12 @@
 //! `kamy protect`: relocation-only, SSA-identity, and profile-driven protect.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use kamy_config::Config;
-use kamy_core::FunctionSelector;
+use kamy_core::ir::IrFunction;
+use kamy_core::{FunctionSelector, Rva, SymbolKind};
 use kamy_disasm::discover_functions;
 use kamy_pe::PeFile;
 
@@ -13,7 +15,7 @@ use super::{parse_rvas, report_to_coverage};
 /// IR-level transform applied per function at a given D28 intensity (1.0 = full,
 /// 0.0 = no-op); the linker walks a reduced-intensity ladder on register
 /// pressure.
-type TransformFn = dyn FnMut(&mut kamy_core::ir::IrFunction, f32);
+type TransformFn = dyn FnMut(Rva, &mut IrFunction, f32);
 
 /// Parsed `protect` arguments.
 pub(crate) struct Args {
@@ -94,7 +96,9 @@ fn relocation_only(input: &Path, output: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `protect --profile`: apply the profile's transforms (MBA today).
+/// `protect --profile`: lift, transform, and relocate. Each profile's passes
+/// apply only to the functions its `symbols:` select (empty list = whole
+/// module); the first profile to claim a function wins.
 fn with_profile(input: &Path, output: &Path, profile_path: &Path) -> anyhow::Result<()> {
     let cfg = Config::from_path(profile_path)
         .with_context(|| format!("loading profile {}", profile_path.display()))?;
@@ -106,42 +110,73 @@ fn with_profile(input: &Path, output: &Path, profile_path: &Path) -> anyhow::Res
     let seeds = pe.seeds();
     module.functions = discover_functions(&module, &seeds);
 
-    let mut mba_pass: Option<kamy_transforms::MbaPass> = None;
-    for profile in &cfg.profiles {
-        for pass in &profile.passes {
-            if let kamy_config::Pass::MixedBooleanArithmetic(sp) = pass {
-                mba_pass = Some(kamy_transforms::MbaPass {
-                    config: kamy_transforms::mba::MbaConfig {
-                        iterations: sp.iterations,
-                        probability: sp.probability,
-                        semantics: kamy_transforms::mba::MbaSemantics {
-                            add: sp.semantics.add,
-                            sub: sp.semantics.sub,
-                            xor: sp.semantics.xor,
-                        },
-                        bitwidths: kamy_transforms::mba::MbaBitwidths {
-                            bit8: sp.bitwidths.bit8,
-                            bit16: sp.bitwidths.bit16,
-                            bit32: sp.bitwidths.bit32,
-                            bit64: sp.bitwidths.bit64,
-                        },
-                    },
-                    seed: 42,
-                });
-            }
+    let cg = kamy_analysis::build_call_graph(&module);
+    let exports: HashMap<u32, &str> = module
+        .symbols
+        .iter()
+        .filter(|s| s.kind == SymbolKind::Export)
+        .map(|s| (s.rva.get(), s.name.as_str()))
+        .collect();
+    let label = |rva: Rva| -> String {
+        exports
+            .get(&rva.get())
+            .map_or_else(|| format!("sub_{:x}", rva.get()), |n| (*n).to_string())
+    };
+
+    let passes: Vec<Option<kamy_transforms::MbaPass>> = cfg
+        .profiles
+        .iter()
+        .map(|p| {
+            p.passes.iter().find_map(|pass| match pass {
+                kamy_config::Pass::MixedBooleanArithmetic(sp) => Some(mba_from(sp)),
+                _ => None,
+            })
+        })
+        .collect();
+
+    let mut rva_to_profile: HashMap<u32, usize> = HashMap::new();
+    let mut counts = vec![0usize; cfg.profiles.len()];
+    for (pi, profile) in cfg.profiles.iter().enumerate() {
+        let targets: HashSet<Rva> = if profile.symbols.is_empty() {
+            module.functions.iter().map(|f| f.entry).collect()
+        } else {
+            crate::target::resolve_targets(
+                &profile.symbols,
+                &module.functions,
+                &label,
+                &cfg.groups,
+                &cg,
+            )
+        };
+        for rva in targets {
+            rva_to_profile.entry(rva.get()).or_insert_with(|| {
+                counts[pi] += 1;
+                pi
+            });
         }
     }
 
+    for (pi, profile) in cfg.profiles.iter().enumerate() {
+        tracing::info!(
+            profile = %profile.name,
+            functions = counts[pi],
+            mba = passes[pi].is_some(),
+            "profile targets"
+        );
+    }
+    for (rva, &pi) in &rva_to_profile {
+        tracing::debug!(addr = %Rva::new(*rva), profile = %cfg.profiles[pi].name, "profile applied");
+    }
+
     let cc = kamy_link::build_callconv(&module);
-    let mut transform_fn: Box<TransformFn> = if let Some(mba) = mba_pass {
-        Box::new(
-            move |func: &mut kamy_core::ir::IrFunction, intensity: f32| {
-                mba.run_with_intensity(func, intensity);
-            },
-        )
-    } else {
-        Box::new(|_: &mut kamy_core::ir::IrFunction, _: f32| {})
-    };
+    let mut transform_fn: Box<TransformFn> =
+        Box::new(move |rva: Rva, func: &mut IrFunction, intensity: f32| {
+            if let Some(&pi) = rva_to_profile.get(&rva.get()) {
+                if let Some(mba) = &passes[pi] {
+                    mba.run_with_intensity(func, intensity);
+                }
+            }
+        });
 
     let (image, report) = kamy_link::protect_with_transforms(
         &pe,
@@ -165,4 +200,25 @@ fn with_profile(input: &Path, output: &Path, profile_path: &Path) -> anyhow::Res
         tracing::info!(reason = %reason, count, "reject summary");
     }
     Ok(())
+}
+
+fn mba_from(sp: &kamy_config::SemanticPass) -> kamy_transforms::MbaPass {
+    kamy_transforms::MbaPass {
+        config: kamy_transforms::mba::MbaConfig {
+            iterations: sp.iterations,
+            probability: sp.probability,
+            semantics: kamy_transforms::mba::MbaSemantics {
+                add: sp.semantics.add,
+                sub: sp.semantics.sub,
+                xor: sp.semantics.xor,
+            },
+            bitwidths: kamy_transforms::mba::MbaBitwidths {
+                bit8: sp.bitwidths.bit8,
+                bit16: sp.bitwidths.bit16,
+                bit32: sp.bitwidths.bit32,
+                bit64: sp.bitwidths.bit64,
+            },
+        },
+        seed: 42,
+    }
 }

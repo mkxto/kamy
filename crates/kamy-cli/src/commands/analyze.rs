@@ -87,7 +87,7 @@ pub(crate) fn run(
             .iter()
             .map(|p| SymbolSelector::Pattern(p.clone()))
             .collect();
-        let set = crate::target::resolve_targets(&selectors, functions, &label);
+        let set = crate::target::resolve_targets(&selectors, functions, &label, &[], &cg);
         writeln!(
             report,
             "selected      {} (globs: {})",

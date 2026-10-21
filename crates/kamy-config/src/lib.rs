@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub profiles: Vec<Profile>,
     #[serde(default)]
+    pub groups: Vec<Group>,
+    #[serde(default)]
     pub exclude: Vec<Exclude>,
 }
 
@@ -73,6 +75,14 @@ pub struct Profile {
     pub passes: Vec<Pass>,
     #[serde(default)]
     pub compiler_settings: CompilerSettings,
+    #[serde(default)]
+    pub symbols: Vec<SymbolSelector>,
+}
+
+/// A reusable named set of selectors referenced by a profile via `!Group`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    pub name: String,
     #[serde(default)]
     pub symbols: Vec<SymbolSelector>,
 }
@@ -208,6 +218,8 @@ pub enum SymbolSelector {
     Name(String),
     Pattern(String),
     Address(u64),
+    Group(String),
+    TopXref(usize),
 }
 
 /// A function-exclusion rule.

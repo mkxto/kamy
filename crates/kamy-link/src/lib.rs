@@ -124,7 +124,7 @@ pub fn protect_with_transforms(
     functions: &[Function],
     opts: &Options,
     cc: &dyn CallingConvLookup,
-    transform: &mut dyn FnMut(&mut IrFunction, f32),
+    transform: &mut dyn FnMut(Rva, &mut IrFunction, f32),
 ) -> anyhow::Result<(Vec<u8>, Report)> {
     protect_inner(
         pe,
@@ -150,7 +150,7 @@ fn ssa_body(
     module: &Module,
     func: &Function,
     cc: &dyn CallingConvLookup,
-    transform: &mut dyn FnMut(&mut IrFunction, f32),
+    transform: &mut dyn FnMut(Rva, &mut IrFunction, f32),
     base: u64,
     new_va: u64,
 ) -> Result<(Vec<u8>, PrologueShape), RejectionReason> {
@@ -169,7 +169,7 @@ fn ssa_body(
             return Err(RejectionReason::UnsupportedInstruction);
         }
         kamy_lift::ssa::construct_ssa(&mut result);
-        transform(&mut result.func, intensity);
+        transform(func.entry, &mut result.func, intensity);
         kamy_transforms::optimize(&mut result.func);
         if uses_unsupported_flags(&result.func) {
             return Err(RejectionReason::UnsupportedFlags);

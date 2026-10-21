@@ -39,7 +39,7 @@ pub fn protect_identity(
     module.functions = discover_functions(&module, &seeds);
 
     let cc = kamy_link::build_callconv(&module);
-    let mut identity = |_: &mut IrFunction, _: f32| {};
+    let mut identity = |_: kamy_core::Rva, _: &mut IrFunction, _: f32| {};
     let opts = kamy_link::Options {
         selector: selector.cloned(),
         ..Default::default()
