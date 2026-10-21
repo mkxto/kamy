@@ -43,6 +43,8 @@ Living document. Updated as work lands.
 | Pressure-aware transform budgeting (D28) | Partial | Intensity knob on the MBA pass landed (`run_with_intensity`); the retry-at-lower-intensity ladder is not wired. |
 | .pdata/UNWIND_INFO emission for generated prologues (D31) | ✅ Done | `.kamyxd` section + UNWIND_INFO describing the push/align prologue; body frame-alloc codes are Phase 3. |
 | Differential self-test harness (kamy-verify) | ✅ Done | `kamy verify --original X --protected Y`: exit + stdout diff over N seeded runs. The Phase 2 shipping gate. |
+| 8/16-bit register write semantics | ✅ Done | `write_gpr_sub64`: 8/16-bit GPR writes merge into the live register (`(old & ~mask) | zext`) rather than zero-extending; only 32-bit zero-extends (x86). Fixed a latent partial-register miscompile (`mov al,X` dropped the destination's upper bits). `b3b326a`. |
+| Callee-side argument inference (own functions) | ✅ Done | Leaf-only read-before-write liveness over the Win64 argument registers narrows signatures for the target's unnamed functions (`kamy-analysis::infer_signature`); sound-by-construction — tail-forwarding/indirect exits force all args live-out, ambiguous/non-contiguous prefixes bail to the four-arg default. +25 SSA-lowered / −26 RegisterPressure over the partial-register-fix baseline; corpus 21/23. `214e2ee`. |
 
 ### Known bugs
 
