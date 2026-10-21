@@ -146,9 +146,9 @@ Living document. Updated as work lands.
 | ObscureConstants | Not started |
 | MutationEngine | Not started |
 | LoopEncodeSemantics | Not started (design settled: add/sub/and/xor as carry/bit-propagation loops — research.md §2.8) |
-| Per-function config profiles + symbol matching | Not started |
+| Per-function config profiles + symbol matching | 🔶 In progress | PDB function naming (`kamy-pdb`: RVA→name from public + procedure symbols; `sub_<rva>` fallback) wired into `analyze`; `target::resolve_targets` maps config `SymbolSelector` name/pattern/address → function RVAs via PDB/export/`sub_` labels (`*`/`?` glob), previewable with `analyze --select`. Call-graph xref map (`kamy-analysis::build_call_graph`/`top_xref`) ranks the hottest functions (`analyze` top-references report). Remaining: config groups + top-N-xref profile targeting and per-profile application/reporting. |
 | Jump table recovery & lowering (D24) | Layers 0 + 2 (detect + **tableless ladder**) done | Layer 0: `jmp [rip+slot]` classified at discovery; link skips import thunks, reports in-image static-ptr as `ResolvableIndirect`. Layer 2 detect: per-function use-def DAG + petgraph VF2 (research.md §10.5) recovers the table (bound-or-reject following index copies, in-range cross-check) and tags `Terminator::Switch`. **Lowering:** the lifter expands the dispatch into a tableless compare ladder (`index==k → entries[k]`); the function SSA-lowers like any other and **no table survives** (matching CodeDefender). Verbatim table-retarget (`.kamytb`, `build_switch_body`, `RecoverableSwitch`) removed. Runtime-verified by `console_jtable`. |
-| Trampoline stub obfuscation (D29: flavor diversification + junk fill + direct-call re-pointing) | Not started |
+| Function cross-reference / call-graph map (#18) | ✅ Done | `kamy-analysis::build_call_graph`: direct call edges + per-function incoming call-site counts; `top_xref(n)` yields the high-xref set. Surfaced in `analyze` (top references + per-function xref column). Enables high-xref targeting for #29. `4bebf5c`. |
 
 ## Phase 5 — Advanced Passes
 
