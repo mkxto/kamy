@@ -18,6 +18,7 @@ kamy-config.workspace = true
 kamy-corpus.workspace = true
 kamy-core.workspace = true
 kamy-pe.workspace = true
+kamy-pdb.workspace = true
 kamy-disasm.workspace = true
 kamy-link.workspace = true
 kamy-transforms.workspace = true

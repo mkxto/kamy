@@ -34,6 +34,7 @@ kamy-observe = { path = "crates/kamy-observe", version = "0.0.0" }
 kamy-corpus = { path = "crates/kamy-corpus", version = "0.0.0" }
 kamy-run = { path = "crates/kamy-run", version = "0.0.0" }
 kamy-triage = { path = "crates/kamy-triage", version = "0.0.0" }
+kamy-pdb = { path = "crates/kamy-pdb", version = "0.0.0" }
 
 # External crates
 iced-x86 = "1.21.0"
@@ -48,6 +49,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 rand_chacha = "0.10.0"
 rand_core = "0.10.1"
 petgraph = "0.6.5"
+pdb = "0.8.0"
 windows = { version = "0.58.0", features = [
     "Win32_Foundation",
     "Win32_System_Threading",

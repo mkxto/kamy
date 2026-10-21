@@ -181,7 +181,9 @@ fn main() -> anyhow::Result<()> {
         ansi: None,
     })?;
     match cli.command {
-        Command::Analyze { input, output, .. } => commands::analyze::run(&input, output.as_deref()),
+        Command::Analyze { input, pdb, output } => {
+            commands::analyze::run(&input, pdb.as_deref(), output.as_deref())
+        }
         Command::Protect {
             input,
             profile,
