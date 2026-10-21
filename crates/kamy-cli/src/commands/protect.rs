@@ -87,6 +87,12 @@ fn with_profile(
 
     let bytes = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
     let pe = PeFile::parse(&bytes).with_context(|| format!("parsing {}", input.display()))?;
+    if cfg.module_settings.injection.enabled {
+        anyhow::ensure!(
+            pe.subsystem() != 1,
+            "SDK module injection is prohibited for kernel images"
+        );
+    }
 
     let mut module = pe.to_module();
     let seeds = pe.seeds();
@@ -104,6 +110,44 @@ fn with_profile(
             .get(&rva.get())
             .map_or_else(|| format!("sub_{:x}", rva.get()), |n| (*n).to_string())
     };
+    let injection = &cfg.module_settings.injection;
+    let plugins = if injection.enabled {
+        injection
+            .plugins
+            .iter()
+            .map(|plugin| {
+                let bytes = std::fs::read(&plugin.path).with_context(|| {
+                    format!(
+                        "reading plugin {} from {}",
+                        plugin.name,
+                        plugin.path.display()
+                    )
+                })?;
+                Ok(kamy_link::module::Plugin {
+                    name: plugin.name.clone(),
+                    module: kamy_pe::module::AuthoredModule::parse(&bytes)
+                        .with_context(|| format!("parsing plugin {}", plugin.name))?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    let mut entries: Vec<_> = module
+        .functions
+        .iter()
+        .map(|function| (function.entry, label(function.entry)))
+        .collect();
+    entries.extend(
+        kamy_link::module::planned_functions(&module, &plugins)?
+            .into_iter()
+            .map(|function| {
+                (
+                    function.rva,
+                    format!("{}::{}", function.plugin, function.name),
+                )
+            }),
+    );
 
     let passes: Vec<Option<kamy_transforms::MbaPass>> = cfg
         .profiles
@@ -120,15 +164,9 @@ fn with_profile(
     let mut counts = vec![0usize; cfg.profiles.len()];
     for (pi, profile) in cfg.profiles.iter().enumerate() {
         let targets: HashSet<Rva> = if profile.symbols.is_empty() {
-            module.functions.iter().map(|f| f.entry).collect()
+            entries.iter().map(|(rva, _)| *rva).collect()
         } else {
-            crate::target::resolve_targets(
-                &profile.symbols,
-                &module.functions,
-                &label,
-                &cfg.groups,
-                &cg,
-            )
+            crate::target::resolve_targets(&profile.symbols, &entries, &cfg.groups, &cg)
         };
         for rva in targets {
             rva_to_profile.entry(rva.get()).or_insert_with(|| {
@@ -168,13 +206,21 @@ fn with_profile(
         options.pdata_section.clone_from(&section_name.value);
     }
 
-    let (image, report) = kamy_link::protect_with_transforms(
+    let mode = match injection.mode {
+        kamy_config::InjectionMode::Inline => kamy_link::module::EntryMode::Inline,
+        kamy_config::InjectionMode::InitTable => kamy_link::module::EntryMode::InitTable,
+    };
+    let (image, report) = kamy_link::module::protect_with_modules(
         &pe,
         &module,
         &module.functions,
         &options,
         &cc,
         &mut *transform_fn,
+        kamy_link::module::Injection {
+            plugins: &plugins,
+            mode,
+        },
     )?;
 
     std::fs::write(output, &image).with_context(|| format!("writing {}", output.display()))?;

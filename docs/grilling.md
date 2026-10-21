@@ -423,11 +423,11 @@ PE-specific code lives ONLY in `kamy-pe`, `kamy-seh`, `kamy-link`, `kamy-disasm`
 
 ### D17 — Plugin/SDK Architecture
 
-**Decision:** Support authored-module symbol/relocation linking under D38; defer the general user-facing SDK to v2+.
+**Decision:** Authored-module linking follows D38. D39 supersedes the original public-SDK deferral with a configurable Rust-only SDK/plugin system.
 
-**Reasoning:** The vendor's [Module Extension System](https://codedefender.io/blog/2025/03/27) statically links compiled C/C++/Rust functions and data into a host. This is not a COFF-object-only SDK contract. D38 specifies the authored-module path and optional payload scope; a general public SDK remains outside this epic.
+**Reasoning:** The vendor's [Module Extension System](https://codedefender.io/blog/2025/03/27) is the static-linking reference, not a requirement to support every vendor source language. Kamy plugins are authored and built in Rust; native object files are compiler intermediates, not a public C/C++ plugin interface.
 
-**Implication:** The linker consumes module function/data symbols and authored relocations. Optional Kamy payload support does not require a general user-facing SDK.
+**Implication:** Consume specialized DLL code/data symbols and exact authored relocations. Keep plugin compilation and injection separate from host protection.
 
 ---
 
@@ -737,9 +737,19 @@ D5 zero-spill, D16 format-agnostic core, D22 safe rejection, and D24 use-def DAG
 - Host code is inferred from an already-linked image and may be safely rejected. Kamy-authored Rust modules are compiled with **unmerged DLL data directories (one directory per section)**; functions become code symbols, `.rdata`/`.data`/`.bss` become data symbols, and authored relocations enter the same linker/reference machinery directly. Their reference coverage is **exact by construction**, not guessed by host heuristics; host safe-reject does not gate module references. Module functions remain pass-eligible and need valid unwind metadata. This does not waive instruction, ABI, or zero-spill correctness.
 - EP redirection and moving the original startup are independent. A transform-only returnable DLL entry points directly into `.kamy` and returns to the loader; exports are rebased and DLL header semantics preserved. Kernel EP stays pinned and untouched. EXE startup may remain resident or move according to resolved references.
 - Injection is optional, per-build, **off by default and off for kernel entries**. Preserve entry arguments, TLS ordering, stack/return ABI, and CET semantics. For an EXE init table, the final in-range original entry must not return; never execute a past-`end` slot. For DLL payloads, sequence a payload then tail-transfer to `DllMain`, preserving entry arguments and its return value, or explicitly exempt the final entry from status checking. Never interpret `DllMain`'s successful `TRUE` as a failed init status.
-- Section naming/blanking/rebranding is optional, per-build, **off by default** ([#34](https://github.com/mkxto/kamy/issues/34)); `.kamy` remains the normal name. Neither names nor payload injection are prerequisites for relocation correctness. A general public SDK remains deferred (D17).
+- Section naming/blanking/rebranding is optional, per-build, **off by default** ([#34](https://github.com/mkxto/kamy/issues/34)); `.kamy` remains the normal name. Neither names nor payload injection are prerequisites for relocation correctness. The original public-SDK deferral is superseded by D39.
 
 Vendor claims about enforcing CFG, longjmp/SAFESEH registration, and unwind-safe syscalls are not measured sample behavior and do not expand this epic's gates.
+
+### D39 — Configurable Rust SDK & Plugins
+
+**Decision:** The user promotes a reusable SDK/plugin system into this epic and explicitly limits plugin authoring to **Rust**. No C/C++ SDK, headers, templates, or supported plugin workflow.
+
+- A `no_std` Rust SDK defines a Win64 `extern "system"` callback receiving the original three entry arguments and returning a zero-success status. Rust's native compiler/linker outputs do not imply support for another authoring language.
+- A Cargo-based build command produces a specialized DLL with dedicated data-directory sections and versioned embedded code/data/reference metadata, derived from compiler-authored native COFF relocations and symbols. DLL consumers do not need object sidecars or host inference. This preserves D38's module model rather than replacing it with a COFF-only consumer.
+- YAML opts into an ordered list of named plugin artifacts, with paths relative to the profile. Loader mode is configurable. Qualified `plugin::symbol` names select the same transform passes as host code. No built-in payload, runtime DLL loading, or plugin execution inside the protection tool.
+- D5 zero-spill, D16 crate boundaries, D37 reference rewriting and D38 target-specific entry/unwind/TLS/CET contracts remain binding. Unsupported module constructs fail the build/injection contextually; never omit a callback or verbatim-relocate rejected module code.
+
 
 
 ## Decision Summary
@@ -762,7 +772,7 @@ Vendor claims about enforcing CFG, longjmp/SAFESEH registration, and unwind-safe
 | D14 | Win32metadata | Pre-process, load once at startup, shared across jobs |
 | D15 | Delivery model | CLI-first, SaaS later |
 | D16 | ELF timing | PE-only v1, abstract for ELF from the start |
-| D17 | Plugin/SDK | Authored-module linker path under D38; public SDK deferred |
+| D17 | Plugin/SDK | D38 authored linking; D39 configurable Rust-only public SDK |
 | D18 | Module settings | All except ida_crasher in v1 |
 | D19 | Crate structure | 12 crates as designed |
 | D20 | Diversification | Assembler shuffle + IR-level diversify pass |
@@ -784,6 +794,7 @@ Vendor claims about enforcing CFG, longjmp/SAFESEH registration, and unwind-safe
 | D36 | kamy-corpus crate | Orchestration crate; kamy-verify stays format-agnostic |
 | D37 | Relocation rebuild | Complete references, conservative host residency, no thunks, selective reclamation, consistent non-enforcing CFG |
 | D38 | Modules & entry ABI | Exact authored-module refs; returnable DLL EP direct, kernel EP pinned; injection/names optional |
+| D39 | Rust SDK/plugins | Cargo-built exact metadata modules, ordered opt-in injection, no C/C++ support |
 
 ---
 

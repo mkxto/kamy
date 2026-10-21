@@ -359,7 +359,7 @@ its accumulator over 20,000 iterations (`relocated` = 0 corpus-wide — verbatim
 movement is gone). The computed-`jmp`/pad obfuscation CodeDefender layers on top
 is a separate Phase-4 transform.
 
-## Relocation rebuild — current (#17, D37–D38)
+## Relocation rebuild — current (#17, D37–D39)
 
 The supported input is x86-64 PE32+; x86/PE32 is out of scope.
 
@@ -392,7 +392,7 @@ non-enforcing (`GuardFlags=0x100` when instrumented), with cleared guard tables,
 valid cookie targets and relocated check/dispatch slots.
 
 Verified: formatting, clippy with denied warnings, workspace/all-target build,
-and **197 tests** pass. Differential corpus: **23/23 PASS**, **1314/11202
+and **225 tests** pass. Differential corpus: **23/23 PASS**, **1314/11202
 SSA-lowered (11.7%)**, zero verbatim relocations and zero `NoThunkSpace` rejects.
 The pre-change executable baseline was 21/23 PASS and 2100 SSA-lowered; coverage
 remains conservative, and the previously failing throw helpers stay resident.
@@ -430,5 +430,48 @@ mapped-section adjacency. Eight differential runs pass, including SEH through
 the moved frame. A portable multi-page regression preserves rounded virtual
 coverage while removing dead raw bytes.
 
-Remaining: configurable SDK/plugin authored-module injection (#32). Exact
-module metadata remains part of #18/#32, not host inference.
+Configurable Rust-only SDK/plugin injection (#32, D39) is implemented.
+`kamy plugin build` compiles a freestanding Cargo `staticlib` with native fat
+LTO, retains compiler symbol/relocation provenance, and packages a specialized
+DLL with unmerged data directories. `kamy-sdk` supplies the Win64 callback,
+aborting panic handler and optional linker-filled init-table bounds. There is
+no C/C++ SDK or runtime plugin-DLL loading.
+
+Enabled YAML profiles select an ordered list of named artifacts and either
+inline or init-table entry sequencing. Paths resolve relative to the profile;
+`plugin::symbol` selectors use the existing transform pipeline. Every module
+function must pass SSA/codegen and unwind reconstruction; an unsupported or
+over-budget function fails injection rather than being omitted or relocated
+verbatim. A combined bounds-check/counter probe exercised this strict
+`RegisterPressure` failure. Injection remains off by default, requires an
+original entry point, and rejects kernel images before discovery.
+
+Authored references retain compiler symbol bases and signed addends rather
+than guessing pointers from constants. Portable regressions and real Rust
+builds cover `__ImageBase + RVA`, local data interiors and LLVM's negative
+REL32 addend for trailing immediates. Compiler provenance is consumed and
+stripped from the protected output; numeric literals are not rebased.
+
+Runtime acceptance uses Rust-only plugin and EXE/DLL fixtures:
+- Two ordered callbacks produce `trace=12` in both entry modes, with an MBA
+  profile selecting both authored functions.
+- Forced-ASLR DLL loads preserve the exact instance/reason/reserved arguments
+  and the original `DllMain` TRUE return.
+- `RtlLookupFunctionEntry` and `RtlVirtualUnwind` validate the generated loader's
+  72-byte frame and recover its caller under forced ASLR, including pure-PIC
+  inline output with a zero BaseReloc directory and no unnecessary table.
+- EXE and DLL bounds callbacks read the linker-filled table slots correctly;
+  the DLL case runs under forced ASLR.
+- A non-inlined Rust dependency function is included by native LTO, lowered
+  with its caller and executed after linking.
+- Nonzero callback status stops both EXE/DLL entry modes with `0xc0000409`;
+  original startup is not reached. A disabled missing-plugin path is ignored.
+- An injected integrity callback preserves `console_tls` behavior across eight
+  differential runs. Import names/IAT RVAs, runtime ranges and stripped module
+  provenance are checked on both ordered EXE/DLL outputs.
+
+Module imports, module TLS/PE export directories, language-handler unwind,
+interior-code pointers and unsupported instruction/operand forms remain explicit
+errors. Exact authored reference coverage does not waive D5 or instruction/ABI
+support. Enforcing module CFG and the vendor's unobserved extras remain outside
+this epic's gates.

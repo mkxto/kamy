@@ -3,6 +3,7 @@
 mod directories;
 mod exports;
 mod imports;
+pub mod module;
 mod pdata;
 mod rebuild;
 mod references;

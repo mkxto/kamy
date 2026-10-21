@@ -354,6 +354,7 @@ dependencies = [
  "anyhow",
  "iced-x86",
  "kamy-core",
+ "object",
  "tracing",
 ]
 
@@ -365,6 +366,10 @@ dependencies = [
  "tracing",
  "windows",
 ]
+
+[[package]]
+name = "kamy-sdk"
+version = "0.0.0"
 
 [[package]]
 name = "kamy-seh"
@@ -446,6 +451,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
  "windows-sys",
+]
+
+[[package]]
+name = "object"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

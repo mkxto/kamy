@@ -31,6 +31,30 @@ impl Config {
             validate_section_name(&name.value)
                 .context("validating module_settings.custom_section_name")?;
         }
+        let injection = &config.module_settings.injection;
+        if injection.enabled {
+            anyhow::ensure!(
+                !injection.plugins.is_empty(),
+                "enabled injection requires plugins"
+            );
+            let mut names = std::collections::HashSet::new();
+            for plugin in &injection.plugins {
+                anyhow::ensure!(
+                    !plugin.name.is_empty() && !plugin.name.contains("::"),
+                    "plugin name MUST be nonempty and MUST NOT contain ::"
+                );
+                anyhow::ensure!(
+                    names.insert(&plugin.name),
+                    "duplicate plugin name {}",
+                    plugin.name
+                );
+                anyhow::ensure!(
+                    !plugin.path.as_os_str().is_empty(),
+                    "plugin {} has an empty path",
+                    plugin.name
+                );
+            }
+        }
         Ok(config)
     }
 
@@ -40,7 +64,15 @@ impl Config {
         tracing::debug!(path = %path.display(), "loading protection profile");
         let yaml = std::fs::read_to_string(path)
             .with_context(|| format!("reading profile {}", path.display()))?;
-        let cfg = Self::from_yaml_str(&yaml)?;
+        let mut cfg = Self::from_yaml_str(&yaml)?;
+        for plugin in &mut cfg.module_settings.injection.plugins {
+            if plugin.path.is_relative() {
+                plugin.path = path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(&plugin.path);
+            }
+        }
         tracing::debug!(
             profiles = cfg.profiles.len(),
             version = %cfg.version,
@@ -63,6 +95,32 @@ pub struct ModuleSettings {
     pub fake_pdb_string: Toggle,
     #[serde(default)]
     pub custom_section_name: Toggle,
+    #[serde(default)]
+    pub injection: Injection,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Injection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: InjectionMode,
+    #[serde(default)]
+    pub plugins: Vec<Plugin>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InjectionMode {
+    Inline,
+    #[default]
+    InitTable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Plugin {
+    pub name: String,
+    pub path: std::path::PathBuf,
 }
 
 /// An opt-in setting carrying an associated string value.
@@ -405,6 +463,25 @@ exclude:
                 Config::from_yaml_str(&yaml).expect("disabled section name should be ignored");
             assert!(!cfg.module_settings.custom_section_name.enabled);
             assert_eq!(cfg.module_settings.custom_section_name.value, expected);
+        }
+    }
+
+    #[test]
+    fn enabled_injection_rejects_ambiguous_plugin_identities() {
+        for (plugins, reason) in [
+            ("[]", "requires plugins"),
+            (
+                "[{name: a, path: a.dll}, {name: a, path: b.dll}]",
+                "duplicate plugin name a",
+            ),
+            ("[{name: 'a::b', path: a.dll}]", "MUST NOT contain ::"),
+            ("[{name: a, path: ''}]", "empty path"),
+        ] {
+            let yaml = format!(
+                "version: '1'\nmodule_settings:\n  injection:\n    enabled: true\n    plugins: {plugins}\n"
+            );
+            let error = Config::from_yaml_str(&yaml).unwrap_err();
+            assert!(format!("{error:#}").contains(reason));
         }
     }
 }

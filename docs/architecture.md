@@ -130,6 +130,7 @@ kamy/
 │   ├── kamy-verify/        # SMT verification, test-vector equivalence, coverage reporting
 │   ├── kamy-config/        # Profile/config parsing (YAML), per-function layer selection
 │   ├── kamy-observe/       # tracing subscriber + log config (terminal-first diagnostics)
+│   ├── kamy-sdk/           # no_std Rust plugin entry ABI and linker-bound symbols
 │   └── kamy-cli/           # CLI binary
 ├── docs/
 │   ├── research.md
@@ -159,6 +160,10 @@ module_settings:
   custom_section_name:
     enabled: false
     value: ''
+  injection:
+    enabled: false
+    mode: init-table
+    plugins: []
 
 profiles:
 - name: light
@@ -373,11 +378,42 @@ For supported plain lowered code, `kamy-seh` derives stack/nonvolatile state fro
 - A transform-only returnable DLL entry is addressed **directly in `.kamy`**, with no `.text` stub; preserve arguments and return to the loader. Rebase moved exports' EAT RVAs and preserve DLL/header semantics ([#35](https://github.com/mkxto/kamy/issues/35)). Kernel EP remains pinned and untouched.
 - Payload injection is per-build, **off by default and off for kernel entries** ([#32](https://github.com/mkxto/kamy/issues/32)). Authored module functions use the same passes and unwind regeneration as lowered host functions; module RW data does not imply a mandatory runtime.
 - The [published vendor init loader](https://github.com/codedefender-io/plugins) forwards three entry arguments, status-checks callbacks, and shows a past-`end` `musttail`. In the shipped EXE, the original nonreturning startup is the last element **inside** `[begin,end)`; the past-`end` call is dead and MUST NOT be replicated as a continuation. A returning `DllMain` success (`TRUE`) MUST NOT be status-checked against zero. DLL injection instead preserves the entry arguments/return with payload-then-tail-entry sequencing, or a separately handled final callback. Preserve TLS ordering and CET.
-- Optional section-name blanking/rebranding is **off by default**, separate from relocation correctness; `.kamy` is the normal code/metadata name and `.pdata` holds the fresh exception table ([#34](https://github.com/mkxto/kamy/issues/34)). The existing `module_settings.custom_section_name` toggle controls the policy described in §5. A general public SDK remains deferred.
+- Optional section-name blanking/rebranding is **off by default**, separate from relocation correctness; `.kamy` is the normal code/metadata name and `.pdata` holds the fresh exception table ([#34](https://github.com/mkxto/kamy/issues/34)). The existing `module_settings.custom_section_name` toggle controls the policy described in §5. D39 supplies the configurable Rust-only SDK/plugin interface; no C/C++ plugin surface.
 
 Vendor module claims (enforcing CFG, longjmp/SAFESEH registration, unwind-safe syscalls) are not measured sample behavior or additional gates for this epic ([vendor blog](https://codedefender.io/blog/2025/03/27)).
 
-### 8.4 CET Compatibility
+### 8.4 Rust SDK & Plugin Configuration (D39)
+
+`kamy-sdk` is a dependency-free `no_std` Rust crate. `plugin!(initialize)` exports
+the default callback and the module's aborting panic handler; `declare_init_table!()` optionally declares linker-filled
+`SYMBOL_init_table_start`/`SYMBOL_init_table_end` slots. The callback uses
+`unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32`.
+These are entry registers, not main arguments. Zero continues; nonzero fast-fails.
+
+`kamy plugin build --manifest-path <Cargo.toml> -o <plugin.dll>` compiles a Rust
+`staticlib` Cargo target for `x86_64-pc-windows-msvc` with native fat LTO, then
+packages compiler metadata in the specialized DLL. Native COFF objects are private build intermediates.
+Consumer input is the self-contained DLL, with code/data symbol boundaries,
+layout-sensitive references and dedicated Exception/BaseReloc sections.
+Host inferred completeness does not gate this metadata. Unsupported module
+directories, operand forms or SSA/unwind lowering fail contextually.
+
+Authored references retain a symbol base and signed compiler addend. An x64
+`REL32` field can encode a negative addend for bytes following its displacement;
+its encoded expression is not necessarily a valid standalone RVA. Rebase the
+symbol before applying the addend, then let decoding recover the architectural
+RIP target. `__ImageBase` binds to the host base, distinct from module-local data.
+
+`module_settings.injection` is disabled by default. Enabling it requires an
+ordered `plugins: [{name: ..., path: ...}]` list. Paths resolve relative to the
+profile, not the current directory. Names MUST be unique, nonempty and contain
+no `::`; profiles select module functions as `plugin::symbol`. `mode` accepts
+`inline` or `init-table`. DLL entry results are propagated without treating
+successful `TRUE` as a callback failure; kernel injection is prohibited.
+The build command never loads the plugin into the protection process.
+
+
+### 8.5 CET Compatibility
 - Any pass that fakes CALL/RET must emit RDSSPQ feature check + INCSSPQ reconciliation
 - ENDBR64 insertion at indirect branch targets if CET-IBT is enabled
 - Never emit a RET that doesn't correspond to a real CALL

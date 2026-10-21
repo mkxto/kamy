@@ -6,7 +6,7 @@ use std::collections::HashSet;
 
 use kamy_analysis::CallGraph;
 use kamy_config::{Group, SymbolSelector};
-use kamy_core::{Function, Rva};
+use kamy_core::Rva;
 
 /// Match a `*`/`?` wildcard `pattern` against `text` (`*` any run, `?` one
 /// char). No character classes — the config patterns are simple globs.
@@ -37,40 +37,23 @@ pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-/// Resolve `selectors` to the set of function entry RVAs they select. `label`
-/// yields a function's display name (PDB > export > `sub_<rva>`), so name and
-/// pattern matches work with or without a PDB.
+/// Resolves selectors against host labels and qualified plugin symbol names.
 pub(crate) fn resolve_targets(
     selectors: &[SymbolSelector],
-    functions: &[Function],
-    label: &impl Fn(Rva) -> String,
+    entries: &[(Rva, String)],
     groups: &[Group],
     cg: &CallGraph,
 ) -> HashSet<Rva> {
-    let entries: Vec<(Rva, String)> = functions
-        .iter()
-        .map(|f| (f.entry, label(f.entry)))
-        .collect();
     let mut out = HashSet::new();
     let mut active: HashSet<String> = HashSet::new();
-    resolve_into(
-        selectors,
-        &entries,
-        functions,
-        groups,
-        cg,
-        &mut active,
-        &mut out,
-    );
+    resolve_into(selectors, entries, groups, cg, &mut active, &mut out);
     out
 }
 
 /// Recursive core; `active` guards against `!Group` reference cycles.
-#[allow(clippy::too_many_arguments)]
 fn resolve_into(
     selectors: &[SymbolSelector],
     entries: &[(Rva, String)],
-    functions: &[Function],
     groups: &[Group],
     cg: &CallGraph,
     active: &mut HashSet<String>,
@@ -94,7 +77,7 @@ fn resolve_into(
             }
             SymbolSelector::Address(addr) => {
                 let rva = Rva::new(*addr as u32);
-                if functions.iter().any(|f| f.entry == rva) {
+                if entries.iter().any(|(entry, _)| *entry == rva) {
                     out.insert(rva);
                 }
             }
@@ -108,7 +91,7 @@ fn resolve_into(
                     continue;
                 }
                 if let Some(g) = groups.iter().find(|g| &g.name == name) {
-                    resolve_into(&g.symbols, entries, functions, groups, cg, active, out);
+                    resolve_into(&g.symbols, entries, groups, cg, active, out);
                 }
                 active.remove(name);
             }
@@ -119,20 +102,6 @@ fn resolve_into(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kamy_core::BasicBlock;
-    use kamy_core::Terminator;
-
-    fn func(rva: u32) -> Function {
-        Function {
-            entry: Rva::new(rva),
-            blocks: vec![BasicBlock {
-                start: Rva::new(rva),
-                end: Rva::new(rva + 1),
-                successors: vec![],
-                terminator: Terminator::Return,
-            }],
-        }
-    }
 
     #[test]
     fn glob_matches_prefix_and_middle() {
@@ -146,31 +115,38 @@ mod tests {
 
     #[test]
     fn resolves_name_pattern_and_address() {
-        let funcs = vec![func(0x1000), func(0x1040), func(0x2000)];
         let label = |rva: Rva| match rva.get() {
             0x1000 => "main".to_string(),
             0x1040 => "helper_a".to_string(),
             other => format!("sub_{other:x}"),
         };
+        let entries: Vec<_> = [0x1000, 0x1040, 0x2000]
+            .into_iter()
+            .map(Rva::new)
+            .map(|rva| (rva, label(rva)))
+            .collect();
         let sels = vec![
             SymbolSelector::Name("main".into()),
             SymbolSelector::Pattern("helper_*".into()),
             SymbolSelector::Address(0x2000),
         ];
-        let got = resolve_targets(&sels, &funcs, &label, &[], &CallGraph::default());
+        let got = resolve_targets(&sels, &entries, &[], &CallGraph::default());
         let expected: HashSet<Rva> = [0x1000, 0x1040, 0x2000].into_iter().map(Rva::new).collect();
         assert_eq!(got, expected);
     }
 
     #[test]
     fn sub_rva_label_matched_without_pdb() {
-        let funcs = vec![func(0x1000), func(0x2000)];
         let label = |rva: Rva| format!("sub_{:x}", rva.get());
+        let entries: Vec<_> = [0x1000, 0x2000]
+            .into_iter()
+            .map(Rva::new)
+            .map(|rva| (rva, label(rva)))
+            .collect();
         // Pattern targeting still works with the fallback labels.
         let got = resolve_targets(
             &[SymbolSelector::Pattern("sub_2*".into())],
-            &funcs,
-            &label,
+            &entries,
             &[],
             &CallGraph::default(),
         );
@@ -179,11 +155,15 @@ mod tests {
 
     #[test]
     fn group_selector_expands_and_guards_cycles() {
-        let funcs = vec![func(0x1000), func(0x2000)];
         let label = |rva: Rva| match rva.get() {
             0x1000 => "main".to_string(),
             other => format!("sub_{other:x}"),
         };
+        let entries: Vec<_> = [0x1000, 0x2000]
+            .into_iter()
+            .map(Rva::new)
+            .map(|rva| (rva, label(rva)))
+            .collect();
         let groups = vec![
             Group {
                 name: "a".into(),
@@ -203,8 +183,7 @@ mod tests {
         ];
         let got = resolve_targets(
             &[SymbolSelector::Group("a".into())],
-            &funcs,
-            &label,
+            &entries,
             &groups,
             &CallGraph::default(),
         );

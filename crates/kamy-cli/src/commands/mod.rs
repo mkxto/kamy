@@ -6,6 +6,7 @@ pub(crate) mod bisect;
 pub(crate) mod corpus;
 pub(crate) mod dump;
 pub(crate) mod explain_reject;
+pub(crate) mod plugin;
 pub(crate) mod protect;
 pub(crate) mod verify;
 

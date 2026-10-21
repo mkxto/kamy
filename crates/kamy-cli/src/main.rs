@@ -133,6 +133,11 @@ enum Command {
         #[command(subcommand)]
         cmd: CorpusCmd,
     },
+    /// Build Rust SDK plugins for static module injection.
+    Plugin {
+        #[command(subcommand)]
+        cmd: commands::plugin::Command,
+    },
 }
 
 #[derive(Subcommand)]
@@ -234,5 +239,6 @@ fn main() -> anyhow::Result<()> {
             vectors,
         } => commands::verify::run(&original, &protected, vectors),
         Command::Corpus { cmd } => commands::corpus::dispatch(cmd),
+        Command::Plugin { cmd } => commands::plugin::dispatch(cmd),
     }
 }

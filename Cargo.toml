@@ -35,9 +35,11 @@ kamy-corpus = { path = "crates/kamy-corpus", version = "0.0.0" }
 kamy-run = { path = "crates/kamy-run", version = "0.0.0" }
 kamy-triage = { path = "crates/kamy-triage", version = "0.0.0" }
 kamy-pdb = { path = "crates/kamy-pdb", version = "0.0.0" }
+kamy-sdk = { path = "crates/kamy-sdk", version = "0.0.0" }
 
 # External crates
 iced-x86 = "1.21.0"
+object = { version = "0.40", default-features = false, features = ["read_core", "std", "coff"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_norway = "0.9.42"
 rayon = "1.12.0"

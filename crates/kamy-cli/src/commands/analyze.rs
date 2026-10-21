@@ -124,7 +124,11 @@ pub(crate) fn run(
             .iter()
             .map(|p| SymbolSelector::Pattern(p.clone()))
             .collect();
-        let set = crate::target::resolve_targets(&selectors, functions, &label, &[], &cg);
+        let entries: Vec<_> = functions
+            .iter()
+            .map(|function| (function.entry, label(function.entry)))
+            .collect();
+        let set = crate::target::resolve_targets(&selectors, &entries, &[], &cg);
         writeln!(
             report,
             "selected      {} (globs: {})",

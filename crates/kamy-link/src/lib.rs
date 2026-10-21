@@ -1,6 +1,7 @@
 //! Reference-rewriting linker with conservative residency and native PE output.
 
 mod layout;
+pub mod module;
 mod rewrite;
 mod translation;
 

@@ -2,6 +2,10 @@ version: 1.0.0
 module_settings:
   import_protection: false
   obscure_entry_point: false
+  injection:
+    enabled: false
+    mode: init-table
+    plugins: []
 
 profiles:
 - name: default
