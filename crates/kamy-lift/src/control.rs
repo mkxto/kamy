@@ -130,13 +130,16 @@ pub(crate) fn lift_call(
 
 pub(crate) fn lift_call_indirect(
     target_val: ValueId,
+    slot_va: Option<u64>,
     b: &mut IrBuilder,
     s: &mut LiftState,
     cc: &dyn CallingConvLookup,
 ) {
-    // Indirect calls carry no resolvable target address, so assume the Win64
-    // default ABI; over-approximating the argument set is safe, never unsound.
-    let sig = cc.lookup(0);
+    // A `call [rip+slot]` into a resolved import slot carries a precise
+    // signature (fewer argument pins); register-indirect and unresolved targets
+    // pass 0 and fall back to the Win64 default over-approximation — always
+    // sound, never under-approximating the clobber set.
+    let sig = cc.lookup(slot_va.unwrap_or(0));
 
     let mut arg_vals = Vec::new();
     if let Some(sig) = &sig {

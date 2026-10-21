@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
 use super::phys::{Gpr, PhysReg, XmmReg};
 
 #[derive(Clone, Debug)]
@@ -12,38 +15,59 @@ pub trait CallingConvLookup {
     fn lookup(&self, target_va: u64) -> Option<FnSignature>;
 }
 
-/// Win64 ABI default: RCX/RDX/R8/R9 integer args, XMM0-3 float args,
-/// return in RAX (XMM0 for float). Volatile: RAX RCX RDX R8-R11 XMM0-5.
+/// The four Win64 integer-argument registers, in positional order.
+const WIN64_ARG_GPRS: [Gpr; 4] = [Gpr::Rcx, Gpr::Rdx, Gpr::R8, Gpr::R9];
+
+/// The four Win64 floating-point argument registers, in positional order.
+const WIN64_ARG_XMMS: [XmmReg; 4] = [XmmReg::Xmm0, XmmReg::Xmm1, XmmReg::Xmm2, XmmReg::Xmm3];
+
+/// Every Win64 call clobbers the full volatile set regardless of the callee's
+/// declared arguments, so a precise signature narrows only the argument pins —
+/// never the clobber set (which must stay a sound superset) and never the RAX
+/// return (threading an unused value is harmless; DCE removes it).
+fn win64_volatiles() -> Vec<PhysReg> {
+    use Gpr::*;
+    use XmmReg::*;
+    vec![
+        PhysReg::Gpr(Rax),
+        PhysReg::Gpr(Rcx),
+        PhysReg::Gpr(Rdx),
+        PhysReg::Gpr(R8),
+        PhysReg::Gpr(R9),
+        PhysReg::Gpr(R10),
+        PhysReg::Gpr(R11),
+        PhysReg::Xmm(Xmm0),
+        PhysReg::Xmm(Xmm1),
+        PhysReg::Xmm(Xmm2),
+        PhysReg::Xmm(Xmm3),
+        PhysReg::Xmm(Xmm4),
+        PhysReg::Xmm(Xmm5),
+    ]
+}
+
+/// A Win64 signature with `int_args` integer-class arguments (capped at the
+/// four register slots), the RAX return, and the full volatile clobber set.
+fn win64_sig(int_args: usize, noreturn: bool) -> FnSignature {
+    FnSignature {
+        args: WIN64_ARG_GPRS
+            .iter()
+            .take(int_args.min(WIN64_ARG_GPRS.len()))
+            .map(|g| PhysReg::Gpr(*g))
+            .collect(),
+        ret: Some(PhysReg::Gpr(Gpr::Rax)),
+        clobbers: win64_volatiles(),
+        noreturn,
+    }
+}
+
+/// Win64 ABI default: four integer args in RCX/RDX/R8/R9, return in RAX, the
+/// full volatile clobber set. The safe over-approximation for any call whose
+/// callee we cannot identify.
 pub struct Win64Default;
 
 impl Win64Default {
-    fn default_signature() -> FnSignature {
-        use Gpr::*;
-        FnSignature {
-            args: vec![
-                PhysReg::Gpr(Rcx),
-                PhysReg::Gpr(Rdx),
-                PhysReg::Gpr(R8),
-                PhysReg::Gpr(R9),
-            ],
-            ret: Some(PhysReg::Gpr(Rax)),
-            clobbers: vec![
-                PhysReg::Gpr(Rax),
-                PhysReg::Gpr(Rcx),
-                PhysReg::Gpr(Rdx),
-                PhysReg::Gpr(R8),
-                PhysReg::Gpr(R9),
-                PhysReg::Gpr(R10),
-                PhysReg::Gpr(R11),
-                PhysReg::Xmm(XmmReg::Xmm0),
-                PhysReg::Xmm(XmmReg::Xmm1),
-                PhysReg::Xmm(XmmReg::Xmm2),
-                PhysReg::Xmm(XmmReg::Xmm3),
-                PhysReg::Xmm(XmmReg::Xmm4),
-                PhysReg::Xmm(XmmReg::Xmm5),
-            ],
-            noreturn: false,
-        }
+    pub fn default_signature() -> FnSignature {
+        win64_sig(WIN64_ARG_GPRS.len(), false)
     }
 }
 
@@ -53,12 +77,155 @@ impl CallingConvLookup for Win64Default {
     }
 }
 
-/// Placeholder for the Win32metadata-backed lookup (grilling D14).
-/// Opt-in via config; becomes opt-out once the .winmd preprocessor is built.
-pub struct WinmdLookup;
+/// CRT functions with a fixed Win64 register-argument shape. The C runtime
+/// (`msvcrt`/`ucrt`) is not part of Win32 metadata, so these are curated. An
+/// entry must never undercount the register arguments — an undercount leaves
+/// the real argument register unpinned and miscompiles the call. Variadic CRT
+/// functions (`printf`, `sprintf`, …) and float-returning ones (`atof`,
+/// `strtod`, the `<math.h>` surface — their result is in XMM0, which
+/// [`win64_sig`] cannot express) are intentionally absent.
+fn crt_signature(name: &str) -> Option<FnSignature> {
+    let (int_args, noreturn) = match name {
+        "abort" => (0, true),
+        "exit" | "_exit" | "_Exit" | "quick_exit" => (1, true),
+        "malloc" | "free" | "strlen" | "wcslen" | "puts" | "putchar" | "_strdup" | "_wcsdup"
+        | "fflush" | "fclose" | "rewind" | "ftell" | "atoi" | "atol" | "atoll" | "_atoi64"
+        | "tolower" | "toupper" | "isdigit" | "isalpha" | "isspace" | "isalnum"
+        | "__acrt_iob_func" => (1, false),
+        "calloc" | "realloc" | "strcmp" | "wcscmp" | "strcpy" | "wcscpy" | "strcat" | "wcscat"
+        | "strchr" | "strrchr" | "strstr" | "fopen" | "_wfopen" | "fputs" => (2, false),
+        "memcpy" | "memmove" | "memset" | "memcmp" | "memchr" | "strncmp" | "wcsncmp"
+        | "strncpy" | "wcsncpy" | "strncat" | "fgets" | "fseek" | "strtol" | "strtoul" => {
+            (3, false)
+        }
+        "fwrite" | "fread" => (4, false),
+        _ => return None,
+    };
+    Some(win64_sig(int_args, noreturn))
+}
 
-impl CallingConvLookup for WinmdLookup {
-    fn lookup(&self, _target_va: u64) -> Option<FnSignature> {
-        todo!("Win32metadata .winmd preprocessor (D14)")
+/// Precise Win64 signature for a named import: the curated CRT table first (the
+/// C runtime is outside Win32 metadata), then the generated Win32 metadata DB
+/// (grilling D14). Unknown names fall back to the four-argument Win64 default
+/// at the call site.
+pub fn win64_import_signature(name: &str) -> Option<FnSignature> {
+    if let Some(sig) = crt_signature(name) {
+        return Some(sig);
+    }
+    IMPORT_DB.get(name).map(packed_to_signature)
+}
+
+// ── Win32 metadata DB (grilling D14) ─────────────────────────────────────────
+
+/// Compact `name -> packed signature` table generated offline from
+/// `Windows.Win32.winmd` by `tools/win32cc-gen`. Embedded so the shipping
+/// binary needs no external metadata file, and decoded once into a shared map
+/// (D14: parse once, share across jobs).
+static WIN32_DB: &[u8] = include_bytes!("../../data/win32cc.bin");
+static IMPORT_DB: LazyLock<HashMap<Box<str>, PackedSig>> =
+    LazyLock::new(|| decode_import_db(WIN32_DB));
+
+#[derive(Clone, Copy)]
+struct PackedSig {
+    /// Register-argument slots used (0..=4).
+    arg_regs: u8,
+    /// Bit `i` set => argument slot `i` is a floating-point (XMM) register.
+    float_mask: u8,
+    /// 0 = void, 1 = RAX (integer/pointer class), 2 = XMM0 (float).
+    ret: u8,
+}
+
+/// Decode the `KCC1` blob. Malformed or truncated input yields an empty table,
+/// so the engine simply keeps the Win64 default for every call.
+fn decode_import_db(bytes: &[u8]) -> HashMap<Box<str>, PackedSig> {
+    let mut map = HashMap::new();
+    if bytes.len() < 8 || &bytes[..4] != b"KCC1" {
+        return map;
+    }
+    let count = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let mut off = 8;
+    for _ in 0..count {
+        let Some(&len) = bytes.get(off) else { break };
+        off += 1;
+        let Some(name) = bytes.get(off..off + len as usize) else {
+            break;
+        };
+        off += len as usize;
+        let Some(fields) = bytes.get(off..off + 4) else {
+            break;
+        };
+        off += 4;
+        if let Ok(name) = std::str::from_utf8(name) {
+            map.insert(
+                name.into(),
+                PackedSig {
+                    arg_regs: fields[0],
+                    float_mask: fields[1],
+                    ret: fields[2],
+                },
+            );
+        }
+    }
+    map
+}
+
+fn packed_to_signature(p: &PackedSig) -> FnSignature {
+    let n = (p.arg_regs as usize).min(WIN64_ARG_GPRS.len());
+    let args = (0..n)
+        .map(|i| {
+            if p.float_mask & (1 << i) != 0 {
+                PhysReg::Xmm(WIN64_ARG_XMMS[i])
+            } else {
+                PhysReg::Gpr(WIN64_ARG_GPRS[i])
+            }
+        })
+        .collect();
+    let ret = match p.ret {
+        0 => None,
+        2 => Some(PhysReg::Xmm(XmmReg::Xmm0)),
+        _ => Some(PhysReg::Gpr(Gpr::Rax)),
+    };
+    FnSignature {
+        args,
+        ret,
+        clobbers: win64_volatiles(),
+        noreturn: false,
+    }
+}
+
+/// Calling-convention lookup backed by a precomputed `target VA → signature`
+/// map (import slots and import thunks resolved to [`win64_import_signature`]),
+/// falling back to the Win64 default for every unresolved target — including
+/// the `0` address an unresolvable indirect call passes.
+pub struct MapCallConv {
+    by_va: HashMap<u64, FnSignature>,
+    default: FnSignature,
+}
+
+impl MapCallConv {
+    pub fn new(by_va: HashMap<u64, FnSignature>) -> Self {
+        Self {
+            by_va,
+            default: Win64Default::default_signature(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_va.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_va.is_empty()
+    }
+}
+
+impl CallingConvLookup for MapCallConv {
+    fn lookup(&self, target_va: u64) -> Option<FnSignature> {
+        Some(
+            self.by_va
+                .get(&target_va)
+                .cloned()
+                .unwrap_or_else(|| self.default.clone()),
+        )
     }
 }

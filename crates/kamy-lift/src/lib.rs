@@ -292,18 +292,28 @@ fn dispatch(
             if insn.op_kind(0) == OpKind::NearBranch64 {
                 control::lift_call(insn, insn.near_branch_target(), builder, state, cc);
             } else {
+                let mut slot_va = None;
                 let target_val = match insn.op_kind(0) {
                     OpKind::Register => {
                         iced_reg_to_gpr(insn.op_register(0)).map(|g| state.get_gpr(g))
                     }
                     OpKind::Memory => {
+                        // A `call [rip+disp]` / `call [abs]` with no index names a
+                        // fixed pointer slot; iced folds RIP-relative displacement
+                        // into the absolute slot VA, matching the import-slot keys
+                        // in the calling-convention map.
+                        if insn.memory_index() == Register::None
+                            && matches!(insn.memory_base(), Register::RIP | Register::None)
+                        {
+                            slot_va = Some(insn.memory_displacement64());
+                        }
                         let addr = compute_mem_addr(insn, builder, state);
                         Some(builder.emit(IrOp::Load, &[addr], IrType::I64))
                     }
                     _ => None,
                 };
                 match target_val {
-                    Some(t) => control::lift_call_indirect(t, builder, state, cc),
+                    Some(t) => control::lift_call_indirect(t, slot_va, builder, state, cc),
                     None => {
                         tracing::warn!(
                             ip = %insn.ip(),

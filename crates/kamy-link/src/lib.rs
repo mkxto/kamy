@@ -3,8 +3,8 @@
 
 use anyhow::Context;
 use kamy_codegen::{relocate, thunk};
-use kamy_core::ir::{CallingConvLookup, IrFunction};
-use kamy_core::{Function, Module, RejectionReason, Rva, SectionFlags};
+use kamy_core::ir::{CallingConvLookup, IrFunction, MapCallConv, win64_import_signature};
+use kamy_core::{Function, Module, RejectionReason, Rva, SectionFlags, SymbolKind, Terminator};
 use kamy_disasm::function_instructions;
 use kamy_pe::{BytePatch, DirectoryUpdate, NewSection, PeEdits, PeFile};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -50,6 +50,43 @@ struct Moved {
     new_rva: u32,
     new_len: u32,
     unwind: Option<Vec<u8>>,
+}
+
+/// Resolve every call target we can name to its precise Win64 signature,
+/// keyed by target VA for [`MapCallConv`]. Two shapes resolve:
+/// an import slot (`call [rip+slot]`, keyed by the slot VA) and a single-block
+/// import thunk (`jmp [rip+slot]`, keyed by the thunk entry VA, so a direct
+/// `call thunk` also narrows). Everything else falls back to the Win64 default.
+pub fn build_import_callconv(module: &Module) -> MapCallConv {
+    let base = module.image_base;
+    let mut slot_name: HashMap<u32, &str> = HashMap::new();
+    for s in &module.symbols {
+        if s.kind == SymbolKind::Import {
+            slot_name.insert(s.rva.get(), s.name.as_str());
+        }
+    }
+
+    let mut by_va: HashMap<u64, kamy_core::ir::FnSignature> = HashMap::new();
+    for (&slot_rva, name) in &slot_name {
+        if let Some(sig) = win64_import_signature(name) {
+            by_va.insert(base + u64::from(slot_rva), sig);
+        }
+    }
+    for func in &module.functions {
+        if func.blocks.len() != 1 {
+            continue;
+        }
+        let Terminator::Indirect { slot: Some(slot) } = func.blocks[0].terminator else {
+            continue;
+        };
+        if let Some(name) = slot_name.get(&slot.get()) {
+            if let Some(sig) = win64_import_signature(name) {
+                by_va.insert(base + u64::from(func.entry.get()), sig);
+            }
+        }
+    }
+
+    MapCallConv::new(by_va)
 }
 
 /// Relocation-only path (Phase 1).
