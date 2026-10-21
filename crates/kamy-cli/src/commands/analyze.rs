@@ -21,9 +21,11 @@ pub(crate) fn run(
     let bytes = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
     let pe = PeFile::parse(&bytes).with_context(|| format!("parsing {}", input.display()))?;
 
-    let module = pe.to_module();
+    let mut module = pe.to_module();
     let seeds = pe.seeds();
-    let functions = discover_functions(&module, &seeds);
+    module.functions = discover_functions(&module, &seeds);
+    let functions = &module.functions;
+    let cg = kamy_analysis::build_call_graph(&module);
     let blocks: usize = functions.iter().map(|f| f.blocks.len()).sum();
 
     let pdb_syms = match pdb {
@@ -85,7 +87,7 @@ pub(crate) fn run(
             .iter()
             .map(|p| SymbolSelector::Pattern(p.clone()))
             .collect();
-        let set = crate::target::resolve_targets(&selectors, &functions, &label);
+        let set = crate::target::resolve_targets(&selectors, functions, &label);
         writeln!(
             report,
             "selected      {} (globs: {})",
@@ -94,6 +96,16 @@ pub(crate) fn run(
         )?;
         Some(set)
     };
+
+    writeln!(report, "\ntop references:")?;
+    for (rva, count) in cg.top_xref(8) {
+        writeln!(
+            report,
+            "  {count:>4} calls  {:#010x}  {}",
+            rva.get(),
+            label(rva)
+        )?;
+    }
 
     let mut sorted: Vec<&kamy_core::Function> = functions.iter().collect();
     sorted.sort_by_key(|f| f.entry.get());
@@ -105,9 +117,10 @@ pub(crate) fn run(
         };
         writeln!(
             report,
-            "{mark} {:#010x}  {:>3} blocks  {}",
+            "{mark} {:#010x}  {:>3} blocks  {:>4} xref  {}",
             f.entry.get(),
             f.blocks.len(),
+            cg.xref_count(f.entry),
             label(f.entry)
         )?;
     }
