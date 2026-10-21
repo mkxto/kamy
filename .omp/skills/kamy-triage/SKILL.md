@@ -43,14 +43,20 @@ corpus verify  ─▶  bisect  ─▶  dump --stage regalloc  ─▶  x64dbg (de
 | `kamy bisect <bin> --expect-exit <n> [--expect-stdout F] [--stdin-file F] [--timeout S]` | isolate the culprit set; a crash (any fatal exception) counts as fail, `--expect-stdout` also catches wrong-output/same-exit |
 | `kamy dump <in> --rva <hex> [--stage lift\|ssa\|optimize\|regalloc]` | one function's IR + allocation |
 | `kamy explain-reject <in> [--rva <hex>]` | why a function was left unlowered; per-function reason (not aggregate) |
-| `kamy protect <in> -o <out> --ssa-identity [--only-rva H,..] [--reject-rva H,..]` | SSA-identity protect; the rva flags force lowering on/off per function |
+| `kamy protect <in> -o <out> --no-transform [--only-rva H,..] [--reject-rva H,..] [--debug-map F]` | canonical SSA identity; `--ssa-identity` has identical behavior; selectors cannot override safe rejection |
 
 ## Rules & gotchas
 
-- **SSA-only is the design.** Verbatim relocation is a banned weakness (D22);
-  deselected functions (`--only-rva`/`--reject-rva`) are rejected **in place**,
-  byte-identical, never relocated. If a tool ever relocates verbatim, that is a
-  bug — stop and report, do not paper over it.
+- **SSA-only is the design.** Verbatim relocation is banned (D22/D37).
+  `--no-transform` and `--ssa-identity` run the same SSA pipeline and honor the
+  same mutually exclusive RVA selectors. Resident and deselected bodies stay
+  in place, never relocated verbatim. Their reference operands may still be
+  patched to movers; thunk-free reference rewriting requires this, so residency
+  does not mean byte-identical bytes. If a tool relocates verbatim, stop and
+  report the bug; do not paper over it.
+- **Address maps:** `protect --debug-map <csv>` works for identity and profile
+  runs. It writes actual original/final RVAs in sorted `old_rva,new_rva` CSV,
+  with `0x`-prefixed hexadecimal values. Filesystem errors fail with path context.
 - **`bisect` oracle:** the original's exit code (`--expect-exit`); a crash (AV,
   stack overflow, any fatal exception) is an unexpected exit and counts as fail.
   Add `--expect-stdout <file>` to also catch wrong-output miscompiles that exit
@@ -63,4 +69,4 @@ corpus verify  ─▶  bisect  ─▶  dump --stage regalloc  ─▶  x64dbg (de
   children, safe in bulk and in parallel. On a crash it reports the faulting RVA
   + NTSTATUS for any unhandled exception, not just access violations.
 
-Full command surface and flags: `docs/tooling.md`. Decision context: `docs/grilling.md` (D22).
+Full command surface and flags: `docs/tooling.md`. Decision context: `docs/grilling.md` (D22/D37).

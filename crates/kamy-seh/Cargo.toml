@@ -10,5 +10,6 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-kamy-core.workspace = true
-kamy-pe.workspace = true
+anyhow.workspace = true
+iced-x86.workspace = true
+tracing.workspace = true

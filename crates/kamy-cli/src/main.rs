@@ -55,20 +55,21 @@ enum Command {
     Protect {
         /// Input PE to protect.
         input: PathBuf,
-        /// Protection profile (YAML). Omit together with --no-transform.
+        /// Protection profile (YAML). Omit with --no-transform or --ssa-identity.
         #[arg(long)]
         profile: Option<PathBuf>,
         /// Protected output path.
         #[arg(short, long)]
         output: PathBuf,
-        /// Write the old->new address map here.
+        /// Write sorted old_rva,new_rva CSV using actual final RVAs.
         #[arg(long)]
         debug_map: Option<PathBuf>,
-        /// Relocate functions through the engine without applying transforms
-        /// (round-trip validation path).
+        /// Run canonical SSA identity without semantic transforms (same as --ssa-identity).
+        /// Resident bodies stay in place; their references to moved code may be patched.
         #[arg(long)]
         no_transform: bool,
-        /// Protect through the SSA backend with an identity transform.
+        /// Run canonical SSA identity without semantic transforms (same as --no-transform).
+        /// Resident bodies stay in place; their references to moved code may be patched.
         #[arg(long)]
         ssa_identity: bool,
         /// SSA-lower ONLY these function RVAs (hex, comma-separated).
@@ -195,15 +196,16 @@ fn main() -> anyhow::Result<()> {
             input,
             profile,
             output,
+            debug_map,
             no_transform,
             ssa_identity,
             only_rva,
             reject_rva,
-            ..
         } => commands::protect::run(commands::protect::Args {
             input,
             profile,
             output,
+            debug_map,
             no_transform,
             ssa_identity,
             only_rva,

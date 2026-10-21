@@ -1,6 +1,7 @@
 # Kamy — Project Status
 
 Living document. Updated as work lands.
+Current relocation work is recorded in the final #17 section; older counts below are historical measurements.
 
 ---
 
@@ -31,9 +32,9 @@ Living document. Updated as work lands.
 | Instruction selector (IR → x86, flag fusion, NativeInline re-emit) | Done | `1cfc37b` |
 | RSP pinning (lifter tracks RSP chain, regalloc pins to physical RSP) | Done | `26216be` |
 | Callee-saved activation (D31) | ✅ Done | Pool enabled; push/pop + RSP 16-byte align shim; dropped live-through `Use` pins. Required the SSA backend ABI-correctness pass below to ship correctly. |
-| Relocating linker (thunks, .kamy section, .pdata rebuild, scrub) | Done | `b29b83b` |
-| SSA linker path (lift→ssa→opt→regalloc→isel→encode + fallback) | Done | `13196a1` |
-| No-transform relocation round-trip (169 functions, verified) | ✅ Proven | `b29b83b` |
+| Reference-rewriting linker (.kamy, inbound/outbound refs, directory rebuild) | Done | D37; no original-entry thunks or `NoThunkSpace`; current #17 evidence below |
+| SSA linker path (lift→ssa→opt→regalloc→isel→encode + safe-reject) | Done | One-time preparation, deterministic layout and checked reference rewriting |
+| Historical relocation-only round-trip (169 functions) | Archived | `b29b83b`; the verbatim API/CLI path is removed |
 | No-transform SSA round-trip (coverage = SSA-lowered) | ✅ Verified, honest metric | Coverage counts **only** SSA-lowered functions; verbatim relocation (a "weak move") is now reported as a reject with its real reason, not as coverage. `sw`/`sw2`/`sw3`/`target`/`flag`/`hex` reproduce exact output, `kamy verify` PASS (deterministic). kernel32.dll: **430/1751 (~24.5%) via SSA**; rejects dominated by `RegisterPressure 848` (zero-spill D5 + over-approx call args D14), `SEHComplex 395`, `UnsupportedInstruction 39`. Full taxonomy in `kamy-core::RejectionReason`. |
 | SSA backend ABI + control-flow correctness (D31) | ✅ Done | The backend had never emitted correct code. Fixed across `08ff18c`/`23a792e`/`cd61f2a`/`167cc98`: multi-block phi destruction (sequentialized edge copies + critical-edge landing blocks) and branch resolution (sentinel block IPs so iced `BlockEncoder` links intra-function jumps); subtract-comparison flags lower to `cmp a,b` (was `test a,a`); I8 flag values get distinct registers (was hard-pinned to RAX, so compound conditions clobbered each other); deterministic interval ordering; non-pinned values avoid any register pinned by an overlapping interval (replacing an unsound mid-life eviction copy that clobbered live values such as the frame pointer); RIP-relative data; indirect calls; direct tail calls (`IrTerminator::Tail` with ABI arg liveness + frame teardown before the jmp); `CallIndirect` as a DCE root. Add- and constant-shift-based condition flags consumed by a branch/`setcc` lower by re-executing the op into a reserved R11 scratch (`mov r11,a; add r11,b; jcc`). **Residual conservative relocations (sound, D22):** self-recursive functions (lowered frame too large — needs D5 stack-frame reconstruction), functions branching on a variable-count shift flag (reproducing it needs CL, which the allocator does not model), unmodeled (NativeInline) RIP-relative instructions, indirect / switch `Unknown` terminators (indirect tail jmps included), and genuine >15-register pressure (D5 zero-spill, reducible with the D14 cc DB). |
 | MBA pass (add/sub/xor rules, D13 config shape) | Done | `1cfc37b` |
@@ -41,7 +42,7 @@ Living document. Updated as work lands.
 | MBA visible output | ✅ Done | Exposed two real lowering bugs (now fixed): constant shifts routed the count through `CL`, clobbering a live RCX the allocator does not model — now emit the immediate-form shift (`shl r,imm`); and `emit_void` hardcoded I64 store width, truncating sub-qword stores — now threads the real operand width. `sw`/`sw2`/`sw3`/`target` with MBA (`probability:100`): exit matches original, `kamy verify` PASS (200 runs), output deterministic, bytes differ from `probability:0`. **94/203 via SSA** on `sw` (was a deterministic crash before the fix). |
 | Win32metadata calling-convention DB (D14) | ✅ Done | Embedded 18.2k-fn table generated offline from `Windows.Win32.winmd` (`tools/win32cc-gen`, workspace-excluded) + curated CRT supplement; `MapCallConv` resolves import slots (`call [rip+slot]`) and single-block import thunks to precise per-arg GPR/XMM classes + return class; variadic/aggregate-return omitted (sound). Cross-checked vs IDA 9.4 til (1168 common names, 0 float/vararg errors, 19 diffs all on legacy fns where metadata is authoritative). Corpus 21/23, RegisterPressure 3576→3531, SSA-lowered 2113→2158. |
 | Pressure-aware transform budgeting (D28) | Partial | Intensity knob on the MBA pass landed (`run_with_intensity`); the retry-at-lower-intensity ladder is not wired. |
-| .pdata/UNWIND_INFO emission for generated prologues (D31) | ✅ Done | `.kamyxd` section + UNWIND_INFO describing the push/align prologue; body frame-alloc codes are Phase 3. |
+| Actual-body .pdata/UNWIND_INFO reconstruction (D31/#20) | Done for supported plain functions | Per-state v2 ranges describe body stack allocation and GPR/XMM saves; handler/scoped or unprovable states stay resident |
 | Differential self-test harness (kamy-verify) | ✅ Done | `kamy verify --original X --protected Y`: exit + stdout diff over N seeded runs. The Phase 2 shipping gate. |
 | 8/16-bit register write semantics | ✅ Done | `write_gpr_sub64`: 8/16-bit GPR writes merge into the live register (`(old & ~mask) | zext`) rather than zero-extending; only 32-bit zero-extends (x86). Fixed a latent partial-register miscompile (`mov al,X` dropped the destination's upper bits). `b3b326a`. |
 | Callee-side argument inference (own functions) | ✅ Done | Leaf-only read-before-write liveness over the Win64 argument registers narrows signatures for the target's unnamed functions (`kamy-analysis::infer_signature`); sound-by-construction — tail-forwarding/indirect exits force all args live-out, ambiguous/non-contiguous prefixes bail to the four-arg default. +25 SSA-lowered / −26 RegisterPressure over the partial-register-fix baseline; corpus 21/23. `214e2ee`. |
@@ -65,12 +66,11 @@ Living document. Updated as work lands.
    callee-saved pool: a 128-bit value that crosses a call lands there, saved with
    `movups` in the generated prologue (one combined `sub rsp` folds the alignment
    pad and the 16-byte save slots) and described as a `UWOP_ALLOC` in `UNWIND_INFO`.
-   `SAVE_XMM128` for the individual stores needs a 16-aligned frame — incompatible
-   with keeping the lowered body at `rsp%16==8` without a frame pointer — so the
-   per-register restore on an exception unwind is deferred to full SEH (D31 Phase
-   3); the ALLOC alone keeps stack walks correct. Demonstrated: a fixture whose
-   function keeps eight vectors across a call lowers via SSA into XMM6–XMM13 and
-   `verify` PASS.
+   Actual-body unwind reconstruction now emits each GPR/XMM restore from the
+   fixed frame base. Full unscaled FAR offsets cover unaligned saved-XMM slots;
+   this is verified with Windows `RtlVirtualUnwind`, without a frame pointer.
+   A fixture retaining eight vectors across a call previously lowered into
+   XMM6–XMM13 and passed differential verification.
 4. **Return-address push is materialized.** `Store(rsp, const_return_addr)` before
    Call could be folded into the Call node. Optimization, not correctness.
 5. ✅ **FIXED — Over-approximated call args (D14).** `Win64Default` passed four
@@ -376,15 +376,37 @@ extended guard-table strides, ordinal-only exports and x64 dynamic function
 overrides. Unrecognized encoded metadata still fails closed; this is not a
 claim of complete blind recovery of dynamically computed addresses.
 
-Verified: formatting, clippy with denied warnings, workspace/all-target build,
-and all 143 tests pass. Actual `analyze` runs cover console CFG, LTO and
-vendored kernel32; differential corpus verification is **23/23 PASS**, with
-**1309/11388 SSA-lowered (11.5%)**, zero verbatim relocations. The session's
-pre-change executable baseline was 21/23 PASS and 2100 SSA-lowered. The lower
-coverage is explicit conservative rejection, not an unwind/CFG reconstruction
-fix; the formerly failing throw helpers stay resident.
+The host reference cutover (#19/#20/#30/#22/#33/#35) removes entry thunks,
+`NoThunkSpace`, and the legacy verbatim API/CLI route. Both identity flags use
+the same SSA path. Resident callers' reference operands are rewritten; selected
+bodies move, and unprovable targets remain resident. Absolute pointers, EAT,
+TLS/LoadConfig references and loader fixups follow the moved map. Debug records
+are rebuilt, including POGO contributions, without treating a range start as a
+function pointer.
 
-The reference-rewriting cutover (#19/#20/#30/#22/#33/#35), image rebuild (#27),
-optional naming (#34) and authored-module injection (#32) are not yet landed.
-The legacy entry-thunk and `--no-transform` verbatim paths still exist pending
-that cutover. Exact module metadata remains part of #18/#32, not host inference.
+`kamy-seh` reconstructs the actual encoded CFG's stack/nonvolatile states.
+Version 2 ranges avoid v1's incorrect epilogue scan across fragment jumps;
+Windows `RtlVirtualUnwind` confirms branch, saved-XMM and empty-frame behavior.
+Unsupported handler/scoped or dynamic frames remain rejected. CFG is explicitly
+non-enforcing (`GuardFlags=0x100` when instrumented), with cleared guard tables,
+valid cookie targets and relocated check/dispatch slots.
+
+Verified: formatting, clippy with denied warnings, workspace/all-target build,
+and **175 tests** pass. Differential corpus: **23/23 PASS**, **1314/11202
+SSA-lowered (11.7%)**, zero verbatim relocations and zero `NoThunkSpace` rejects.
+The pre-change executable baseline was 21/23 PASS and 2100 SSA-lowered; coverage
+remains conservative, and the previously failing throw helpers stay resident.
+This does not claim their underlying miscompile is repaired.
+
+A throwaway x64 DLL proves direct moved entry/EAT, a rebased `.reloc`-backed
+function pointer, a rewritten resident direct caller, runtime translation of an
+old RVA-derived pointer, new/external-target misses, forced ASLR, and SEH unwind
+through a moved frame. All four selected functions moved; the resident caller
+stayed in place. Eight differential runs pass. Identity/no-transform outputs
+and CSV maps are byte-identical; map-write failures surface with path context.
+The probe omits unanchored linker volatile metadata; such unknown references
+remain safe-rejected rather than bypassed.
+
+Remaining: #27 import rebuilding, section recycling and tail reclamation;
+optional naming (#34) and authored-module injection (#32). Exact module
+metadata remains part of #18/#32, not host inference.

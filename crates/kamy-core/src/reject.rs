@@ -6,8 +6,6 @@ use std::fmt;
 /// `tag` values are stable identifiers safe to assert on in CI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RejectionReason {
-    /// Original function too small to host a thunk (< 5 bytes).
-    NoThunkSpace,
     /// Unresolvable indirect jump: register or table-indexed dispatch that
     /// matched no known jump-table pattern.
     BadIndirectBranch,
@@ -42,9 +40,9 @@ pub enum RejectionReason {
     /// would land on the pushed registers; rejected until shrink-wrapping
     /// reuses the function's own register saves (D5).
     CallerFrameAccess,
-    /// Excluded from SSA lowering by an explicit [`crate::FunctionSelector`]
-    /// (bisection / `--only-rva` / `--reject-rva` tooling): left byte-identical
-    /// in place. Not an engine limitation.
+    /// Excluded from SSA lowering by an explicit [`crate::FunctionSelector`].
+    /// Its body remains resident; verified reference operands may be rebased.
+    /// This is not an engine limitation.
     Deselected,
 
     // --- Target reject taxonomy (CodeDefender parity). Documented for a precise
@@ -87,7 +85,6 @@ impl RejectionReason {
     /// Stable machine-readable tag for report serialization and CI assertions.
     pub fn tag(self) -> &'static str {
         match self {
-            Self::NoThunkSpace => "NoThunkSpace",
             Self::BadIndirectBranch => "BadIndirectBranch",
             Self::ResolvableIndirect => "ResolvableIndirect",
             Self::UnsupportedInstruction => "UnsupportedInstruction",

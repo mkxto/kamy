@@ -323,6 +323,7 @@ dependencies = [
  "kamy-disasm",
  "kamy-lift",
  "kamy-pe",
+ "kamy-seh",
  "kamy-transforms",
  "tracing",
 ]
@@ -369,8 +370,9 @@ dependencies = [
 name = "kamy-seh"
 version = "0.0.0"
 dependencies = [
- "kamy-core",
- "kamy-pe",
+ "anyhow",
+ "iced-x86",
+ "tracing",
 ]
 
 [[package]]

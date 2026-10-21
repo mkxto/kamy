@@ -1,17 +1,17 @@
-//! Relocating linker: move selected functions into a new section, leave a thunk
-//! at each original entry, scrub the vacated body, and rebuild the PE.
+//! Reference-rewriting linker with conservative residency and native PE output.
 
-use anyhow::Context;
-use kamy_codegen::{relocate, thunk};
+mod rewrite;
+mod translation;
+
+use anyhow::{Context, ensure};
+use iced_x86::{Instruction, Register};
+use kamy_codegen::relocate;
 use kamy_core::ir::{CallingConvLookup, IrFunction, MapCallConv, win64_import_signature};
 use kamy_core::{Function, Module, RejectionReason, Rva, SectionFlags, SymbolKind, Terminator};
 use kamy_disasm::function_instructions;
 use kamy_pe::{BytePatch, DirectoryUpdate, NewSection, PeEdits, PeFile};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-const ENDBR64: [u8; 4] = [0xF3, 0x0F, 0x1E, 0xFA];
-const INT3: u8 = 0xCC;
-const NEAR_JMP_LEN: u32 = 5;
 const FUNCTION_ALIGN: u32 = 16;
 
 pub struct Options {
@@ -37,19 +37,29 @@ pub struct Report {
     pub rejected: Vec<(Rva, RejectionReason)>,
     pub ssa_lowered: usize,
     pub ssa_lowered_rvas: Vec<Rva>,
+    pub address_map: BTreeMap<Rva, Rva>,
 }
 
-#[derive(Clone)]
-struct PrologueShape {
-    pushed: Vec<iced_x86::Register>,
-    stack_alloc: u32,
+struct Prepared<'a> {
+    function: &'a Function,
+    instructions: Vec<Instruction>,
+    references: Vec<Operand>,
+    indirect: Vec<(usize, Register)>,
+    slot_len: u32,
+    new_rva: Option<u32>,
+    body: Vec<u8>,
+    unwind: Vec<kamy_seh::UnwindRange>,
 }
 
-struct Moved {
-    entry: Rva,
-    new_rva: u32,
-    new_len: u32,
-    unwind: Option<Vec<u8>>,
+enum Operand {
+    Branch(usize, u64),
+    Rip(usize, u64),
+}
+
+struct EncodedHelper {
+    rva: u32,
+    body: Vec<u8>,
+    unwind: Vec<kamy_seh::UnwindRange>,
 }
 
 /// Resolve every call target we can narrow to a precise Win64 signature, keyed
@@ -100,24 +110,7 @@ pub fn build_callconv(module: &Module) -> MapCallConv {
     MapCallConv::new(by_va)
 }
 
-/// Relocation-only path (Phase 1).
-pub fn protect(
-    pe: &PeFile,
-    module: &Module,
-    functions: &[Function],
-    opts: &Options,
-) -> anyhow::Result<(Vec<u8>, Report)> {
-    protect_inner(pe, module, functions, opts, |module, func, base, new_va| {
-        let instrs = function_instructions(module, func);
-        Ok((relocate(&instrs, base + u64::from(new_va))?, Err(None)))
-    })
-}
-
-/// SSA path with IR-level transforms. A function that cannot be SSA-lowered
-/// (register pressure, unsupported instruction/flags, self-recursion) is
-/// rejected in place — verbatim relocation is banned, since copying a function
-/// unchanged applies no protection and only risks relocation bugs. Only
-/// SSA-lowered (and switch-retargeted) functions are moved.
+/// Functions that cannot be transformed or safely referenced remain resident.
 pub fn protect_with_transforms(
     pe: &PeFile,
     module: &Module,
@@ -126,43 +119,42 @@ pub fn protect_with_transforms(
     cc: &dyn CallingConvLookup,
     transform: &mut dyn FnMut(Rva, &mut IrFunction, f32),
 ) -> anyhow::Result<(Vec<u8>, Report)> {
-    protect_inner(
-        pe,
-        module,
-        functions,
-        opts,
-        |module, func, base, new_rva| {
-            if let Some(sel) = opts.selector.as_ref() {
-                if !sel.allows(func.entry) {
-                    return Ok((Vec::new(), Err(Some(RejectionReason::Deselected))));
-                }
-            }
-            let new_va = base + u64::from(new_rva);
-            match ssa_body(module, func, cc, transform, base, new_va) {
-                Ok((body, shape)) => Ok((body, Ok(shape))),
-                Err(reason) => Ok((Vec::new(), Err(Some(reason)))),
-            }
-        },
-    )
+    protect_inner(pe, module, functions, opts, cc, transform)
 }
 
-fn ssa_body(
+fn ssa_instructions(
     module: &Module,
     func: &Function,
     cc: &dyn CallingConvLookup,
     transform: &mut dyn FnMut(Rva, &mut IrFunction, f32),
-    base: u64,
-    new_va: u64,
-) -> Result<(Vec<u8>, PrologueShape), RejectionReason> {
-    // D28 pressure ladder: when the zero-spill allocator overflows under a
-    // transform, retry at reduced intensity before giving up. Re-lift per
-    // attempt so each intensity sees a clean IR. The non-pressure rejects
-    // (unsupported / unsupported-flags / self-recursive) are intensity-
-    // invariant, so they surface on the first attempt and short-circuit;
-    // only `RegisterPressure` walks the ladder, relocating verbatim (the
-    // caller's fallback) only after intensity 0.0 still fails.
+) -> Result<Vec<Instruction>, RejectionReason> {
+    // Only pressure retries re-lift: each transform intensity needs clean SSA.
     const INTENSITY_LADDER: [f32; 4] = [1.0, 0.5, 0.25, 0.0];
-    let entry_va = base + u64::from(func.entry.get());
+    let base = module.image_base;
+    let entry_va = base
+        .checked_add(u64::from(func.entry.get()))
+        .ok_or(RejectionReason::InvalidReference)?;
+    for block in &func.blocks {
+        let len = block
+            .end
+            .get()
+            .checked_sub(block.start.get())
+            .ok_or(RejectionReason::LiftFailure)? as usize;
+        let bytes = module
+            .bytes_at(block.start)
+            .and_then(|bytes| bytes.get(..len))
+            .ok_or(RejectionReason::LiftFailure)?;
+        let ip = base
+            .checked_add(u64::from(block.start.get()))
+            .ok_or(RejectionReason::InvalidReference)?;
+        let mut decoder = iced_x86::Decoder::with_ip(64, bytes, ip, iced_x86::DecoderOptions::NONE);
+        while decoder.can_decode() {
+            // EIP-relative lowering currently loses address provenance in the lifter.
+            if decoder.decode().memory_base() == Register::EIP {
+                return Err(RejectionReason::UnsupportedInstruction);
+            }
+        }
+    }
     for (i, &intensity) in INTENSITY_LADDER.iter().enumerate() {
         let mut result = kamy_lift::lift_function(module, func, cc);
         if result.unsupported {
@@ -205,17 +197,11 @@ fn ssa_body(
                     &result.func,
                     &alloc,
                     base,
-                    new_va,
+                    entry_va,
                     &used,
                     &used_xmm,
                 );
-                let shape = PrologueShape {
-                    pushed: used,
-                    stack_alloc,
-                };
-                return relocate(&instrs, new_va)
-                    .map(|b| (b, shape))
-                    .map_err(|_| RejectionReason::CodegenFailure);
+                return Ok(instrs);
             }
             Err(_) => {
                 let msg = "register pressure";
@@ -235,13 +221,7 @@ fn ssa_body(
     Err(RejectionReason::RegisterPressure)
 }
 
-/// Variable-count shift condition flags (`shl cl;jc`, …) cannot be
-/// reconstructed without CL, which the allocator does not model, so a function
-/// that consumes one is relocated verbatim instead of miscompiled (reject-on-
-/// ambiguity, D22). Add flags and constant-count shift flags ARE recomputable
-/// (re-executed into a reserved scratch at the consumer) and so are no longer
-/// rejected here; subtract comparisons (`cmp a,b`) and result flags (`test
-/// r,r`) are lowered directly as before.
+/// Variable-count shift flags cannot be reconstructed without the original CL.
 fn uses_unsupported_flags(func: &IrFunction) -> bool {
     use kamy_core::ir::{IrOp, IrTerminator};
     let mut used = HashSet::new();
@@ -375,26 +355,57 @@ fn accesses_caller_frame(func: &IrFunction, rsp_chain: &HashSet<kamy_core::ir::V
     })
 }
 
-#[allow(dead_code)]
-fn gpr_to_iced(g: kamy_core::ir::Gpr) -> iced_x86::Register {
-    use kamy_core::ir::Gpr::*;
-    match g {
-        Rax => iced_x86::Register::RAX,
-        Rcx => iced_x86::Register::RCX,
-        Rdx => iced_x86::Register::RDX,
-        Rbx => iced_x86::Register::RBX,
-        Rsp => iced_x86::Register::RSP,
-        Rbp => iced_x86::Register::RBP,
-        Rsi => iced_x86::Register::RSI,
-        Rdi => iced_x86::Register::RDI,
-        R8 => iced_x86::Register::R8,
-        R9 => iced_x86::Register::R9,
-        R10 => iced_x86::Register::R10,
-        R11 => iced_x86::Register::R11,
-        R12 => iced_x86::Register::R12,
-        R13 => iced_x86::Register::R13,
-        R14 => iced_x86::Register::R14,
-        R15 => iced_x86::Register::R15,
+impl Prepared<'_> {
+    fn bind(
+        &mut self,
+        addresses: &BTreeMap<u64, u64>,
+        helpers: &BTreeMap<u32, (Register, u32)>,
+        base: u64,
+    ) -> anyhow::Result<bool> {
+        let mut changed = false;
+        for reference in &self.references {
+            match *reference {
+                Operand::Branch(index, original) => {
+                    let target = addresses.get(&original).copied().unwrap_or(original);
+                    changed |= self.instructions[index].near_branch_target() != target;
+                }
+                Operand::Rip(index, original) => {
+                    let target = addresses.get(&original).copied().unwrap_or(original);
+                    changed |= self.instructions[index].ip_rel_memory_address() != target;
+                }
+            }
+        }
+        for &(index, register) in &self.indirect {
+            let (_, rva) = helpers
+                .get(&(register as u32))
+                .context("missing indirect translator")?;
+            let target = base
+                .checked_add(u64::from(*rva))
+                .context("translator VA overflow")?;
+            changed |= self.instructions[index].near_branch_target() != target;
+        }
+        if !changed {
+            return Ok(false);
+        }
+        for reference in &self.references {
+            match *reference {
+                Operand::Branch(index, original) => {
+                    self.instructions[index].set_near_branch64(original)
+                }
+                Operand::Rip(index, original) => {
+                    self.instructions[index].set_memory_displacement64(original)
+                }
+            }
+        }
+        kamy_codegen::rebase_instructions(&mut self.instructions, addresses)?;
+        for &(index, register) in &self.indirect {
+            let rva = helpers[&(register as u32)].1;
+            self.instructions[index].set_near_branch64(
+                base.checked_add(u64::from(rva))
+                    .context("translator VA overflow")?,
+            );
+        }
+        Ok(changed)
     }
 }
 
@@ -403,15 +414,8 @@ fn protect_inner(
     module: &Module,
     functions: &[Function],
     opts: &Options,
-    mut produce_body: impl FnMut(
-        &Module,
-        &Function,
-        u64,
-        u32,
-    ) -> anyhow::Result<(
-        Vec<u8>,
-        Result<PrologueShape, Option<RejectionReason>>,
-    )>,
+    cc: &dyn CallingConvLookup,
+    transform: &mut dyn FnMut(Rva, &mut IrFunction, f32),
 ) -> anyhow::Result<(Vec<u8>, Report)> {
     let metadata = pe
         .metadata_references()
@@ -419,196 +423,639 @@ fn protect_inner(
     let reference_model = kamy_analysis::build_reference_model(module, &metadata)
         .context("building reference model")?;
     let base = module.image_base;
-    let code_rva = pe.next_section_rva().get();
+    let image_end = module.sections.iter().try_fold(0u32, |end, section| {
+        section
+            .rva
+            .get()
+            .checked_add(section.virtual_size)
+            .map(|next| end.max(next))
+            .context("original section RVA overflow")
+    })?;
+    let code_rva = align_up(image_end, pe.section_alignment())?;
+    let code_va = base
+        .checked_add(u64::from(code_rva))
+        .context("code VA overflow")?;
     let runtime_fns = pe.runtime_functions();
-    let import_slots: std::collections::HashSet<u32> =
-        pe.import_slots().iter().map(|r| r.get()).collect();
-    let funcs_by_entry: HashMap<u32, &Function> =
-        functions.iter().map(|f| (f.entry.get(), f)).collect();
+    let import_slots = pe.import_slots().iter().map(|r| r.get()).collect();
+    let funcs_by_entry = functions.iter().map(|f| (f.entry.get(), f)).collect();
     let eh_runtime = eh_runtime_functions(module, &runtime_fns, &funcs_by_entry);
-
+    let has_cfg = pe.has_cfg();
+    let cfg_usable = !has_cfg || pe.cfg_edits(Rva::new(code_rva), Rva::new(code_rva)).is_ok();
+    let has_cfg_check = has_cfg && pe.has_cfg_check();
     let mut report = Report {
         moved: Vec::new(),
         rejected: Vec::new(),
         ssa_lowered: 0,
         ssa_lowered_rvas: Vec::new(),
+        address_map: BTreeMap::new(),
     };
-    let mut code: Vec<u8> = Vec::new();
-    let mut moved: Vec<Moved> = Vec::new();
-    let mut pending_patches: Vec<BytePatch> = Vec::new();
+    let mut ordered: Vec<_> = functions.iter().collect();
+    ordered.sort_by_key(|function| function.entry);
+    let mut prepared = Vec::new();
+    for function in ordered {
+        match classify(module, function, &runtime_fns, &import_slots, &eh_runtime) {
+            Ok(()) => {}
+            Err(Some(reason)) => {
+                report.rejected.push((function.entry, reason));
+                continue;
+            }
+            Err(None) => continue,
+        }
+        let reason = if pe.subsystem() == 1 && module.entry_point == Some(function.entry) {
+            Some(RejectionReason::InvalidReference)
+        } else if opts
+            .selector
+            .as_ref()
+            .is_some_and(|selector| !selector.allows(function.entry))
+        {
+            Some(RejectionReason::Deselected)
+        } else if !reference_model.is_resolved(function.entry) {
+            Some(RejectionReason::SymbolizationUncertain)
+        } else if !cfg_usable {
+            Some(RejectionReason::InvalidReference)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            report.rejected.push((function.entry, reason));
+            continue;
+        }
+        let mut instructions = match ssa_instructions(module, function, cc, transform) {
+            Ok(instructions) => instructions,
+            Err(reason) => {
+                report.rejected.push((function.entry, reason));
+                continue;
+            }
+        };
+        let indirect = match translation::instrument(&mut instructions) {
+            Ok(indirect) => indirect,
+            Err(_) => {
+                report
+                    .rejected
+                    .push((function.entry, RejectionReason::InvalidReference));
+                continue;
+            }
+        };
+        let labels: HashSet<_> = instructions
+            .iter()
+            .map(Instruction::ip)
+            .filter(|ip| *ip != 0)
+            .collect();
+        let indirect_indices: HashSet<_> = indirect.iter().map(|(index, _)| *index).collect();
+        let mut references = Vec::new();
+        for (index, instruction) in instructions.iter().enumerate() {
+            if !indirect_indices.contains(&index)
+                && matches!(instruction.op0_kind(), iced_x86::OpKind::NearBranch64)
+                && !labels.contains(&instruction.near_branch_target())
+            {
+                references.push(Operand::Branch(index, instruction.near_branch_target()));
+            }
+            if instruction.is_ip_rel_memory_operand()
+                && !labels.contains(&instruction.ip_rel_memory_address())
+            {
+                references.push(Operand::Rip(index, instruction.ip_rel_memory_address()));
+            }
+        }
+        prepared.push(Prepared {
+            function,
+            instructions,
+            references,
+            indirect,
+            slot_len: 0,
+            new_rva: None,
+            body: Vec::new(),
+            unwind: Vec::new(),
+        });
+    }
 
-    let mut ordered: Vec<&Function> = functions.iter().collect();
-    ordered.sort_by_key(|f| f.entry.get());
-    for func in ordered {
-        let _s = tracing::debug_span!("function", addr = %func.entry).entered();
-        match classify(module, func, &runtime_fns, &import_slots, &eh_runtime) {
-            Ok(cand) => {
-                if !reference_model.is_resolved(func.entry) {
-                    let reason = RejectionReason::SymbolizationUncertain;
-                    tracing::debug!(addr = %func.entry, reason = %reason, "function rejected");
-                    report.rejected.push((func.entry, reason));
+    let seed_addresses = prepared
+        .iter()
+        .map(|function| {
+            Ok((
+                base.checked_add(u64::from(function.function.entry.get()))
+                    .context("original VA overflow")?,
+                code_va,
+            ))
+        })
+        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+    let seed_helpers = prepared
+        .iter()
+        .flat_map(|function| function.indirect.iter())
+        .map(|&(_, register)| (register as u32, (register, code_rva)))
+        .collect();
+    prepared.retain_mut(|function| {
+        let result = function
+            .bind(&seed_addresses, &seed_helpers, base)
+            .and_then(|_| relocate(&function.instructions, code_va))
+            .and_then(|body| {
+                ensure!(!body.is_empty(), "empty selected function");
+                u32::try_from(body.len()).context("encoded function exceeds RVA space")
+            });
+        match result {
+            Ok(len) => {
+                function.slot_len = len;
+                true
+            }
+            Err(_) => {
+                report
+                    .rejected
+                    .push((function.function.entry, RejectionReason::CodegenFailure));
+                false
+            }
+        }
+    });
+
+    let (
+        addresses,
+        helpers,
+        encoded_helpers,
+        check_rva,
+        check_unwind,
+        code_end,
+        xdata_rva,
+        mut patches,
+        mut reference_edits,
+    ) = loop {
+        if prepared.is_empty() {
+            report.rejected.sort_by_key(|&(entry, _)| entry);
+            return Ok((
+                pe.rebuild(&PeEdits::default()).context("rebuilding PE")?,
+                report,
+            ));
+        }
+        let mut cursor = code_rva;
+        let mut addresses = BTreeMap::new();
+        for function in &prepared {
+            cursor = align_up(cursor, FUNCTION_ALIGN)?;
+            addresses.insert(function.function.entry, Rva::new(cursor));
+            cursor = cursor
+                .checked_add(function.slot_len)
+                .context("code layout RVA overflow")?;
+        }
+        let (patches, pinned) = rewrite::resident_patches(module, &reference_model, &addresses);
+        if !pinned.is_empty() {
+            prepared.retain(|function| {
+                if pinned.contains(&function.function.entry) {
+                    report
+                        .rejected
+                        .push((function.function.entry, RejectionReason::InvalidReference));
+                    false
+                } else {
+                    true
+                }
+            });
+            continue;
+        }
+        let mut helpers = BTreeMap::new();
+        for function in &prepared {
+            for &(_, register) in &function.indirect {
+                helpers.insert(register as u32, (register, 0));
+            }
+        }
+        if has_cfg {
+            helpers.insert(Register::RAX as u32, (Register::RAX, 0));
+        }
+        for (_, rva) in helpers.values_mut() {
+            cursor = align_up(cursor, FUNCTION_ALIGN)?;
+            *rva = cursor;
+            cursor = cursor
+                .checked_add(translation::HELPER_LEN)
+                .context("helper RVA overflow")?;
+        }
+        let check_rva = if has_cfg_check {
+            cursor = align_up(cursor, FUNCTION_ALIGN)?;
+            let rva = cursor;
+            cursor = cursor
+                .checked_add(translation::CHECK_BYTES.len() as u32)
+                .context("CFG helper RVA overflow")?;
+            Some(rva)
+        } else {
+            None
+        };
+        let va_addresses = addresses
+            .iter()
+            .map(|(&old, &new)| {
+                Ok((
+                    base.checked_add(u64::from(old.get()))
+                        .context("original VA overflow")?,
+                    base.checked_add(u64::from(new.get()))
+                        .context("new VA overflow")?,
+                ))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        let mut rejected = BTreeMap::new();
+        let mut grew = false;
+        for function in &mut prepared {
+            let new_rva = addresses[&function.function.entry].get();
+            let bindings_changed = match function.bind(&va_addresses, &helpers, base) {
+                Ok(changed) => changed,
+                Err(_) => {
+                    rejected.insert(function.function.entry, RejectionReason::InvalidReference);
                     continue;
                 }
-                pad_to_align(&mut code, FUNCTION_ALIGN);
-                let new_rva = code_rva + code.len() as u32;
-
-                let (body, shape) = match produce_body(module, func, base, new_rva) {
-                    Ok(b) => b,
-                    Err(_) => {
+            };
+            if function.new_rva == Some(new_rva) && !bindings_changed {
+                continue;
+            }
+            let new_va = base
+                .checked_add(u64::from(new_rva))
+                .context("new VA overflow")?;
+            let body = match relocate(&function.instructions, new_va) {
+                Ok(body) => body,
+                Err(_) => {
+                    rejected.insert(function.function.entry, RejectionReason::CodegenFailure);
+                    continue;
+                }
+            };
+            let len = u32::try_from(body.len()).context("encoded function exceeds RVA space")?;
+            if len > function.slot_len {
+                // Slots grow monotonically; branch widening cannot oscillate layout.
+                function.slot_len = len;
+                grew = true;
+            }
+            function.new_rva = Some(new_rva);
+            function.body = body;
+            function.unwind.clear();
+        }
+        if !rejected.is_empty() {
+            prepared.retain(|function| !rejected.contains_key(&function.function.entry));
+            report.rejected.extend(rejected);
+            continue;
+        }
+        if grew {
+            continue;
+        }
+        // Widening can put a tentative successor entry inside the current body.
+        for function in &mut prepared {
+            if !function.unwind.is_empty() {
+                continue;
+            }
+            let new_va = base
+                .checked_add(u64::from(addresses[&function.function.entry].get()))
+                .context("new VA overflow")?;
+            match kamy_seh::unwind_ranges(&function.body, new_va) {
+                Ok(ranges) if !ranges.is_empty() => function.unwind = ranges,
+                _ => {
+                    rejected.insert(function.function.entry, RejectionReason::EhNoBucketCreation);
+                }
+            }
+        }
+        if !rejected.is_empty() {
+            prepared.retain(|function| !rejected.contains_key(&function.function.entry));
+            report.rejected.extend(rejected);
+            continue;
+        }
+        let reference_edits = match pe.rebase_references(&addresses) {
+            Ok(edits) => edits,
+            Err(error) => {
+                let mut pinned = HashSet::new();
+                for (&old, &new) in &addresses {
+                    if pe.rebase_references(&BTreeMap::from([(old, new)])).is_err() {
+                        pinned.insert(old);
+                    }
+                }
+                if pinned.is_empty() {
+                    return Err(error).context("rebasing image references");
+                }
+                prepared.retain(|function| {
+                    if pinned.contains(&function.function.entry) {
                         report
                             .rejected
-                            .push((func.entry, RejectionReason::CodegenFailure));
-                        tracing::debug!(
-                            addr = %func.entry,
-                            reason = %RejectionReason::CodegenFailure,
-                            "function rejected"
-                        );
-                        continue;
+                            .push((function.function.entry, RejectionReason::InvalidReference));
+                        false
+                    } else {
+                        true
                     }
-                };
-
-                match &shape {
-                    Ok(_) => {
-                        report.ssa_lowered += 1;
-                        report.ssa_lowered_rvas.push(cand.entry);
-                    }
-                    Err(Some(reason)) => {
-                        report.rejected.push((cand.entry, *reason));
-                        continue;
-                    }
-                    Err(None) => {}
-                }
-
-                let patch = entry_patch(base, cand.entry.get(), new_rva, cand.endbr);
-                let thunk_len = patch.len() as u32;
-                code.extend_from_slice(&body);
-
-                let mut patches = vec![BytePatch {
-                    rva: cand.entry,
-                    bytes: patch,
-                }];
-                let scrub_start = cand.entry.get() + thunk_len;
-                if cand.end > scrub_start {
-                    patches.push(BytePatch {
-                        rva: Rva::new(scrub_start),
-                        bytes: vec![INT3; (cand.end - scrub_start) as usize],
-                    });
-                }
-                report.moved.push(cand.entry);
-                // SSA-lowered funcs get FRESH UNWIND_INFO for the generated
-                // push/align prologue (null blob when no reg was pushed);
-                // relocation-shipped funcs keep their original UNWIND_INFO RVA.
-                let unwind = shape
-                    .ok()
-                    .map(|s| kamy_pe::build_unwind_info(&s.pushed, s.stack_alloc));
-                moved.push(Moved {
-                    entry: cand.entry,
-                    new_rva,
-                    new_len: body.len() as u32,
-                    unwind,
                 });
-                pending_patches.extend(patches);
-                tracing::debug!(
-                    addr = %func.entry,
-                    new_rva = format_args!("{new_rva:#x}"),
-                    len = body.len() as u32,
-                    "moved function"
-                );
+                continue;
             }
-            Err(Some(reason)) => {
-                tracing::debug!(addr = %func.entry, reason = %reason, "function rejected");
-                report.rejected.push((func.entry, reason));
+        };
+        let xdata_rva = align_up(cursor, pe.section_alignment())?;
+        let mut encoded_helpers = Vec::with_capacity(helpers.len());
+        let mut bad_helpers = BTreeMap::new();
+        for (&key, &(register, rva)) in &helpers {
+            let body = match translation::helper(register, rva, xdata_rva) {
+                Ok(body) => body,
+                Err(_) => {
+                    bad_helpers.insert(key, RejectionReason::InvalidReference);
+                    continue;
+                }
+            };
+            let va = base
+                .checked_add(u64::from(rva))
+                .context("helper VA overflow")?;
+            match kamy_seh::unwind_ranges(&body, va) {
+                Ok(unwind) if !unwind.is_empty() => {
+                    encoded_helpers.push(EncodedHelper { rva, body, unwind })
+                }
+                _ => {
+                    bad_helpers.insert(key, RejectionReason::EhNoBucketCreation);
+                }
             }
-            Err(None) => {}
+        }
+        let mut global_reject = if has_cfg {
+            bad_helpers.get(&(Register::RAX as u32)).copied()
+        } else {
+            None
+        };
+        let check_unwind = if let Some(rva) = check_rva {
+            let va = base
+                .checked_add(u64::from(rva))
+                .context("CFG helper VA overflow")?;
+            match kamy_seh::unwind_ranges(&translation::CHECK_BYTES, va) {
+                Ok(ranges) if !ranges.is_empty() => Some(ranges),
+                _ => {
+                    global_reject = Some(RejectionReason::EhNoBucketCreation);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if global_reject.is_some() || !bad_helpers.is_empty() {
+            prepared.retain(|function| {
+                let reason = global_reject.or_else(|| {
+                    function
+                        .indirect
+                        .iter()
+                        .find_map(|&(_, register)| bad_helpers.get(&(register as u32)).copied())
+                });
+                if let Some(reason) = reason {
+                    report.rejected.push((function.function.entry, reason));
+                    false
+                } else {
+                    true
+                }
+            });
+            continue;
+        }
+        break (
+            addresses,
+            helpers,
+            encoded_helpers,
+            check_rva,
+            check_unwind,
+            cursor,
+            xdata_rva,
+            patches,
+            reference_edits,
+        );
+    };
+
+    patches.append(&mut reference_edits.patches);
+    if has_cfg {
+        let dispatch = helpers[&(Register::RAX as u32)].1;
+        let check = check_rva.unwrap_or(dispatch);
+        let (mut cfg_patches, relocations) = pe
+            .cfg_edits(Rva::new(check), Rva::new(dispatch))
+            .context("rewriting CFG dispatch")?;
+        patches.append(&mut cfg_patches);
+        reference_edits.relocations.extend(relocations);
+    }
+    let code_len = code_end
+        .checked_sub(code_rva)
+        .context("invalid code layout")? as usize;
+    let mut code = Vec::with_capacity(code_len);
+    let mut xdata = if helpers.is_empty() {
+        Vec::new()
+    } else {
+        translation::table(&addresses)?
+    };
+    let mut entries: Vec<_> = runtime_fns
+        .iter()
+        .filter(|function| !addresses.contains_key(&function.begin))
+        .map(|function| {
+            (
+                function.begin.get(),
+                function.end.get(),
+                function.unwind.get(),
+            )
+        })
+        .collect();
+    for function in &prepared {
+        let new_rva = addresses[&function.function.entry].get();
+        append_code(&mut code, code_rva, new_rva, &function.body)?;
+        append_unwind(
+            &mut xdata,
+            &mut entries,
+            xdata_rva,
+            new_rva,
+            u32::try_from(function.body.len()).context("function size overflow")?,
+            &function.unwind,
+        )?;
+        for block in &function.function.blocks {
+            let len = block
+                .end
+                .get()
+                .checked_sub(block.start.get())
+                .context("invalid owned block")?;
+            let mut bytes = Vec::with_capacity(len as usize);
+            append_nops(&mut bytes, len as usize);
+            patches.push(BytePatch {
+                rva: block.start,
+                bytes,
+            });
         }
     }
-    tracing::info!(
-        ssa_lowered = report.ssa_lowered,
-        rejected = report.rejected.len(),
-        relocated = report.moved.len(),
-        "protection complete"
-    );
-
-    if moved.is_empty() {
-        return Ok((
-            pe.rebuild(&PeEdits::default()).context("rebuilding PE")?,
-            report,
-        ));
+    for helper in encoded_helpers {
+        append_code(&mut code, code_rva, helper.rva, &helper.body)?;
+        append_unwind(
+            &mut xdata,
+            &mut entries,
+            xdata_rva,
+            helper.rva,
+            translation::HELPER_LEN,
+            &helper.unwind,
+        )?;
     }
-
-    let code_len = code.len() as u32;
-    let mut new_sections: Vec<NewSection> = Vec::new();
-    new_sections.push(NewSection {
-        name: opts.code_section.clone(),
-        rva: Rva::new(code_rva),
-        flags: SectionFlags {
-            read: true,
-            write: false,
-            execute: true,
-        },
-        data: code,
-    });
-    // Section order after code: .kamyxd (UNWIND_INFO blobs) then .pdata, so the
-    // DWORD-aligned blobs sit between the code and the exception table.
-    let mut xdata: Vec<u8> = Vec::new();
-    let mut unwind_offsets: BTreeMap<u32, u32> = BTreeMap::new();
-    for m in &moved {
-        if let Some(blob) = &m.unwind {
-            unwind_offsets.insert(m.entry.get(), xdata.len() as u32);
-            xdata.extend_from_slice(blob);
-        }
+    if let Some(rva) = check_rva {
+        let ranges = check_unwind
+            .as_deref()
+            .context("missing CFG check unwind state")?;
+        append_code(&mut code, code_rva, rva, &translation::CHECK_BYTES)?;
+        append_unwind(
+            &mut xdata,
+            &mut entries,
+            xdata_rva,
+            rva,
+            translation::CHECK_BYTES.len() as u32,
+            ranges,
+        )?;
     }
-    let xdata_rva = align_up(code_rva + code_len, pe.section_alignment());
-    if !xdata.is_empty() {
-        new_sections.push(NewSection {
-            name: opts.xdata_section.clone(),
-            rva: Rva::new(xdata_rva),
-            flags: SectionFlags {
-                read: true,
-                write: false,
-                execute: false,
-            },
-            data: xdata.clone(),
-        });
-    }
-
-    let mut directories = Vec::new();
-
-    if !runtime_fns.is_empty() {
-        let moved_by_entry: HashMap<u32, &Moved> =
-            moved.iter().map(|m| (m.entry.get(), m)).collect();
-        let pdata = rebuild_pdata(&runtime_fns, &moved_by_entry, xdata_rva, &unwind_offsets);
-        let pdata_rva = align_up(xdata_rva + xdata.len() as u32, pe.section_alignment());
-        let size = pdata.len() as u32;
-        new_sections.push(NewSection {
-            name: opts.pdata_section.clone(),
-            rva: Rva::new(pdata_rva),
-            flags: SectionFlags {
-                read: true,
-                write: false,
-                execute: false,
-            },
-            data: pdata,
-        });
+    let reserved = code_end
+        .checked_sub(code_rva)
+        .context("invalid code layout")? as usize;
+    ensure!(code.len() <= reserved, "code exceeded reserved layout");
+    let padding = reserved - code.len();
+    append_nops(&mut code, padding);
+    let pdata = encode_pdata(&mut entries)?;
+    let pdata_rva = align_up(
+        xdata_rva
+            .checked_add(u32::try_from(xdata.len()).context("xdata size overflow")?)
+            .context("xdata RVA overflow")?,
+        pe.section_alignment(),
+    )?;
+    let pdata_len = u32::try_from(pdata.len()).context("pdata size overflow")?;
+    let mut new_sections = vec![
+        section(opts.code_section.clone(), code_rva, true, code),
+        section(opts.xdata_section.clone(), xdata_rva, false, xdata),
+        section(opts.pdata_section.clone(), pdata_rva, false, pdata),
+    ];
+    let mut directories = vec![DirectoryUpdate {
+        index: PeFile::EXCEPTION_DIRECTORY,
+        rva: Rva::new(pdata_rva),
+        size: pdata_len,
+    }];
+    let relocations = kamy_pe::encode_base_relocations(&reference_edits.relocations)
+        .context("serializing base relocations")?;
+    if relocations.is_empty() {
         directories.push(DirectoryUpdate {
-            index: PeFile::EXCEPTION_DIRECTORY,
-            rva: Rva::new(pdata_rva),
+            index: 5,
+            rva: Rva::ZERO,
+            size: 0,
+        });
+    } else {
+        let reloc_rva = align_up(
+            pdata_rva
+                .checked_add(pdata_len)
+                .context("pdata RVA overflow")?,
+            pe.section_alignment(),
+        )?;
+        let size = u32::try_from(relocations.len()).context("relocation size overflow")?;
+        new_sections.push(section(".kamyr".into(), reloc_rva, false, relocations));
+        directories.push(DirectoryUpdate {
+            index: 5,
+            rva: Rva::new(reloc_rva),
             size,
         });
     }
-
+    let last_section = new_sections.last().context("missing output section")?;
+    let debug_rva = align_up(
+        last_section
+            .rva
+            .get()
+            .checked_add(u32::try_from(last_section.data.len()).context("section size overflow")?)
+            .context("section RVA overflow")?,
+        pe.section_alignment(),
+    )?;
+    let debug_moves = prepared
+        .iter()
+        .map(|function| {
+            Ok((
+                function.function.entry,
+                addresses[&function.function.entry],
+                u32::try_from(function.body.len()).context("function size overflow")?,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if let Some((debug, directory)) = pe
+        .rebuild_debug_directory(&debug_moves, Rva::new(debug_rva))
+        .context("rebuilding debug directory")?
+    {
+        new_sections.push(section(".kamyd".into(), debug_rva, false, debug));
+        directories.push(directory);
+    }
+    report.moved = addresses.keys().copied().collect();
+    report.ssa_lowered = report.moved.len();
+    report.ssa_lowered_rvas = report.moved.clone();
+    report.rejected.sort_by_key(|&(entry, _)| entry);
+    report.address_map = addresses;
     let edits = PeEdits {
         new_sections,
-        patches: pending_patches,
+        patches,
         directories,
+        entry_point: reference_edits.entry_point,
+        clear_guard_cf: has_cfg,
     };
     Ok((pe.rebuild(&edits).context("rebuilding PE")?, report))
 }
 
-struct Candidate {
-    entry: Rva,
-    end: u32,
-    endbr: bool,
+fn section(name: String, rva: u32, execute: bool, data: Vec<u8>) -> NewSection {
+    NewSection {
+        name,
+        rva: Rva::new(rva),
+        flags: SectionFlags {
+            read: true,
+            write: false,
+            execute,
+        },
+        data,
+    }
+}
+
+fn append_code(code: &mut Vec<u8>, code_rva: u32, rva: u32, body: &[u8]) -> anyhow::Result<()> {
+    let offset = rva
+        .checked_sub(code_rva)
+        .context("code before section start")? as usize;
+    ensure!(code.len() <= offset, "overlapping generated code");
+    let padding = offset - code.len();
+    append_nops(code, padding);
+    code.extend_from_slice(body);
+    Ok(())
+}
+
+fn append_unwind(
+    xdata: &mut Vec<u8>,
+    entries: &mut Vec<(u32, u32, u32)>,
+    xdata_rva: u32,
+    function_rva: u32,
+    function_len: u32,
+    ranges: &[kamy_seh::UnwindRange],
+) -> anyhow::Result<()> {
+    ensure!(!ranges.is_empty(), "no reachable unwind ranges");
+    for range in ranges {
+        ensure!(
+            range.begin < range.end && range.end <= function_len,
+            "invalid unwind range"
+        );
+        let padding = (4 - xdata.len() % 4) % 4;
+        xdata.resize(
+            xdata
+                .len()
+                .checked_add(padding)
+                .context("xdata size overflow")?,
+            0,
+        );
+        let unwind = xdata_rva
+            .checked_add(u32::try_from(xdata.len()).context("xdata size overflow")?)
+            .context("unwind RVA overflow")?;
+        xdata.extend_from_slice(&range.info);
+        entries.push((
+            function_rva
+                .checked_add(range.begin)
+                .context("unwind begin overflow")?,
+            function_rva
+                .checked_add(range.end)
+                .context("unwind end overflow")?,
+            unwind,
+        ));
+    }
+    Ok(())
+}
+
+fn encode_pdata(entries: &mut [(u32, u32, u32)]) -> anyhow::Result<Vec<u8>> {
+    entries.sort_by_key(|entry| entry.0);
+    for entry in entries.iter() {
+        ensure!(entry.0 < entry.1, "empty runtime-function range");
+    }
+    for pair in entries.windows(2) {
+        ensure!(
+            pair[0].1 <= pair[1].0,
+            "overlapping runtime-function ranges"
+        );
+    }
+    let mut bytes = Vec::with_capacity(
+        entries
+            .len()
+            .checked_mul(12)
+            .context("pdata size overflow")?,
+    );
+    for &(begin, end, unwind) in entries.iter() {
+        bytes.extend_from_slice(&begin.to_le_bytes());
+        bytes.extend_from_slice(&end.to_le_bytes());
+        bytes.extend_from_slice(&unwind.to_le_bytes());
+    }
+    Ok(bytes)
 }
 
 fn classify(
@@ -617,9 +1064,14 @@ fn classify(
     runtime_fns: &[kamy_pe::RuntimeFunction],
     import_slots: &std::collections::HashSet<u32>,
     eh_runtime: &std::collections::HashSet<u32>,
-) -> Result<Candidate, Option<RejectionReason>> {
+) -> Result<(), Option<RejectionReason>> {
     let entry = func.entry;
     if !module.is_executable(entry) {
+        return Err(None);
+    }
+    if func.blocks.iter().any(|block| {
+        matches!(block.terminator, Terminator::Indirect { slot: Some(slot) } if import_slots.contains(&slot.get()))
+    }) {
         return Err(None);
     }
     // The C++ exception runtime (the __CxxFrameHandler personality and everything
@@ -637,21 +1089,11 @@ fn classify(
         .map(|b| b.end.get())
         .max()
         .unwrap_or(entry.get());
-    let size = end.saturating_sub(entry.get());
 
     use kamy_core::Terminator::{Indirect, Unknown};
     for b in &func.blocks {
         match &b.terminator {
-            // D24 layer 0: `jmp [rip+slot]` is statically resolvable, not a
-            // computed branch. An IAT slot is an import/forwarder thunk — never
-            // a protection target, so skip it. Any other in-image slot is a
-            // recoverable tail-call pending direct-ification.
-            Indirect { slot: Some(s) } => {
-                if import_slots.contains(&s.get()) {
-                    return Err(None);
-                }
-                return Err(Some(RejectionReason::ResolvableIndirect));
-            }
+            Indirect { slot: Some(_) } => return Err(Some(RejectionReason::ResolvableIndirect)),
             Indirect { slot: None } => return Err(Some(RejectionReason::BadIndirectBranch)),
             Unknown => return Err(Some(RejectionReason::LiftFailure)),
             _ => {}
@@ -662,83 +1104,31 @@ fn classify(
         return Err(Some(RejectionReason::SymbolizationUncertain));
     }
 
-    let frags: Vec<_> = runtime_fns
+    let mut frags = runtime_fns
         .iter()
-        .filter(|r| r.begin.get() >= entry.get() && r.begin.get() < end)
-        .collect();
-    if frags.len() > 1 {
+        .filter(|r| r.begin.get() < end && r.end.get() > entry.get());
+    let first = frags.next();
+    if frags.next().is_some() {
         return Err(Some(RejectionReason::SehComplex));
     }
-    if let Some(rf) = frags.first() {
+    if let Some(rf) = first {
         if rf.begin != entry || unwind_flags(module, rf.unwind) != 0 {
             return Err(Some(RejectionReason::SehComplex));
         }
-    }
-
-    let endbr = module
-        .bytes_at(entry)
-        .is_some_and(|b| b.len() >= ENDBR64.len() && b[..ENDBR64.len()] == ENDBR64);
-    let thunk_total = if endbr { ENDBR64.len() as u32 } else { 0 } + NEAR_JMP_LEN;
-    if size < thunk_total {
-        return Err(Some(RejectionReason::NoThunkSpace));
-    }
-
-    Ok(Candidate { entry, end, endbr })
-}
-
-fn entry_patch(base: u64, entry: u32, new_rva: u32, endbr: bool) -> Vec<u8> {
-    let prefix_len = if endbr { ENDBR64.len() as u32 } else { 0 };
-    let site = base + u64::from(entry) + u64::from(prefix_len);
-    let target = base + u64::from(new_rva);
-    let mut bytes = Vec::new();
-    if endbr {
-        bytes.extend_from_slice(&ENDBR64);
-    }
-    bytes.extend_from_slice(&thunk(site, target));
-    bytes
-}
-
-fn rebuild_pdata(
-    runtime_fns: &[kamy_pe::RuntimeFunction],
-    moved: &HashMap<u32, &Moved>,
-    xdata_rva: u32,
-    unwind_offsets: &BTreeMap<u32, u32>,
-) -> Vec<u8> {
-    let original_begins: HashSet<u32> = runtime_fns.iter().map(|rf| rf.begin.get()).collect();
-    let mut entries: Vec<(u32, u32, u32)> = runtime_fns
-        .iter()
-        .map(|rf| match moved.get(&rf.begin.get()) {
-            // SSA-lowered: point at the fresh blob; relocation-shipped
-            // (no offset recorded): keep the original UNWIND_INFO RVA.
-            Some(m) => {
-                let unwind = match unwind_offsets.get(&m.entry.get()) {
-                    Some(off) => xdata_rva + off,
-                    None => rf.unwind.get(),
-                };
-                (m.new_rva, m.new_rva + m.new_len, unwind)
-            }
-            None => (rf.begin.get(), rf.end.get(), rf.unwind.get()),
-        })
-        .collect();
-
-    // SSA-moved funcs with no original runtime_function need a fresh entry.
-    for (&entry, &off) in unwind_offsets {
-        if original_begins.contains(&entry) {
-            continue;
+        if rf.end.get() > end
+            && module.functions.iter().any(|other| {
+                other.entry != entry
+                    && other
+                        .blocks
+                        .iter()
+                        .any(|block| block.start < rf.end && block.end > rf.begin)
+            })
+        {
+            return Err(Some(RejectionReason::EhFunctionDoesntOwnInfo));
         }
-        let m = moved[&entry];
-        entries.push((m.new_rva, m.new_rva + m.new_len, xdata_rva + off));
     }
 
-    entries.sort_by_key(|&(begin, _, _)| begin);
-
-    let mut out = Vec::with_capacity(entries.len() * 12);
-    for (begin, end, unwind) in entries {
-        out.extend_from_slice(&begin.to_le_bytes());
-        out.extend_from_slice(&end.to_le_bytes());
-        out.extend_from_slice(&unwind.to_le_bytes());
-    }
-    out
+    Ok(())
 }
 
 fn reloc_in_range(module: &Module, start: u32, end: u32) -> bool {
@@ -855,17 +1245,35 @@ fn unwind_flags(module: &Module, unwind: Rva) -> u8 {
         .map_or(0xff, |b| b >> 3)
 }
 
-fn align_up(value: u32, align: u32) -> u32 {
-    if align == 0 {
-        return value;
+fn align_up(value: u32, align: u32) -> anyhow::Result<u32> {
+    ensure!(align != 0, "zero section alignment");
+    let remainder = value % align;
+    if remainder == 0 {
+        Ok(value)
+    } else {
+        value
+            .checked_add(align - remainder)
+            .context("aligned RVA overflow")
     }
-    value.div_ceil(align) * align
 }
 
-fn pad_to_align(buf: &mut Vec<u8>, align: u32) {
-    let rem = buf.len() % align as usize;
-    if rem != 0 {
-        buf.extend(std::iter::repeat_n(INT3, align as usize - rem));
+fn append_nops(bytes: &mut Vec<u8>, mut len: usize) {
+    const NOPS: [&[u8]; 10] = [
+        &[],
+        &[0x90],
+        &[0x66, 0x90],
+        &[0x0f, 0x1f, 0x00],
+        &[0x0f, 0x1f, 0x40, 0x00],
+        &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+        &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    ];
+    while len != 0 {
+        let size = len.min(9);
+        bytes.extend_from_slice(NOPS[size]);
+        len -= size;
     }
 }
 
@@ -874,28 +1282,102 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rebuild_pdata_appends_entry_for_ssa_moved_leaf() {
-        let entry = 0x1000u32;
-        let m = Moved {
-            entry: Rva::new(entry),
-            new_rva: 0x5000,
-            new_len: 0x40,
-            unwind: Some(vec![0x01, 0, 0, 0]),
-        };
-        let mut moved: HashMap<u32, &Moved> = HashMap::new();
-        moved.insert(entry, &m);
-        let mut unwind_offsets: BTreeMap<u32, u32> = BTreeMap::new();
-        unwind_offsets.insert(entry, 0x8);
-        let xdata_rva = 0x9000u32;
-
-        let out = rebuild_pdata(&[], &moved, xdata_rva, &unwind_offsets);
+    fn runtime_table_includes_moved_leaf_without_original_pdata() {
+        let ranges = kamy_seh::unwind_ranges(&[0xc3], 0x140005000).unwrap();
+        let mut xdata = Vec::new();
+        let mut entries = Vec::new();
+        append_unwind(&mut xdata, &mut entries, 0x9000, 0x5000, 1, &ranges).unwrap();
+        let out = encode_pdata(&mut entries).unwrap();
         assert_eq!(out.len(), 12);
-        let begin = u32::from_le_bytes(out[0..4].try_into().unwrap());
-        let end = u32::from_le_bytes(out[4..8].try_into().unwrap());
-        let unwind = u32::from_le_bytes(out[8..12].try_into().unwrap());
-        assert_eq!(begin, 0x5000);
-        assert_eq!(end, 0x5040);
-        assert_eq!(unwind, xdata_rva + 0x8);
+        assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 0x5000);
+        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 0x5001);
+        assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 0x9000);
+    }
+
+    #[test]
+    fn encoded_caller_rebinds_when_callee_becomes_resident() {
+        let function = Function {
+            entry: Rva::new(0x1000),
+            blocks: vec![],
+        };
+        let instructions = vec![
+            Instruction::with_branch(iced_x86::Code::Call_rel32_64, 0x140002000).unwrap(),
+            Instruction::with(iced_x86::Code::Retnq),
+        ];
+        let mut prepared = Prepared {
+            function: &function,
+            instructions,
+            references: vec![Operand::Branch(0, 0x140002000)],
+            indirect: vec![],
+            slot_len: 0,
+            new_rva: None,
+            body: vec![],
+            unwind: vec![],
+        };
+        let map = BTreeMap::from([(0x140002000, 0x140006000)]);
+        prepared.bind(&map, &BTreeMap::new(), 0x140000000).unwrap();
+        let body = relocate(&prepared.instructions, 0x140005000).unwrap();
+        let mut decoder =
+            iced_x86::Decoder::with_ip(64, &body, 0x140005000, iced_x86::DecoderOptions::NONE);
+        assert_eq!(decoder.decode().near_branch_target(), 0x140006000);
+        prepared
+            .bind(&BTreeMap::new(), &BTreeMap::new(), 0x140000000)
+            .unwrap();
+        let body = relocate(&prepared.instructions, 0x140005000).unwrap();
+        let mut decoder =
+            iced_x86::Decoder::with_ip(64, &body, 0x140005000, iced_x86::DecoderOptions::NONE);
+        assert_eq!(decoder.decode().near_branch_target(), 0x140002000);
+    }
+
+    #[test]
+    fn single_byte_function_has_no_thunk_size_floor() {
+        use kamy_core::{BasicBlock, Machine, Section};
+        let function = Function {
+            entry: Rva::new(0x1000),
+            blocks: vec![BasicBlock {
+                start: Rva::new(0x1000),
+                end: Rva::new(0x1001),
+                successors: vec![],
+                terminator: Terminator::Return,
+            }],
+        };
+        let module = Module {
+            image_base: 0x140000000,
+            machine: Machine::X64,
+            entry_point: None,
+            sections: vec![Section {
+                name: ".text".into(),
+                rva: Rva::new(0x1000),
+                virtual_size: 1,
+                data: vec![0xc3],
+                flags: SectionFlags {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+            }],
+            symbols: vec![],
+            relocations: vec![],
+            functions: vec![function.clone()],
+        };
+        assert_eq!(
+            classify(&module, &function, &[], &HashSet::new(), &HashSet::new()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn retired_block_padding_contains_only_complete_nops() {
+        for len in 0..64 {
+            let mut bytes = Vec::new();
+            append_nops(&mut bytes, len);
+            assert_eq!(bytes.len(), len);
+            let mut decoder =
+                iced_x86::Decoder::with_ip(64, &bytes, 0x140001000, iced_x86::DecoderOptions::NONE);
+            while decoder.can_decode() {
+                assert_eq!(decoder.decode().mnemonic(), iced_x86::Mnemonic::Nop);
+            }
+        }
     }
 
     #[test]

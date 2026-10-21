@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use iced_x86::{Code, Decoder, DecoderOptions, Instruction, MemoryOperand, Register};
 use kamy_core::ir::{
@@ -444,6 +444,55 @@ fn flag_op_to_jcc(op: &IrOp) -> Code {
     }
 }
 
+fn rsp_immediate(
+    func: &IrFunction,
+    alloc: &RegAllocation,
+    inst: &kamy_core::ir::Inst,
+) -> Option<(ValueId, i32)> {
+    if inst.ty != IrType::I64 || !matches!(inst.op, IrOp::Add | IrOp::Sub) {
+        return None;
+    }
+    let dest = inst.dest?;
+    let rsp = PhysReg::Gpr(Gpr::Rsp);
+    if alloc.assignments.get(&dest) != Some(&rsp)
+        || alloc.assignments.get(&inst.args[0]) != Some(&rsp)
+    {
+        return None;
+    }
+    let rhs = inst.args[1];
+    let value = const_value(func, rhs)? as i64;
+    Some((rhs, i32::try_from(value).ok()?))
+}
+
+fn folded_rsp_constants(func: &IrFunction, alloc: &RegAllocation) -> HashSet<ValueId> {
+    // Physical eviction copies can consume a value without an IR use.
+    if !alloc.copies.is_empty() || !alloc.edge_copies.is_empty() {
+        return HashSet::new();
+    }
+    let mut folded = HashSet::new();
+    let mut live = HashSet::new();
+    for block in &func.blocks {
+        for phi in &block.phis {
+            live.extend(phi.args.iter().map(|(_, value)| *value));
+        }
+        if let IrTerminator::Branch { cond, .. } = block.term {
+            live.insert(cond);
+        }
+        for inst in &block.insts {
+            let immediate = rsp_immediate(func, alloc, inst).map(|(value, _)| value);
+            for (index, &arg) in inst.args.iter().enumerate() {
+                if index == 1 && immediate == Some(arg) {
+                    folded.insert(arg);
+                } else {
+                    live.insert(arg);
+                }
+            }
+        }
+    }
+    folded.retain(|value| !live.contains(value));
+    folded
+}
+
 pub fn select_instructions(
     func: &IrFunction,
     alloc: &RegAllocation,
@@ -453,6 +502,7 @@ pub fn select_instructions(
     callee_saved_xmms: &[Register],
 ) -> Vec<Instruction> {
     let order = block_order(func);
+    let folded_constants = folded_rsp_constants(func, alloc);
     let mut out: Vec<Instruction> = Vec::new();
     let mut block_labels: HashMap<BlockId, u64> = HashMap::new();
     for (bi, &bid) in order.iter().enumerate() {
@@ -512,7 +562,13 @@ pub fn select_instructions(
                 }
             }
 
-            select_inst(func, alloc, inst, &block_labels, &mut out);
+            if !matches!(inst.op, IrOp::Const(_))
+                || !inst
+                    .dest
+                    .is_some_and(|dest| folded_constants.contains(&dest))
+            {
+                select_inst(func, alloc, inst, &block_labels, &mut out);
+            }
         }
 
         if matches!(block.term, IrTerminator::Ret | IrTerminator::Tail { .. }) {
@@ -673,6 +729,17 @@ fn select_inst(
             let dest = inst.dest.unwrap();
             let lhs = inst.args[0];
             let rhs = inst.args[1];
+            if let Some((_, immediate)) = rsp_immediate(func, alloc, inst) {
+                let code = match (&inst.op, i8::try_from(immediate).is_ok()) {
+                    (IrOp::Add, true) => Code::Add_rm64_imm8,
+                    (IrOp::Add, false) => Code::Add_rm64_imm32,
+                    (IrOp::Sub, true) => Code::Sub_rm64_imm8,
+                    (IrOp::Sub, false) => Code::Sub_rm64_imm32,
+                    _ => unreachable!(),
+                };
+                out.push(Instruction::with2(code, Register::RSP, immediate).unwrap());
+                return;
+            }
             if is_xmm(alloc.assignments[&dest]) {
                 // Only xorps (Xor) produces an XMM ALU value; packed logical op.
                 let dest_reg = reg_of(alloc, dest, IrType::I128);
@@ -1202,6 +1269,78 @@ fn select_terminator(
 mod tests {
     use super::*;
     use kamy_core::ir::*;
+
+    #[test]
+    fn rsp_constant_folding_preserves_live_uses_and_immediate_boundaries() {
+        use iced_x86::{Mnemonic, OpKind};
+        let rsp = ValueId(0);
+        let constant = ValueId(1);
+        let result = ValueId(2);
+        let alloc = RegAllocation {
+            assignments: HashMap::from([
+                (rsp, PhysReg::Gpr(Gpr::Rsp)),
+                (constant, PhysReg::Gpr(Gpr::R10)),
+                (result, PhysReg::Gpr(Gpr::Rsp)),
+            ]),
+            copies: vec![],
+            edge_copies: HashMap::new(),
+            flag_scratch: None,
+        };
+        for op in [IrOp::Add, IrOp::Sub] {
+            for amount in [0, 127, 128, i32::MAX as u64, i32::MIN as i64 as u64] {
+                let mut func = IrFunction {
+                    entry: BlockId(0),
+                    next_value: 3,
+                    blocks: vec![IrBlock {
+                        id: BlockId(0),
+                        phis: vec![],
+                        insts: vec![
+                            Inst {
+                                dest: Some(constant),
+                                op: IrOp::Const(amount),
+                                args: vec![],
+                                ty: IrType::I64,
+                            },
+                            Inst {
+                                dest: Some(result),
+                                op: op.clone(),
+                                args: vec![rsp, constant],
+                                ty: IrType::I64,
+                            },
+                        ],
+                        term: IrTerminator::Ret,
+                    }],
+                };
+                let instrs = select_instructions(&func, &alloc, 0, 0, &[], &[]);
+                assert_eq!(instrs.len(), 2);
+                let code = crate::relocate(&instrs, 0x1000).unwrap();
+                let decoded = Decoder::with_ip(64, &code, 0x1000, DecoderOptions::NONE).decode();
+                assert_eq!(
+                    decoded.mnemonic(),
+                    if matches!(op, IrOp::Add) {
+                        Mnemonic::Add
+                    } else {
+                        Mnemonic::Sub
+                    }
+                );
+                assert_eq!(decoded.op0_register(), Register::RSP);
+                assert!(matches!(
+                    decoded.op1_kind(),
+                    OpKind::Immediate8to64 | OpKind::Immediate32to64
+                ));
+                assert_eq!(decoded.immediate(1), amount);
+                func.blocks[0].insts.push(Inst {
+                    dest: None,
+                    op: IrOp::Use,
+                    args: vec![constant],
+                    ty: IrType::I64,
+                });
+                assert!(folded_rsp_constants(&func, &alloc).is_empty());
+                func.blocks[0].insts[0].op = IrOp::Const(0x8000_0000);
+                assert!(rsp_immediate(&func, &alloc, &func.blocks[0].insts[1]).is_none());
+            }
+        }
+    }
 
     #[test]
     fn select_const_add_ret() {

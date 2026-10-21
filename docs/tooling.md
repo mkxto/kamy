@@ -9,14 +9,24 @@ Diagnostics go to stderr; command results go to stdout.
 
 ## Commands
 
-### `kamy protect <input> -o <out> --ssa-identity [--only-rva <hex[,hex...]>] [--reject-rva <hex[,hex...]>]`
+### `kamy protect <input> -o <out> --no-transform [--only-rva <hex[,hex...]>] [--reject-rva <hex[,hex...]>] [--debug-map <csv>]`
 
-SSA-identity protect: run each function through lift → SSA → optimize →
-regalloc and lower it back unchanged, exercising the full pipeline without
-semantic transforms. `--only-rva` restricts the move set to the listed
-functions; `--reject-rva` excludes them. RVAs accept an optional `0x` prefix
-and are comma-separated, base 16. `--no-transform` and `--profile` are
-unchanged.
+`--no-transform` and `--ssa-identity` run the same canonical SSA identity path:
+lift → SSA → optimize → regalloc → lower, without semantic transforms. There is
+no verbatim relocation path. `--only-rva` restricts SSA selection to the listed
+functions; `--reject-rva` excludes them. These selectors are mutually exclusive.
+RVAs accept an optional `0x` prefix and are comma-separated, base 16. Selection
+does not override safe rejection.
+
+Resident and deselected bodies stay at their original locations. Their reference
+operands may still be patched to moved functions; this is mandatory for thunk-free
+reference rewriting, so residency does not promise byte-identical bodies.
+
+`--profile <yaml>` retains profile-driven transforms and symbol selection.
+For identity and profile runs, `--debug-map <csv>` writes the linker's actual
+original/final RVA map, sorted by original RVA. The CSV header is
+`old_rva,new_rva`; values are `0x`-prefixed hexadecimal RVAs, not image VAs.
+Map filesystem errors fail the command with path context.
 
 ```sh
 kamy protect app.exe -o app.kamy.exe --ssa-identity --only-rva 0x1400,0x1860

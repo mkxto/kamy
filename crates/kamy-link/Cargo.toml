@@ -19,4 +19,5 @@ kamy-codegen.workspace = true
 kamy-lift.workspace = true
 kamy-transforms.workspace = true
 kamy-analysis.workspace = true
+kamy-seh.workspace = true
 iced-x86.workspace = true

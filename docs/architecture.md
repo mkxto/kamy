@@ -342,6 +342,8 @@ Every pass must:
 - Rewrite LoadConfig to a consistent **non-enforcing default**: preserve valid security-cookie references, use non-enforcing CF check/dispatch targets, and clear stale function-table-present state or retain valid metadata. Enforcing CFG is a later opt-in, not a correctness gate here ([#33](https://github.com/mkxto/kamy/issues/33)).
 - Update section headers, directories, image sizes/checksum, and optionally emit a debug/address map.
 
+For supported plain lowered code, `kamy-seh` derives stack/nonvolatile state from the final machine CFG and emits per-state Version 2 unwind ranges. Version 1's epilogue scan can mistake a cross-fragment jump for function exit and ignore the recorded allocation. Saved-register offsets use the fixed frame base, not incrementally restored RSP. Windows `RtlVirtualUnwind` verifies Version 2 branch/empty-frame handling and full unscaled saved-XMM offsets. Dynamic frames and unprovable handler/scope state remain safe-rejects.
+
 ### 8.3 Entry Points, DLLs & Optional Modules (D38)
 - EP redirection and relocating the original startup are independent. EXE startup may remain resident or move when references are resolved; a structural redirect does not imply payload injection.
 - A transform-only returnable DLL entry is addressed **directly in `.kamy`**, with no `.text` stub; preserve arguments and return to the loader. Rebase moved exports' EAT RVAs and preserve DLL/header semantics ([#35](https://github.com/mkxto/kamy/issues/35)). Kernel EP remains pinned and untouched.

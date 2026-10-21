@@ -2,10 +2,12 @@
 
 pub mod encode;
 pub mod isel;
+mod references;
 pub mod regalloc;
 
 pub use encode::assemble;
 pub use isel::select_instructions;
+pub use references::rebase_instructions;
 pub use regalloc::{
     CALLEE_SAVED_GPRS, RegAllocation, RegCopy, allocate_registers, callee_saved_used,
     callee_saved_xmms_used,
@@ -19,8 +21,12 @@ use iced_x86::{BlockEncoder, BlockEncoderOptions, Instruction, InstructionBlock}
 /// displacements are recomputed so they still resolve to the same absolute VA.
 pub fn relocate(instrs: &[Instruction], new_va: u64) -> anyhow::Result<Vec<u8>> {
     let block = InstructionBlock::new(instrs, new_va);
-    let result = BlockEncoder::encode(64, block, BlockEncoderOptions::NONE)
+    let result = BlockEncoder::encode(64, block, BlockEncoderOptions::RETURN_RELOC_INFOS)
         .map_err(|e| anyhow::anyhow!("instruction encode failed: {e}"))?;
+    anyhow::ensure!(
+        result.reloc_infos.is_empty(),
+        "branch requires an absolute far thunk"
+    );
     tracing::trace!(
         bytes = result.code_buffer.len(),
         new_va = format_args!("{new_va:#x}"),
@@ -43,33 +49,20 @@ pub fn relocate_with_offsets(
     let result = BlockEncoder::encode(
         64,
         block,
-        BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS,
+        BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS
+            | BlockEncoderOptions::RETURN_RELOC_INFOS,
     )
     .map_err(|e| anyhow::anyhow!("instruction encode failed: {e}"))?;
+    anyhow::ensure!(
+        result.reloc_infos.is_empty(),
+        "branch requires an absolute far thunk"
+    );
     tracing::trace!(
         bytes = result.code_buffer.len(),
         new_va = format_args!("{new_va:#x}"),
         "relocated block"
     );
     Ok((result.code_buffer, result.new_instruction_offsets))
-}
-
-/// Emit a jump thunk from `site_va` to `target_va`:
-/// 5-byte `E9 rel32` when the displacement fits in i32, else the 14-byte
-/// `FF 25 00000000` + `dq target_va` rip-indirect form.
-pub fn thunk(site_va: u64, target_va: u64) -> Vec<u8> {
-    let rel = (target_va as i64).wrapping_sub(site_va.wrapping_add(5) as i64);
-    if let Ok(rel32) = i32::try_from(rel) {
-        let mut out = Vec::with_capacity(5);
-        out.push(0xE9);
-        out.extend_from_slice(&rel32.to_le_bytes());
-        out
-    } else {
-        let mut out = Vec::with_capacity(14);
-        out.extend_from_slice(&[0xFF, 0x25, 0x00, 0x00, 0x00, 0x00]);
-        out.extend_from_slice(&target_va.to_le_bytes());
-        out
-    }
 }
 
 #[cfg(test)]
@@ -127,21 +120,6 @@ mod tests {
             .find(|i| i.mnemonic() == Mnemonic::Jmp)
             .expect("jmp present");
         assert_eq!(jmp.near_branch_target(), 0x9000);
-    }
-
-    #[test]
-    fn thunk_near_is_rel32() {
-        let out = thunk(0x1000, 0x2000);
-        assert_eq!(out.len(), 5);
-        assert_eq!(out[0], 0xE9);
-    }
-
-    #[test]
-    fn thunk_far_is_rip_indirect() {
-        let out = thunk(0x1000, 0x1_0000_0000);
-        assert_eq!(out.len(), 14);
-        assert_eq!(&out[..2], &[0xFF, 0x25]);
-        assert_eq!(&out[6..], &0x1_0000_0000u64.to_le_bytes());
     }
 
     #[test]

@@ -34,11 +34,17 @@ pub struct PeEdits {
     pub new_sections: Vec<NewSection>,
     pub patches: Vec<BytePatch>,
     pub directories: Vec<DirectoryUpdate>,
+    pub entry_point: Option<Rva>,
+    pub clear_guard_cf: bool,
 }
 
 impl PeEdits {
     fn is_empty(&self) -> bool {
-        self.new_sections.is_empty() && self.patches.is_empty() && self.directories.is_empty()
+        self.new_sections.is_empty()
+            && self.patches.is_empty()
+            && self.directories.is_empty()
+            && self.entry_point.is_none()
+            && !self.clear_guard_cf
     }
 }
 
@@ -161,6 +167,14 @@ impl PeFile {
             write_u32(&mut out, base, update.rva.get())?;
             write_u32(&mut out, base + 4, update.size)?;
         }
+        if let Some(entry_point) = edits.entry_point {
+            write_u32(&mut out, layout.opt + 16, entry_point.get())?;
+        }
+        if edits.clear_guard_cf {
+            let characteristics = read_u16(&out, layout.opt + 70)? & !0x4000;
+            write_u16(&mut out, layout.opt + 70, characteristics)?;
+        }
+        rebuild_debug_file_pointers(&mut out, &layout, new_num_sections)?;
 
         write_u32(&mut out, layout.opt + 64, 0)?;
 
@@ -191,7 +205,7 @@ impl PeFile {
         })
     }
 
-    fn patch_offset(&self, rva: u32, len: usize) -> anyhow::Result<usize> {
+    pub(super) fn patch_offset(&self, rva: u32, len: usize) -> anyhow::Result<usize> {
         for s in &self.sections {
             if rva >= s.rva && rva < s.rva.saturating_add(s.raw_size) {
                 let delta = (rva - s.rva) as usize;
@@ -212,6 +226,74 @@ impl PeFile {
         }
         anyhow::bail!("patch target out of section bounds");
     }
+}
+
+fn rebuild_debug_file_pointers(
+    bytes: &mut [u8],
+    layout: &HeaderLayout,
+    section_count: usize,
+) -> anyhow::Result<()> {
+    if layout.num_dirs <= 6 {
+        return Ok(());
+    }
+    let base = layout.opt + 112 + 6 * 8;
+    let rva = read_u32(bytes, base)?;
+    let size = read_u32(bytes, base + 4)?;
+    if rva == 0 && size == 0 {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        rva != 0 && size % 28 == 0,
+        "invalid rebuilt debug directory"
+    );
+    let offset = final_file_offset(bytes, layout, section_count, rva, size)?;
+    for record in (offset..offset + size as usize).step_by(28) {
+        let payload = read_u32(bytes, record + 20)?;
+        if payload == 0 {
+            continue;
+        }
+        let length = read_u32(bytes, record + 16)?;
+        let file = final_file_offset(bytes, layout, section_count, payload, length)?;
+        write_u32(
+            bytes,
+            record + 24,
+            u32::try_from(file).context("debug file offset overflow")?,
+        )?;
+    }
+    Ok(())
+}
+
+fn final_file_offset(
+    bytes: &[u8],
+    layout: &HeaderLayout,
+    section_count: usize,
+    rva: u32,
+    length: u32,
+) -> anyhow::Result<usize> {
+    for index in 0..section_count {
+        let header = layout.section_table + index * SECTION_HEADER_SIZE;
+        let begin = read_u32(bytes, header + 12)?;
+        let raw_size = read_u32(bytes, header + 16)?;
+        let file = read_u32(bytes, header + 20)?;
+        let Some(delta) = rva.checked_sub(begin).filter(|delta| *delta < raw_size) else {
+            continue;
+        };
+        anyhow::ensure!(
+            u64::from(delta) + u64::from(length) <= u64::from(raw_size),
+            "debug payload exceeds section raw data"
+        );
+        let offset = (file as usize)
+            .checked_add(delta as usize)
+            .context("debug file offset overflow")?;
+        anyhow::ensure!(
+            offset
+                .checked_add(length as usize)
+                .is_some_and(|end| end <= bytes.len()),
+            "debug payload is not file-backed"
+        );
+        return Ok(offset);
+    }
+    anyhow::bail!("debug RVA {rva:#x} is not file-backed")
 }
 
 fn align(value: u32, alignment: u32) -> u32 {

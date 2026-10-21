@@ -16,8 +16,8 @@ use anyhow::Context as _;
 use kamy_core::Rva;
 use kamy_corpus::Coverage;
 
-/// Map a linker [`Report`](kamy_link::Report) to corpus [`Coverage`]: verbatim
-/// relocations (moved minus SSA-lowered) and rejections tallied by reason tag.
+/// Map linker outcomes to corpus coverage, excluding import thunks and counting
+/// only SSA-lowered movers as covered; any non-SSA movement remains visible.
 pub(crate) fn report_to_coverage(report: &kamy_link::Report) -> Coverage {
     let mut by_reason: BTreeMap<String, usize> = BTreeMap::new();
     for (_, reason) in &report.rejected {
