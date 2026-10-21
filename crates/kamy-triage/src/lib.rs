@@ -38,7 +38,7 @@ pub fn protect_identity(
     let seeds = pe.seeds();
     module.functions = discover_functions(&module, &seeds);
 
-    let cc = kamy_link::build_import_callconv(&module);
+    let cc = kamy_link::build_callconv(&module);
     let mut identity = |_: &mut IrFunction, _: f32| {};
     let opts = kamy_link::Options {
         selector: selector.cloned(),
@@ -82,7 +82,7 @@ pub fn dump_function(input: &Path, rva: Rva, stage: Stage) -> anyhow::Result<Str
         .find(|f| f.entry == rva)
         .with_context(|| format!("no function with entry {rva}"))?;
 
-    let cc = kamy_link::build_import_callconv(&module);
+    let cc = kamy_link::build_callconv(&module);
     let mut result: LiftResult = kamy_lift::lift_function(&module, func, &cc);
     if matches!(stage, Stage::Ssa | Stage::Optimize | Stage::Regalloc) {
         kamy_lift::ssa::construct_ssa(&mut result);

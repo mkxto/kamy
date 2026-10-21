@@ -132,7 +132,7 @@ fn with_profile(input: &Path, output: &Path, profile_path: &Path) -> anyhow::Res
         }
     }
 
-    let cc = kamy_link::build_import_callconv(&module);
+    let cc = kamy_link::build_callconv(&module);
     let mut transform_fn: Box<TransformFn> = if let Some(mba) = mba_pass {
         Box::new(
             move |func: &mut kamy_core::ir::IrFunction, intensity: f32| {

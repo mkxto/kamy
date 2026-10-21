@@ -52,12 +52,14 @@ struct Moved {
     unwind: Option<Vec<u8>>,
 }
 
-/// Resolve every call target we can name to its precise Win64 signature,
-/// keyed by target VA for [`MapCallConv`]. Two shapes resolve:
-/// an import slot (`call [rip+slot]`, keyed by the slot VA) and a single-block
-/// import thunk (`jmp [rip+slot]`, keyed by the thunk entry VA, so a direct
-/// `call thunk` also narrows). Everything else falls back to the Win64 default.
-pub fn build_import_callconv(module: &Module) -> MapCallConv {
+/// Resolve every call target we can narrow to a precise Win64 signature, keyed
+/// by target VA for [`MapCallConv`]. Three sources, lowest precedence first:
+/// callee-side argument inference on the target's own functions (keyed by entry
+/// VA), then import slots (`call [rip+slot]`, keyed by slot VA) and single-block
+/// import thunks (`jmp [rip+slot]`, keyed by thunk entry VA) — the named-import
+/// signatures are authoritative and overwrite an inferred entry at the same VA.
+/// Everything else falls back to the Win64 default at the call site.
+pub fn build_callconv(module: &Module) -> MapCallConv {
     let base = module.image_base;
     let mut slot_name: HashMap<u32, &str> = HashMap::new();
     for s in &module.symbols {
@@ -67,6 +69,15 @@ pub fn build_import_callconv(module: &Module) -> MapCallConv {
     }
 
     let mut by_va: HashMap<u64, kamy_core::ir::FnSignature> = HashMap::new();
+    for func in &module.functions {
+        if let Some(sig) = kamy_analysis::infer_signature(module, func) {
+            // A full four-argument result is the default already; only a genuine
+            // narrowing is worth an entry.
+            if sig.args.len() < 4 {
+                by_va.insert(base + u64::from(func.entry.get()), sig);
+            }
+        }
+    }
     for (&slot_rva, name) in &slot_name {
         if let Some(sig) = win64_import_signature(name) {
             by_va.insert(base + u64::from(slot_rva), sig);
