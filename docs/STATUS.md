@@ -358,3 +358,33 @@ Runtime-verified by `console_jtable` (new corpus member): a `#[inline(never)]`
 its accumulator over 20,000 iterations (`relocated` = 0 corpus-wide — verbatim
 movement is gone). The computed-`jmp`/pad obfuscation CodeDefender layers on top
 is a separate Phase-4 transform.
+
+## Relocation rebuild — current (#17, D37–D38)
+
+The supported input is x86-64 PE32+; x86/PE32 is out of scope.
+
+Host reference analysis (#18) now records per-function incoming/outgoing
+references and explicit uncertainty for branches, RIP-relative operands,
+relocated pointers, recovered switches, unwind, exports, TLS, LoadConfig and
+debug metadata. Ambiguous ownership, code-as-data, interior targets, untracked
+addresses and unsupported reference consumers keep the target resident.
+`analyze` reports the sets and deterministic unresolved-reference rows.
+Import/forwarder thunks remain excluded from protection-target accounting.
+
+The corpus exercises flagged volatile metadata, numeric LTCG/SPGO signatures,
+extended guard-table strides, ordinal-only exports and x64 dynamic function
+overrides. Unrecognized encoded metadata still fails closed; this is not a
+claim of complete blind recovery of dynamically computed addresses.
+
+Verified: formatting, clippy with denied warnings, workspace/all-target build,
+and all 143 tests pass. Actual `analyze` runs cover console CFG, LTO and
+vendored kernel32; differential corpus verification is **23/23 PASS**, with
+**1309/11388 SSA-lowered (11.5%)**, zero verbatim relocations. The session's
+pre-change executable baseline was 21/23 PASS and 2100 SSA-lowered. The lower
+coverage is explicit conservative rejection, not an unwind/CFG reconstruction
+fix; the formerly failing throw helpers stay resident.
+
+The reference-rewriting cutover (#19/#20/#30/#22/#33/#35), image rebuild (#27),
+optional naming (#34) and authored-module injection (#32) are not yet landed.
+The legacy entry-thunk and `--no-transform` verbatim paths still exist pending
+that cutover. Exact module metadata remains part of #18/#32, not host inference.

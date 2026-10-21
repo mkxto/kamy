@@ -3,6 +3,8 @@
 Consolidated findings from primary sources, blog posts, and academic papers.
 All claims are cited inline.
 
+The approved relocation target is [#17](https://github.com/mkxto/kamy/issues/17), recorded in grilling D37–D38. Target requirements below do not establish implementation or verification completion; dated measurements remain historical evidence, not proof of that epic's acceptance.
+
 ---
 
 ## 1. Prior Art & Reference Implementations
@@ -19,6 +21,14 @@ Commercial bin2bin protector for Windows PE (x86-64 + ARM64). No source changes 
 - Functions that can't be safely transformed are *reported*, not silently broken
 - Debug map generation for crash investigation in protected builds
 - API + CLI + SDK for CI pipeline integration
+
+**Reference-rewriting evidence:** [#17](https://github.com/mkxto/kamy/issues/17) and [code_defender.md](code_defender.md) record 953 direct branches to moved code versus 26 image-wide base relocations (zero into moved code) in the crackme. The old inference that `NoThunkSpace` proves a thunk at every moved entry is superseded. rel32/RIP-relative rewriting is the primary mechanism; loader `.reloc` rebasing is only one reference class. Residual unwind-referenced stubs are not a reason to preserve Kamy's per-function thunk design.
+
+**Module evidence:** the vendor's [Module Extension System](https://codedefender.io/blog/2025/03/27) compiles C/C++/Rust to a specialized DLL with **unmerged data directories, one per section**; lifts functions as `CodeSymbol`s and `.rdata`/`.data`/`.bss` as `DataSymbol`s; and imports authored relocations into its linker. Kamy-authored module references are exact by construction; host references remain conservative inference with safe-reject ([#18](https://github.com/mkxto/kamy/issues/18)). This replaces the COFF-only plugin assumption, not D16's format boundary or D5's zero-spill rule.
+
+**Entry evidence and scope:** the [published plugin source](https://github.com/codedefender-io/plugins) shows the init loop and a past-`end` `musttail` call. [#32](https://github.com/mkxto/kamy/issues/32) records that the shipped EXE's nonreturning original startup is the final callback **inside** `[begin,end)`; the past-`end` call is dead, not a continuation to copy. A transform-only returnable DLL entry is redirected directly to moved code and returns to the loader; the status-checking EXE loader cannot front `DllMain` unchanged ([#35](https://github.com/mkxto/kamy/issues/35)). Kernel entry stays pinned. Payload injection and section-name blanking/rebranding are per-build, **off by default**, not relocation prerequisites ([#32](https://github.com/mkxto/kamy/issues/32), [#34](https://github.com/mkxto/kamy/issues/34)).
+
+**Rebuild scope:** [#27](https://github.com/mkxto/kamy/issues/27) distinguishes selective in-place hole reclamation/dead-tail truncation from whole-image compaction: pinned survivors cannot slide without rebasing their references too. The target rebuilds directories and recycles empty section slots, not append-with-thunks or `0xCC` fill. CFG/LoadConfig defaults to **non-enforcing and internally consistent**, including valid cookie references; vendor-claimed enforcing module CFG is not observed sample behavior or a gate ([#33](https://github.com/mkxto/kamy/issues/33), [vendor module blog](https://codedefender.io/blog/2025/03/27)).
 
 ### 1.2 BLARE2 (Aftermath Labs internal engine)
 Custom disassembler → SSA IR → optimization pipeline → compiler backend (instruction selector, register allocator, assembler) → linker. AMD64 + ARM64. Used for both obfuscation and devirtualization — same engine, both directions.
@@ -66,7 +76,7 @@ Operates on COFF/lib files. Replaces the linker. Controls symbol placement and l
 
 **Key architecture concepts we adopt:**
 - **Ordered, type-filtered pass pipeline:** passes inherit a base class, declare which symbol types they run on, are registered explicitly in caller-defined order.
-- **Relocation rebasing:** relocations inside routines are rebased to be symbol-relative (or instruction-relative when decomposed to `.split`). This makes code position-independent of original placement — the enabler for free relayout.
+- **Relocation rebasing:** routine relocations become symbol-/instruction-relative. This informs authored-module linking, but loader `.reloc` rebasing alone does not enable linked x64 host relayout: decoded rel32/RIP-relative references and directory consumers also require rewriting ([#17](https://github.com/mkxto/kamy/issues/17)).
 - **Recursive used-symbol walk:** transitive reachability from entry point via relocations, with memoization. Dead-symbol elimination.
 - **Per-instruction decomposition** (`.split` sections): one symbol per instruction for maximum placement freedom.
 
@@ -260,12 +270,15 @@ VMProtect is NOT CET-compatible — its VMEXIT uses RET as a CALL substitute. De
 "Is `0x42424242` a pointer that must move, or a constant that must stay?" Getting one wrong silently corrupts the binary. KAIST's "Reassembly is Hard" (USENIX'23) proves no existing tool (Ramblr, RetroWrite, Ddisasm) is error-free.
 
 ### 5.2 Design Strategy (metadata-first, inference-second)
-1. **Consume ground truth first:** PE relocations (`.reloc` section), symbol tables, `.pdata`/`.xdata` unwind info, debug info (PDB). These are guaranteed-correct references.
-2. **Infer the residual:** jump-table entries (often lack relocations even in PIE), computed pointers, address-of-label patterns. Use weighted-evidence voting (Ddisasm model): register def-use chains, register value analysis, data-access-pattern analysis.
-3. **Graceful degradation:** below a confidence threshold per function, fall back to an address-translation table (correct-but-slow, Multiverse model) instead of fast-but-broken rewriting. Per-function policy.
+1. **Host ground truth first:** consume and validate loader relocations, symbols/PDB, unwind records, and PE directory fields. Metadata identifies particular references; it does not prove that no unrecorded consumers exist.
+2. **Host residual analysis:** decode direct branches and RIP-relative operands in all discovered code, including resident callers of moved bodies. Analyze computed pointers/materialized addresses conservatively. Recover switches with D24's use-def DAG + `petgraph` VF2 and proven bounds; consume case edges through table-free lowering, never table patching. Unresolved consumers pin targets and safe-reject movement ([#18](https://github.com/mkxto/kamy/issues/18), [#19](https://github.com/mkxto/kamy/issues/19)).
+3. **Residual taken-address translation:** [#22](https://github.com/mkxto/kamy/issues/22) permits a known original-RVA → new-VA mapping only when the consuming path uses it. A map does not repair an opaque consumer; leaving its target resident is required. No confidence-threshold permission to move incomplete functions, per-function entry thunk, `NoThunkSpace`, or verbatim fallback (D37).
+4. **Authored modules are not inferred:** their unmerged DLL directories, code/data symbols, and compiler-authored relocations feed the same reference/linker machinery directly. Coverage is exact by construction; host safe-reject does not gate module references. This is distinct provenance, not a redundant reference model or blanket exemption from codegen/ABI/unwind correctness (D38, [vendor specification](https://codedefender.io/blog/2025/03/27)).
+
+rel32/RIP-relative rewriting is the main x64 mechanism (#19). Regenerate moved `.pdata`/`.xdata` ([#20](https://github.com/mkxto/kamy/issues/20)); rebase VA64 pointers that actually have loader fixups ([#30](https://github.com/mkxto/kamy/issues/30)); rewrite known RVA32 directory fields or regenerate their directories. Never sweep arbitrary dwords as pointers or rewrite switch tables.
 
 ### 5.3 Data Model
-Adopt GTIRB/Egalito's **Link/SymbolicExpression** overlay on bytes. Every reference becomes a first-class symbolic object so layout changes are correct-by-construction. Never store absolute addresses in the IR.
+Adopt GTIRB/Egalito's **Link/SymbolicExpression** overlay on bytes. Every layout-sensitive reference becomes a first-class symbolic object. Preserve source/target/kind and per-function incoming/outgoing/unresolved relationships so movement is conditional on complete rewriteability. Symbolic annotations make resolved layout changes tractable; they do not establish completeness for arbitrary host code. Shared reference types stay format-agnostic (D16); PE parsing/regeneration stays in PE-specific crates.
 
 Classify each candidate with the KAIST Type I-VII scheme (atomic/composite × absolute/PC-rel/GOT-rel/label-rel). Composites (`label±const`, `label1-label2`) are 97.4% of cases — not edge cases.
 
@@ -274,7 +287,7 @@ Classify each candidate with the KAIST Type I-VII scheme (atomic/composite × ab
 ## 6. Verification & Testing Strategy
 
 ### 6.1 Layered Pipeline (cheapest first)
-1. **Differential reassembly self-test:** rewrite with no transform, require byte/label equivalence. Catches symbolization bugs. Wire into CI.
+1. **Differential reassembly self-test:** rewrite with no transform, require equivalent observable behavior and correct reference/label resolution, not byte identity at original VAs. Catches symbolization bugs; corpus acceptance remains required by #17, not established by this document.
 2. **Per-instruction lifter validation:** SMT-prove decode→IR semantics per opcode offline (PLDI'20 method found 29 bugs in McSema). Do once per ISA.
 3. **Per-transform equivalence gate (STOKE two-tier):** fast test-vector run with Hamming partial credit → sound SMT bit-vector proof on mutated block before commit.
 4. **Loop/function-level equivalence** (DDEC) for transforms that change control structure (CFF).
@@ -380,7 +393,7 @@ validated against real binaries.
 |-------|-------|--------|-----------------|
 | Export forwarder stubs | 843 blocks | 6–7-byte functions, `jmp qword [rel IAT]`; kernel32 has a literal `fothk` section, targets land in the `.rdata` IAT window (RVA 0x89000–0x8C000) | **Not protection targets.** Classify-and-skip; never count as rejection |
 | Internal static-pointer jumps | 67 blocks | Same `jmp qword [rel X]` shape inside real functions (tail-calls through data pointers) | Resolve pointer statically; rewrite 6-byte indirect jmp as 5-byte `jmp rel32` (fits in place, 1 byte pad) |
-| RVA-relative switch tables | 11 blocks / 12 funcs | Canonical MSVC shape (below) | Layer 2 pattern match; recover + retarget |
+| RVA-relative switch tables | 11 blocks / 12 funcs | Canonical MSVC shape (below) | Layer 2 use-def DAG + VF2 recovery, then table-free lowering; no table retarget |
 | Bare `jmp reg` dispatch | 4 blocks | Computed control flow, no static table | Genuinely dynamic → stay rejected (correct D22 behavior) |
 
 Per-function: 910 of 922 are static-jump-only; only 12 functions contain real
@@ -516,10 +529,7 @@ does not claim 100% on system binaries):
   disassembler decode table data as code — a plausible contributor to our
   phantom-seed artifact (§10.2). They gate noreturn on "all terminators are
   interrupts/known-noreturn calls" after a retpoline false positive.
-- **Documented gap**: the post covers detection/parsing only — **no re-emit or
-  retarget algorithm** for a moved table. That design burden is ours: after a
-  function moves, its table must be copied/re-encoded (deltas or RVAs
-  recomputed for the new layout) and the dispatch re-emitted to match.
+- **Detection is not table relocation:** the post documents detection/parsing, not a moved-table re-emission algorithm. Kamy does not need or adopt one: D24 recovers the switch CFG and SSA lowers it to a table-free compare ladder. A rejected/untouched function keeps its original table verbatim. **No jump-table entries are patched, copied, or re-emitted** ([#17](https://github.com/mkxto/kamy/issues/17), [#19](https://github.com/mkxto/kamy/issues/19), §10.4).
 - **Test corpus**: jump-table-specific corpus at
   `github.com/backengineering/bintests/tree/master/misc/jtables` (distinct from
   the aftermathlabs corpus adopted in D25) — adopt as the D24 conformance set.

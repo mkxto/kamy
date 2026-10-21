@@ -48,9 +48,9 @@ compiler_settings:
 
 `lifter_settings` is mandatory and always present. "MutationEngine" is a pass *within* the SSA pipeline, not a separate byte-patching engine. The difference between "light" and "heavy" protection is **which passes run and how many iterations**, not which engine is used.
 
-**2. Own linker with thunk placement and space reclamation.**
+**2. Own linker with reference rewriting and space reclamation.**
 
-From the windows repo README: *"our linker will reuse free space."* The linker places transformed code and can reclaim the space from original function bodies. The benchmark rejection reason `NoThunkSpace` confirms thunks (stubs) are placed at original function sites — if the original function is too small for a thunk, the function is rejected.
+The windows README states *"our linker will reuse free space."* Historical `NoThunkSpace` benchmark output is not evidence for a universal per-function thunk model. Newer sample analysis in [#17](https://github.com/mkxto/kamy/issues/17) records 953 direct branches to moved code, 26 base relocations (none into moved code), and 10 residual unwind-referenced stubs. D37 supersedes the original thunk inference.
 
 **3. Can do whole-program or selective.**
 
@@ -104,28 +104,11 @@ Two engines = two implementations of: EFLAGS preservation, relocation tracking, 
 
 ---
 
-### D2 — Linker Strategy
+### D2 — Linker Strategy (superseded by D37)
 
-**Question:** How does the linker handle transformed functions?
+**Original choice:** original-VA thunk + appended `.kamy`, with reclamation deferred and a five-byte minimum function size.
 
-**Options considered:**
-1. ✅ **Thunk at original site + new section for transformed code** — original function body overwritten with a short stub redirecting to transformed code in a new `.kamy` section. PE structurally rebuilt.
-2. ❌ Thunk + space reclamation — same as above but linker reuses freed space. CodeDefender does this ("our linker will reuse free space") but it's a v2 optimization.
-3. ❌ Full image re-layout — no thunks, re-point everything. Requires perfect whole-program symbolization.
-
-**Decision:** Thunk + new section. Space reclamation deferred.
-
-**Reasoning:** The `NoThunkSpace` rejection in CodeDefender's benchmark output confirms thunks are the mechanism. If the original function is too small for a thunk, it's rejected — that's the evidence.
-
-Thunk model bounds the symbolization problem: you only need to symbolize *inside* transformed functions + their direct outbound references. Inbound references to the function hit the thunk and redirect automatically. You don't need to find and re-point every caller.
-
-Space reclamation ("our linker will reuse free space") is a size optimization that can be added later without architectural changes. It just means the linker has a free-list of reclaimed original-body regions.
-
-**Implications:**
-- Thunk format: `jmp rel32` (5 bytes) for near, `jmp [rip+0]; dq addr` (14 bytes) for far. Minimum original function size = 5 bytes.
-- Functions smaller than thunk size → rejected (matches `NoThunkSpace`).
-- Direct `call` instructions whose target is a transformed function CAN be re-pointed directly (avoiding the thunk indirection) when the caller is also being transformed. Optimization, not required for correctness.
-- Original function body should be scrubbed (zeroed or filled with `int3`) after thunk placement to prevent analysts from reading the original code.
+**Superseded:** [#17](https://github.com/mkxto/kamy/issues/17) and [#27](https://github.com/mkxto/kamy/issues/27) authorize complete reference rewriting and PE rebuild. Rewriting inbound references is required for correctness, not an optional direct-call optimization. No per-function entry thunk, `NoThunkSpace` floor, original-VA retention, or blanket `int3` scrub remains in the target design. See D37 for conservative residency and selective reclamation rules.
 
 ---
 
@@ -440,11 +423,11 @@ PE-specific code lives ONLY in `kamy-pe`, `kamy-seh`, `kamy-link`, `kamy-disasm`
 
 ### D17 — Plugin/SDK Architecture
 
-**Decision:** Design linker for future plugin injection capability, but defer the user-facing SDK to v2+.
+**Decision:** Support authored-module symbol/relocation linking under D38; defer the general user-facing SDK to v2+.
 
-**Reasoning:** CodeDefender's plugin SDK allows injecting custom C/C++ functions post-compilation (BLARE2 plugins, tether client injection). The capability falls out naturally from having a real linker that resolves symbols. Just don't invest in the SDK API, documentation, or toolchain integration for v1.
+**Reasoning:** The vendor's [Module Extension System](https://codedefender.io/blog/2025/03/27) statically links compiled C/C++/Rust functions and data into a host. This is not a COFF-object-only SDK contract. D38 specifies the authored-module path and optional payload scope; a general public SDK remains outside this epic.
 
-**Implication:** The linker should accept external symbol definitions and code chunks — design for it even if v1 doesn't expose it.
+**Implication:** The linker consumes module function/data symbols and authored relocations. Optional Kamy payload support does not require a general user-facing SDK.
 
 ---
 
@@ -530,10 +513,10 @@ Together: per-build variance that breaks signature matching (SigBreaker model).
 
 **Decision:** Structured rejection report (JSON/YAML) with per-function reasons.
 
-**Rejection reason enum (initial set):**
+**Rejection reasons:** safe rejection remains binding; the historical thunk-size reason is explicitly superseded below.
 | Reason | Meaning |
 |--------|---------|
-| `NoThunkSpace` | Original function too small for a thunk (< 5 bytes) |
+| `NoThunkSpace` (retired target, D37) | Historical original-VA thunk size check; removed by #22, not a rejection in the approved design |
 | `BadIndirectBranch` | Unresolvable indirect jump (not a recognized jump table pattern) |
 | `UnsupportedInstruction` | Instruction the lifter can't model and can't safely pass through |
 | `LiftFailure` | Lifter error (e.g., malformed code, data-in-code confusion) |
@@ -577,10 +560,12 @@ Each stage is independently testable:
 
 Three-layer approach:
 1. **Relocations (.reloc):** some jump table entries have base relocations. These are ground truth — mark as known table entries.
-2. **Pattern matching:** detect the standard MSVC switch pattern: `cmp reg, N; ja default; lea reg, [rip+table]; movsxd reg, [reg+idx*4]; add reg, reg; jmp reg`. Extract entry count from bounds check (N+1). Cross-reference with .pdata function boundaries (entries can't point outside the function).
+2. **Pattern matching:** per-function use-def DAG + `petgraph` VF2 subgraph isomorphism, not textual instruction matching (research.md §10.5). Recognize MSVC/LLVM dispatch variants and derive a proven entry count from a bounds check or mask. Cross-reference with function boundaries; ambiguous or out-of-function targets reject.
 3. **Register value analysis (fallback):** use the register value analysis to determine the range of the index register at the indirect jump. More general but less precise.
 
 If none of the three layers produces a confident result → reject the function (`BadIndirectBranch`). Never guess.
+
+Recovered switches become intra-function CFG edges and lower table-free through SSA. No table is patched, copied, or re-emitted; an untouched/rejected host function retains its original table. See [#18](https://github.com/mkxto/kamy/issues/18), [#19](https://github.com/mkxto/kamy/issues/19), and research.md §10.4–10.5.
 
 **Testing:** aftermathlabs' **bintests** repo includes jump table test cases. Use as part of our test suite.
 
@@ -638,13 +623,13 @@ For parallelism determinism: per-function sub-seeds derived from `hash(global_se
 
 ### D28 — Coverage Robustness: Depth-Adaptive Transforms (Zero-Spill Stands)
 
-**Decision:** Single engine stays (D1). The 100%-coverage goal ("every selected function works", e.g. all of kernel32) is met by adapting transform intensity to the register budget, **not** by adding a spill path.
+**Decision:** Single engine stays (D1); transform intensity adapts to the register budget, **not** by adding a spill path. D37 supersedes the historical claim that relocation fallback guarantees 100% host coverage.
 
 Per-function ladder:
 1. Requested passes at full intensity; if regalloc fails `RegisterPressure`, retry at reduced intensity (fewer MBA iterations, no CFF intermediates) — deterministic per D26 sub-seed.
-2. If even identity lowering doesn't fit → relocation fallback, reported via D22.
+2. If even identity lowering does not fit, reject in place and report via D22. No verbatim relocation fallback.
 
-**Reasoning:** measured on target.exe (2026-10-16): 95/169 functions reach regalloc with the callee-saved pool; the remaining 70 exceed 15 GPRs under zero-spill. D5's bar exists because spill frames break disassembler stack analysis — a product-quality constraint. Depth adaptation keeps every output disassembler-clean while still protecting pressure-heavy functions at reduced depth, which is strictly better than either spilling or rejecting.
+**Reasoning:** D5's zero-spill bar protects disassembler stack analysis. Depth adaptation improves coverage without weakening that constraint; it cannot establish reference completeness or eliminate legitimate host safe-rejects.
 
 **Implications:**
 - Callee-saved activation (Phase 4) is the first rung: widens the pool from 8 volatile to 15 GPRs + XMM6-15.
@@ -654,37 +639,19 @@ Per-function ladder:
 
 ---
 
-### D29 — Trampoline Stub Obfuscation
+### D29 — Trampoline Stub Obfuscation (superseded by D37)
 
-**Decision:** Thunk stubs get deterministic per-function flavor diversification + junk fill in scrubbed body bytes; direct-call re-pointing eliminates stubs entirely where all callers are symbolized with confidence.
+**Original choice:** diversify original-site thunk flavors and junk-fill vacated bodies; remove stubs only when direct callers were known.
 
-- Flavor set (per-function choice from a D26 sub-seed; must fit the original function size; `E9 rel32` stays the 5-byte floor / NoThunkSpace boundary):
-  - `E9 rel32` — plain near jump (floor)
-  - `FF 25 00000000 + qword target` — RIP-indirect through a pointer
-  - `B8 imm32 + FF E0` / `49 BB imm64 + 41 FF E3` — mov-reg + jmp-reg
-- Scrubbed original-body bytes get junk/dead padding instead of int3-only.
-- When every direct caller of a moved function is itself moved or re-pointable with confidence, re-point the calls and drop the stub — the best-hidden stub is no stub. Below confidence threshold the stub stays (graceful degradation, never correctness-dependent).
-- Encrypted/validated dispatch tables are deferred to the runtime (D30): `jmp [rip+x]` with the pointer materialized by init code.
-
-**Reasoning:** ground truth (RE of CodeDefender `HelloWorld-Injected.exe`, 2026-10-16): the demo ships verbatim `E9 rel32` detours on every protected entry ("no obfuscation applied for ease of analysis"). Even the commercial model leaves plain stubs when the knob is off — stub stealth is a cheap differentiator implemented at thunk-emission time, orthogonal to D2 correctness.
+**Superseded:** the clean cutover removes this mechanism, its five-byte floor, and its encrypted dispatch-table extension. The earlier claim that `HelloWorld-Injected.exe` places an `E9` detour on every protected entry was incorrect: that sample demonstrates module injection with no transforms, not a universal thunk strategy ([vendor README](https://github.com/codedefender-io/plugins), [#17](https://github.com/mkxto/kamy/issues/17)). D26 deterministic diversification remains independent of entry thunks.
 
 ---
 
-### D30 — Runtime Section, EP Hijack & Plugin SDK (enriches D17)
+### D30 — Runtime Section, EP Hijack & Plugin SDK (superseded by D38)
 
-**Decision:** Adopt the CodeDefender runtime/injection model: kamy ships a runtime component inside the protected binary, and the plugin SDK (D17 "v2+") takes the CodeDefender SDK shape.
+**Original choice:** mandatory runtime, generated init-table EP stub, COFF-only plugin ingestion, and deferred section recycling.
 
-Ground truth (RE of `HelloWorld-Injected.exe`, `.belabs` sections, base 0x140000000; codedefender-io/plugins README):
-- **EP hijack:** `AddressOfEntryPoint` redirected to a generated stub that walks an init-callback table (bounds in RW section), `__fastfail`s on nonzero status, then tail-calls the original CRT entry (`[[clang::musttail]]` in their SDK).
-- **Runtime sections:** RX code + RW mutable state + R rodata (their split @0x7000/0x8000/0x9000). Helpers: PEB InLoadOrderModuleList walk + export hashing (lazy_importer-style manual import resolution), cpuid/xgetbv feature init (codegen-variant dispatch), fastfail/RtlCaptureContext integrity reporter.
-- **Plugin SDK:** user C/C++ compiled with LLVM-MSVC against SDK headers; `init_table_start/end` linker symbols register init functions; the linker ingests the resulting COFF. This is D17's "linker accepts external symbol definitions and code chunks" made concrete.
-
-**Implications:**
-- kamy-link needs COFF object ingestion (sections, symbols, COMDAT, relocations).
-- Config: plugin object list per profile; init ordering deterministic.
-- EP hijack must preserve TLS callback ordering and CET compatibility (ties into Phase 4).
-- Their old-`.pdata`→`.text` repurposing is space reclamation (D2 option 2) — evidence the commercial tool reclaims section space; stays deferred for us.
-- Open external RE threads: confirm `sub_140007000` (import resolver vs anti-tamper); enumerate the full trampoline set (5 verified: 0x1000, 0x1070, 0x10c0, 0x17c8, 0x1d54); inspect init callbacks at `.rdata` 0x27f0.
+**Superseded:** D38 distinguishes optional injected module code/data from transformation and gives the target-specific entry ABI. RW sections are module data, not proof of a generic runtime or injection. The vendor module is a specialized DLL with unmerged data directories, not a COFF-only input. The shipped EXE's original entry is the final callback **inside** `[begin,end)`; the published source's past-`end` `musttail` call is unreachable because that entry does not return. It is not a continuation to reproduce. The published loader cannot front returnable `DllMain` unchanged ([#32](https://github.com/mkxto/kamy/issues/32), [#35](https://github.com/mkxto/kamy/issues/35)). Section recycling is part of #27, not deferred under D2.
 
 ---
 
@@ -750,12 +717,37 @@ pass **C1/C2**.
 
 **Decision:** A new workspace crate `kamy-corpus` owns the manifest, build driver, bless, verify loop, and the DLL loader. `kamy-verify` keeps the format-agnostic record/compare/run primitives. Windows-specific execution (vcvars build, loader FFI) is cfg-gated so the core still compiles cross-platform.
 
+### D37 — Complete Reference Rewriting & PE Rebuild
+
+**Decision:** Adopt the user-authorized [#17](https://github.com/mkxto/kamy/issues/17) target. This supersedes D2, D29, D22's `NoThunkSpace` choice, and D28's verbatim relocation/100%-host-coverage fallback. These are target requirements, not implementation or verification claims.
+
+- [#18](https://github.com/mkxto/kamy/issues/18) gates movement with a complete per-function incoming/outgoing reference model: decoded direct branches, RIP-relative references, relocation-backed absolute pointers, known RVA fields, recovered switch CFG edges, unwind boundaries, entry, and export/TLS/load-config/debug metadata. Host inference is conservative; unresolved consumers pin their targets. Do not guess completeness from a confidence score or the absence of `.reloc` entries. Safe-reject stays (D22).
+- [#19](https://github.com/mkxto/kamy/issues/19) rewrites rel32/RIP-relative displacements in both directions, including resident callers of moved functions. These references have no loader fixup and are the main x64 mechanism. Recovered switches lower table-free (D24); untouched tables stay untouched.
+- [#20](https://github.com/mkxto/kamy/issues/20) regenerates `.pdata`/`.xdata`, including generated frame/unwind semantics and supported EH scopes. [#30](https://github.com/mkxto/kamy/issues/30) rebases relocation-backed VA64 fields and rebuilds matching loader fixups. It does not rewrite switch tables.
+- [#22](https://github.com/mkxto/kamy/issues/22) translates known residual taken addresses only where the consumer can use that translation. A translation map alone cannot fix opaque consumers; keep their targets resident. Retire per-function entry thunks and `NoThunkSpace`, not safe-reject.
+- [#27](https://github.com/mkxto/kamy/issues/27) makes `.kamy` the selected/lowered code home, with PIC code where possible, rebuilt Import/Debug/BaseReloc/Exception directories, and recycled/retyped empty section slots. No original-VA thunk or `0xCC` thunk-flood. Selective builds reclaim interior holes in place and truncate only a dead tail; do not slide pinned survivors. Whole-image compaction requires rebasing every affected survivor and is not implied by selective reclamation.
+- [#33](https://github.com/mkxto/kamy/issues/33) defaults to a **non-enforcing, internally consistent CFG/LoadConfig**: valid cookie references, non-enforcing check/dispatch targets, and cleared function-table-present state or valid remaining metadata. Real enforcing module CFG is a vendor claim and later opt-in, not a gate here.
+
+D5 zero-spill, D16 format-agnostic core, D22 safe rejection, and D24 use-def DAG + `petgraph` VF2 recovery/table-free lowering remain binding. PE directory interpretation belongs in PE-specific crates; shared reference kinds carry no PE layouts. Corpus/runtime acceptance in the linked issues remains required; this decision records no exercised proof.
+
+### D38 — Authored Modules, Entry ABI & Optional Presentation
+
+**Decision:** Supersede D30's mandatory-runtime, COFF-only, and past-`end`-tailcall claims with the [vendor Module Extension System](https://codedefender.io/blog/2025/03/27) and [published plugin source](https://github.com/codedefender-io/plugins), as scoped by [#32](https://github.com/mkxto/kamy/issues/32) and [#35](https://github.com/mkxto/kamy/issues/35).
+
+- Host code is inferred from an already-linked image and may be safely rejected. Kamy-authored Rust modules are compiled with **unmerged DLL data directories (one directory per section)**; functions become code symbols, `.rdata`/`.data`/`.bss` become data symbols, and authored relocations enter the same linker/reference machinery directly. Their reference coverage is **exact by construction**, not guessed by host heuristics; host safe-reject does not gate module references. Module functions remain pass-eligible and need valid unwind metadata. This does not waive instruction, ABI, or zero-spill correctness.
+- EP redirection and moving the original startup are independent. A transform-only returnable DLL entry points directly into `.kamy` and returns to the loader; exports are rebased and DLL header semantics preserved. Kernel EP stays pinned and untouched. EXE startup may remain resident or move according to resolved references.
+- Injection is optional, per-build, **off by default and off for kernel entries**. Preserve entry arguments, TLS ordering, stack/return ABI, and CET semantics. For an EXE init table, the final in-range original entry must not return; never execute a past-`end` slot. For DLL payloads, sequence a payload then tail-transfer to `DllMain`, preserving entry arguments and its return value, or explicitly exempt the final entry from status checking. Never interpret `DllMain`'s successful `TRUE` as a failed init status.
+- Section naming/blanking/rebranding is optional, per-build, **off by default** ([#34](https://github.com/mkxto/kamy/issues/34)); `.kamy` remains the normal name. Neither names nor payload injection are prerequisites for relocation correctness. A general public SDK remains deferred (D17).
+
+Vendor claims about enforcing CFG, longjmp/SAFESEH registration, and unwind-safe syscalls are not measured sample behavior and do not expand this epic's gates.
+
+
 ## Decision Summary
 
 | # | Decision | Choice |
 |---|----------|--------|
 | D1 | Engine model | Single SSA IR engine, pass-selectable |
-| D2 | Linker strategy | Thunk at original site + new .kamy section |
+| D2 | Linker strategy | Superseded by D37: reference rewriting, no original-VA thunks |
 | D3 | CALL handling | Lift calls + split-on-call fallback |
 | D4 | PE parse/emit | Fully custom (kamy-pe) |
 | D5 | Register allocator | Linear scan, zero-spill hard constraint |
@@ -770,26 +762,28 @@ pass **C1/C2**.
 | D14 | Win32metadata | Pre-process, load once at startup, shared across jobs |
 | D15 | Delivery model | CLI-first, SaaS later |
 | D16 | ELF timing | PE-only v1, abstract for ELF from the start |
-| D17 | Plugin/SDK | Linker capable, SDK deferred to v2+ |
+| D17 | Plugin/SDK | Authored-module linker path under D38; public SDK deferred |
 | D18 | Module settings | All except ida_crasher in v1 |
 | D19 | Crate structure | 12 crates as designed |
 | D20 | Diversification | Assembler shuffle + IR-level diversify pass |
 | D21 | Optimizer | All four passes, convergence-driven (fixed point) |
-| D22 | Rejection | Structured report (JSON/YAML) with reason enum |
+| D22 | Rejection | Structured safe-reject; `NoThunkSpace` retired by D37 |
 | D23 | Bootstrap | Bottom-up linear: PE → disasm → lift → codegen → link |
-| D24 | Jump tables | Hybrid: relocs + pattern match + register value analysis |
+| D24 | Switch recovery/lowering | Relocs + use-def DAG/petgraph VF2 + value analysis; table-free lowering |
 | D25 | Test corpus | Adopt aftermathlabs/bintests |
 | D26 | PRNG | Configurable seed, deterministic ChaCha8Rng |
 | D27 | /GL handling | Detect and warn, fall back to split-on-calls |
 | D28 | Coverage robustness | Depth-adaptive transforms; zero-spill stands |
-| D29 | Stub stealth | Flavor diversification + junk fill + direct-call re-pointing |
-| D30 | Runtime & plugin SDK | CodeDefender model: EP hijack, init table, COFF plugins (D17 enriched) |
+| D29 | Stub stealth | Superseded by D37; no per-function entry stubs |
+| D30 | Runtime & plugin SDK | Superseded by D38; optional authored modules, entry-ABI-specific redirection |
 | D31 | Phase order | Unwind kernel into Phase 2; SEH before obfuscation |
 | D32 | Error handling & observability | anyhow everywhere (no thiserror); tracing via kamy-observe; KAMY_LOG scope/level; RejectionReason stays domain data |
 | D33 | Runnable corpus | Golden record blessed from original; open tool, no CI gate |
 | D34 | Per-member oracle | console stdio / gui link-shim trace / dll loader over pure exports |
 | D35 | Two-phase build | `corpus build` needs toolchains; `corpus verify` does not |
 | D36 | kamy-corpus crate | Orchestration crate; kamy-verify stays format-agnostic |
+| D37 | Relocation rebuild | Complete references, conservative host residency, no thunks, selective reclamation, consistent non-enforcing CFG |
+| D38 | Modules & entry ABI | Exact authored-module refs; returnable DLL EP direct, kernel EP pinned; injection/names optional |
 
 ---
 

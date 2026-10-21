@@ -2,7 +2,9 @@
 
 Binary-to-binary protection engine. 100% Rust.
 Composable, per-function, per-layer protections with scriptable configuration.
-Targets Windows PE (x86-64) first; ELF and ARM64 planned.
+Targets Windows x86-64 PE32+ only. x86/PE32 support is explicitly out of scope; no 32-bit pipeline is planned. ELF and ARM64 remain future targets.
+
+This document specifies the approved target, not completed implementation or verification. The relocation cutover is [#17](https://github.com/mkxto/kamy/issues/17), governed by grilling D37–D38; those decisions supersede D2/D29/D30's original-VA thunk/runtime assumptions.
 
 ---
 
@@ -54,9 +56,9 @@ A "light" profile runs fewer/simpler passes on the same IR as a "heavy" profile.
 
 **Properties:**
 - Per-function selection via symbol names, patterns, addresses, PDB symbols.
-- Per-function graceful rejection with reasons (`BadIndirectBranch`, `NoThunkSpace`).
-- Functions not selected by any profile are untouched (zero cost).
-- Embarrassingly parallel (per-function) via rayon work-stealing.
+- Per-function host safe-rejection with structured reasons (`BadIndirectBranch`, unresolved references, unsupported lowering). No `NoThunkSpace` in the target.
+- Unselected/rejected host bodies stay resident, but their known references into moved code MUST still be rewritten. They are not globally byte-untouched.
+- Lift/transform/codegen is per-function parallel; the complete reference model and final layout/rewrite are shared coordination boundaries.
 ---
 
 ## 3. IR Design
@@ -77,7 +79,7 @@ Program
         └── AuxData (analysis results, unwind info, jump tables, metadata)
 ```
 
-**Key invariant:** absolute addresses never stored. Every cross-reference is a `Link` object pointing to a target `Chunk`. Moving code = free; layout is computed at emit time. (Egalito model)
+**Key invariant:** layout-sensitive references are symbolic, not untracked absolute addresses. Movement is permitted only after reference completeness and rewriteability are established (D37). Opaque consumers pin their targets; a symbolic overlay alone does not prove arbitrary host code movable.
 
 **SymbolicExpression overlay:** every operand that could be a reference carries a typed symbolic annotation: `Absolute(symbol, offset)`, `PcRelative(symbol, offset)`, `LabelDiff(sym1, sym2, offset)`. Classified per KAIST Type I-VII taxonomy.
 
@@ -265,14 +267,25 @@ exclude:
 
 **Performance target:** 750K+ functions in <10s using rayon parallelism (k0mkc achieves this).
 
-### 6.3 Symbolization
-Metadata-first pipeline:
-1. `.reloc` entries → mark as known symbolic references
-2. `.pdata`/`.xdata` pointers → known
-3. Import/export table references → known
-4. PDB info → known
-5. Infer residual: jump tables, computed addresses, switch dispatch
-6. Per-reference confidence score; below threshold → mark as uncertain (handle conservatively)
+### 6.3 Complete Reference Model ([#18](https://github.com/mkxto/kamy/issues/18))
+
+The shared model tracks source, target, kind, per-function incoming/outgoing references, and unresolved references. PE adapters enumerate directory fields; core reference types remain format-agnostic (D16).
+
+| Reference class | Consumer |
+|---|---|
+| Direct branch / RIP-relative code or data | Recompute rel32/disp32 at final layout, inbound and outbound (#19) |
+| Loader-relocated absolute VA64 | Rebase stored pointer and rebuild loader fixup (#30) |
+| Known image-relative RVA32 | Rewrite the identified field; never infer all dwords are pointers |
+| Recovered switch | Intra-function CFG edges consumed by table-free lowering; never patch a table |
+| Unwind boundaries / entry | Regenerate exception metadata as a whole; redirect eligible entry field (#20/#27) |
+| Export / TLS / load-config / debug references | Parse with PE semantics, then rewrite or regenerate (#18/#27/#33/#35) |
+| Opaque / unresolved consumer | Keep the target resident; report host safe-reject |
+
+**Host:** consume relocations, unwind, directories and optional PDB first, then conservative decoded-reference/value analysis. Unknown address materialization or ambiguous consumers block movement. Confidence is evidence, not permission to omit references. A translation map (#22) is valid only at consumers that actually consult it, never a substitute for an unknown consumer.
+
+**Authored module:** compile Kamy's Rust module as a specialized DLL with data directories **unmerged, one directory per section**. Lift functions as code symbols and `.rdata`/`.data`/`.bss` as data symbols; import authored relocations directly into the same linker model. Reference coverage is **exact by construction**, not host inference, so host safe-reject does not gate module references. Instruction/ABI/unwind and D5 zero-spill correctness still apply. This is not a COFF-only SDK contract ([vendor specification](https://codedefender.io/blog/2025/03/27), [#32](https://github.com/mkxto/kamy/issues/32), D38).
+
+Switch recovery remains D24's relocation evidence + per-function use-def DAG / `petgraph` VF2 + value-analysis fallback. Prove bounds and in-function targets or reject. A rejected/untouched function keeps its original table; a lowered function emits none.
 
 ---
 
@@ -315,21 +328,30 @@ Every pass must:
 
 ### 8.1 Code Generation
 - Instruction selection: IR ops → x86 instruction sequences
-- Register allocation: linear-scan; register pressure avoidance as first-class goal
+- Register allocation: linear-scan; D5 zero-spill is a hard constraint; if reduced-intensity/identity lowering fails, reject in place, never verbatim-relocate
 - Stack-frame reconstruction from high-water mark
 - Encode via iced-x86
 
-### 8.2 Linking & PE Emission
-- Layout new code section (`.kamy`)
-- Resolve all Links to final addresses
-- Emit thunks at original function sites (jmp to transformed code)
-- Scrub original function bodies (int3 fill)
-- Rebuild `.reloc` with new base relocations
-- Rebuild `.pdata`/`.xdata` with updated RUNTIME_FUNCTION entries, UNWIND_INFO, C_SCOPE_TABLE
-- Update PE headers (section table, data directories, checksum)
-- Optional debug map output for PDB reconstruction
+### 8.2 Linking & PE Emission (D37)
+- Place selected/lowered bodies in `.kamy`, using PIC rel32/RIP-relative code where possible; resolve links at final addresses.
+- Rewrite both directions, including calls/data references from resident code. Rebase absolute `.reloc` pointers and retain required loader fixups ([#19](https://github.com/mkxto/kamy/issues/19), [#30](https://github.com/mkxto/kamy/issues/30)).
+- Regenerate `.pdata`/`.xdata` for moved host and module functions, matching generated prologues, function bounds, and supported EH scopes ([#20](https://github.com/mkxto/kamy/issues/20)). No unwind-preserving entry stub.
+- Retire per-function original-VA thunks and `NoThunkSpace`. Use known address translation only where its consumer is rewritten; opaque targets stay resident ([#22](https://github.com/mkxto/kamy/issues/22)).
+- Rebuild Import/Debug/BaseReloc/Exception directories without stale duplicate descriptions; recycle/retype emptied section slots ([#27](https://github.com/mkxto/kamy/issues/27)).
+- Reclaim selective interior holes **in place** (repurpose/decoy-fill), without an `int3` thunk-flood; truncate only a contiguous dead tail. Do not slide pinned survivors. Whole-image compaction requires a complete rebasing of affected survivors and is distinct from selective reclamation.
+- Rewrite LoadConfig to a consistent **non-enforcing default**: preserve valid security-cookie references, use non-enforcing CF check/dispatch targets, and clear stale function-table-present state or retain valid metadata. Enforcing CFG is a later opt-in, not a correctness gate here ([#33](https://github.com/mkxto/kamy/issues/33)).
+- Update section headers, directories, image sizes/checksum, and optionally emit a debug/address map.
 
-### 8.3 CET Compatibility
+### 8.3 Entry Points, DLLs & Optional Modules (D38)
+- EP redirection and relocating the original startup are independent. EXE startup may remain resident or move when references are resolved; a structural redirect does not imply payload injection.
+- A transform-only returnable DLL entry is addressed **directly in `.kamy`**, with no `.text` stub; preserve arguments and return to the loader. Rebase moved exports' EAT RVAs and preserve DLL/header semantics ([#35](https://github.com/mkxto/kamy/issues/35)). Kernel EP remains pinned and untouched.
+- Payload injection is per-build, **off by default and off for kernel entries** ([#32](https://github.com/mkxto/kamy/issues/32)). Authored module functions use the same passes and unwind regeneration as lowered host functions; module RW data does not imply a mandatory runtime.
+- The [published vendor init loader](https://github.com/codedefender-io/plugins) forwards three entry arguments, status-checks callbacks, and shows a past-`end` `musttail`. In the shipped EXE, the original nonreturning startup is the last element **inside** `[begin,end)`; the past-`end` call is dead and MUST NOT be replicated as a continuation. A returning `DllMain` success (`TRUE`) MUST NOT be status-checked against zero. DLL injection instead preserves the entry arguments/return with payload-then-tail-entry sequencing, or a separately handled final callback. Preserve TLS ordering and CET.
+- Optional section-name blanking/rebranding is **off by default**, separate from relocation correctness; `.kamy` is the normal name ([#34](https://github.com/mkxto/kamy/issues/34)). A general public SDK remains deferred.
+
+Vendor module claims (enforcing CFG, longjmp/SAFESEH registration, unwind-safe syscalls) are not measured sample behavior or additional gates for this epic ([vendor blog](https://codedefender.io/blog/2025/03/27)).
+
+### 8.4 CET Compatibility
 - Any pass that fakes CALL/RET must emit RDSSPQ feature check + INCSSPQ reconciliation
 - ENDBR64 insertion at indirect branch targets if CET-IBT is enabled
 - Never emit a RET that doesn't correspond to a real CALL
@@ -338,21 +360,21 @@ Every pass must:
 
 ## 9. Multithreading Strategy
 
-Functions are independent processing units — embarrassingly parallel.
+Functions are parallel lift/transform/codegen units after shared reference analysis. Residency, inbound rewrites, and final layout are coordinated globally.
 
 ```
 Main thread:
-  Parse PE → build Module → discover functions → symbolize
+  Parse PE → build Module → discover functions → build complete reference model → select movable functions
 
 Per-function (rayon work-stealing):
   For each function:
     1. Determine applicable profile
-    2. Run transform passes (Tier 1 or Tier 2)
+    2. Run selected SSA transform passes
     3. Emit transformed code + metadata
     4. Report coverage / errors
 
 Main thread:
-  Collect results → layout sections → link → emit PE
+  Collect results → pin rejects/unresolved targets → layout → rewrite all affected references → rebuild directories → emit PE
 ```
 
 Thread-local caches for expression simplification (VTIL model). No global locks in hot paths.
@@ -417,7 +439,7 @@ These must work before any feature is shipped:
 1. **Relocation correctness** — every reference tracked as a Link, resolved correctly after relayout
 2. **EFLAGS preservation** — PUSHF/POPF around any mutation that taints flags where the original didn't
 3. **Register preservation** — push/pop around every scratch register use
-4. **Jump table handling** — recover, retarget, validate
+4. **Switch handling** — recover with D24 use-def DAG + petgraph VF2 and proven bounds; lower table-free; never rewrite table entries
 5. **SEH/unwind preservation** — parse, rebuild, re-point .pdata/.xdata/C_SCOPE_TABLE
 6. **CET compatibility** — shadow stack reconciliation for any CALL/RET manipulation
 7. **Graceful rejection** — report untransformable functions, never silently break
@@ -429,11 +451,11 @@ These must work before any feature is shipped:
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| Symbolization errors corrupt binary | Fatal | Metadata-first + confidence thresholds + graceful degradation |
+| Symbolization errors corrupt binary | Fatal | Complete per-function model + conservative host safe-reject; exact authored-module metadata |
 | SEH reconstruction bugs | Crash on exception | MSVC SEH test suite, 58+ tests as gate |
 | MBA rules unsound for edge widths | Wrong computation | SMT bit-vector proof per rule at authoring time |
 | CET shadow stack corruption | Crash on modern CPUs | RDSSPQ/INCSSPQ reconciliation, test on CET hardware |
 | Register/flag clobber in mutations | Silent corruption | PUSHF/POPF + push/pop discipline, per-pass verification |
-| Jump table entries missed | Wrong branch target | Bounds-check recovery + explicit entry retargeting |
+| Switch targets missed | Wrong branch target | Proven bounds + function-range checks; table-free lowering, otherwise reject in place |
 | Performance overhead too high | Unusable output | Per-function profiling, tiered protection, user control |
 | IR complexity explosion | Slow transforms | Copy-on-write expressions, e-graph reset, thread-local caches |

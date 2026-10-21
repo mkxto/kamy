@@ -413,6 +413,11 @@ fn protect_inner(
         Result<PrologueShape, Option<RejectionReason>>,
     )>,
 ) -> anyhow::Result<(Vec<u8>, Report)> {
+    let metadata = pe
+        .metadata_references()
+        .context("enumerating image references")?;
+    let reference_model = kamy_analysis::build_reference_model(module, &metadata)
+        .context("building reference model")?;
     let base = module.image_base;
     let code_rva = pe.next_section_rva().get();
     let runtime_fns = pe.runtime_functions();
@@ -438,6 +443,12 @@ fn protect_inner(
         let _s = tracing::debug_span!("function", addr = %func.entry).entered();
         match classify(module, func, &runtime_fns, &import_slots, &eh_runtime) {
             Ok(cand) => {
+                if !reference_model.is_resolved(func.entry) {
+                    let reason = RejectionReason::SymbolizationUncertain;
+                    tracing::debug!(addr = %func.entry, reason = %reason, "function rejected");
+                    report.rejected.push((func.entry, reason));
+                    continue;
+                }
                 pad_to_align(&mut code, FUNCTION_ALIGN);
                 let new_rva = code_rva + code.len() as u32;
 

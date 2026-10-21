@@ -1,57 +1,81 @@
+use anyhow::{Context, ensure};
+
 use crate::PeFile;
 
 pub(crate) struct ExportEntry {
-    pub name: String,
+    pub name: Option<String>,
     pub rva: u32,
 }
 
-/// Resolve named exports from an `IMAGE_EXPORT_DIRECTORY`.
-///
-/// Forwarder entries (whose target RVA lies inside the export directory range)
-/// are skipped since they name another module rather than local code.
-pub(crate) fn parse_exports(pe: &PeFile, dir_rva: u32, dir_size: u32) -> Vec<ExportEntry> {
+pub(crate) fn parse_exports(
+    pe: &PeFile,
+    dir_rva: u32,
+    dir_size: u32,
+) -> anyhow::Result<Vec<ExportEntry>> {
+    let dir = pe
+        .slice_at_rva(dir_rva)
+        .context("export directory is not file-backed")?;
+    ensure!(
+        dir_size >= 40 && dir.len() >= dir_size as usize,
+        "truncated export directory"
+    );
+    let functions = crate::read_u32(dir, 20)?;
+    let names = crate::read_u32(dir, 24)?;
+    let eat = crate::read_u32(dir, 28)?;
+    let name_table = crate::read_u32(dir, 32)?;
+    let ordinals = crate::read_u32(dir, 36)?;
+    let end = dir_rva
+        .checked_add(dir_size)
+        .context("export directory range overflow")?;
     let mut out = Vec::new();
-    let Some(dir) = pe.slice_at_rva(dir_rva) else {
-        return out;
-    };
-    if dir.len() < 40 {
-        return out;
-    }
-    let number_of_names = u32::from_le_bytes(dir[24..28].try_into().unwrap());
-    let addr_of_functions = u32::from_le_bytes(dir[28..32].try_into().unwrap());
-    let addr_of_names = u32::from_le_bytes(dir[32..36].try_into().unwrap());
-    let addr_of_name_ordinals = u32::from_le_bytes(dir[36..40].try_into().unwrap());
-    let dir_end = dir_rva.saturating_add(dir_size);
-
-    for i in 0..number_of_names {
-        let Some(name_rva) = addr_of_names
-            .checked_add(i.wrapping_mul(4))
-            .and_then(|r| pe.u32_at_rva(r))
-        else {
-            break;
-        };
-        let Some(ordinal) = addr_of_name_ordinals
-            .checked_add(i.wrapping_mul(2))
-            .and_then(|r| pe.u16_at_rva(r))
-        else {
-            break;
-        };
-        let Some(func_rva) = addr_of_functions
-            .checked_add(u32::from(ordinal).wrapping_mul(4))
-            .and_then(|r| pe.u32_at_rva(r))
-        else {
-            continue;
-        };
-        if func_rva == 0 || (func_rva >= dir_rva && func_rva < dir_end) {
-            continue;
+    for index in 0..functions {
+        let field = eat
+            .checked_add(index.checked_mul(4).context("export table overflow")?)
+            .context("export table overflow")?;
+        let rva = pe
+            .u32_at_rva(field)
+            .context("truncated export address table")?;
+        if rva != 0 && !(dir_rva..end).contains(&rva) {
+            out.push(ExportEntry { name: None, rva });
         }
-        let Some(name) = pe.read_cstr(name_rva) else {
-            continue;
-        };
-        out.push(ExportEntry {
-            name,
-            rva: func_rva,
-        });
     }
-    out
+    for index in 0..names {
+        let name_field = name_table
+            .checked_add(index.checked_mul(4).context("export names overflow")?)
+            .context("export names overflow")?;
+        let ordinal_field = ordinals
+            .checked_add(index.checked_mul(2).context("export ordinals overflow")?)
+            .context("export ordinals overflow")?;
+        let ordinal = u32::from(
+            pe.u16_at_rva(ordinal_field)
+                .context("truncated export ordinal table")?,
+        );
+        ensure!(ordinal < functions, "export ordinal exceeds address table");
+        let rva = pe
+            .u32_at_rva(
+                eat.checked_add(ordinal.checked_mul(4).context("export ordinal overflow")?)
+                    .context("export ordinal overflow")?,
+            )
+            .context("truncated export address table")?;
+        let name_rva = pe
+            .u32_at_rva(name_field)
+            .context("truncated export name table")?;
+        let bytes = pe
+            .slice_at_rva(name_rva)
+            .context("export name is not file-backed")?;
+        ensure!(bytes.contains(&0), "unterminated export name");
+        let name = pe.read_cstr(name_rva).context("invalid export name")?;
+        if let Some(entry) = out
+            .iter_mut()
+            .find(|entry| entry.rva == rva && entry.name.is_none())
+        {
+            entry.name = Some(name);
+        } else if rva != 0 && !(dir_rva..end).contains(&rva) {
+            out.push(ExportEntry {
+                name: Some(name),
+                rva,
+            });
+        }
+    }
+    Ok(out)
 }

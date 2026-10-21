@@ -225,6 +225,7 @@ dependencies = [
 name = "kamy-analysis"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "iced-x86",
  "kamy-core",
  "kamy-disasm",

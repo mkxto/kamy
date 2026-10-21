@@ -4,6 +4,7 @@ mod exports;
 mod imports;
 mod pdata;
 mod rebuild;
+mod references;
 mod reloc;
 
 pub use pdata::build_unwind_info;
@@ -129,7 +130,7 @@ impl PeFile {
             .directory_slice(DIR_EXCEPTION)
             .map_or_else(Vec::new, pdata::parse_pdata);
         pe.exports = match pe.data_directories.get(DIR_EXPORT).copied() {
-            Some((va, size)) if va != 0 => exports::parse_exports(&pe, va, size),
+            Some((va, size)) if va != 0 => exports::parse_exports(&pe, va, size)?,
             _ => Vec::new(),
         };
         pe.imports = match pe.data_directories.get(DIR_IMPORT).copied() {
@@ -177,11 +178,13 @@ impl PeFile {
             });
         }
         for e in &self.exports {
-            symbols.push(Symbol {
-                name: e.name.clone(),
-                rva: Rva::new(e.rva),
-                kind: SymbolKind::Export,
-            });
+            if let Some(name) = &e.name {
+                symbols.push(Symbol {
+                    name: name.clone(),
+                    rva: Rva::new(e.rva),
+                    kind: SymbolKind::Export,
+                });
+            }
         }
         for i in &self.imports {
             symbols.push(Symbol {
@@ -239,6 +242,23 @@ impl PeFile {
     /// forwarder `jmp qword [rip+iat]` thunks (D24 layer 0 classification).
     pub fn import_slots(&self) -> Vec<Rva> {
         self.imports.iter().map(|i| Rva::new(i.iat_rva)).collect()
+    }
+
+    /// Returns the declared directory, including zero entries; absence means no header slot.
+    pub fn data_directory(&self, index: usize) -> Option<(Rva, u32)> {
+        self.data_directories
+            .get(index)
+            .map(|&(rva, size)| (Rva::new(rva), size))
+    }
+
+    pub fn is_dll(&self) -> bool {
+        let pe = read_u32(&self.bytes, 0x3c).expect("parsed DOS header") as usize;
+        read_u16(&self.bytes, pe + 22).expect("parsed COFF header") & 0x2000 != 0
+    }
+
+    pub fn subsystem(&self) -> u16 {
+        let pe = read_u32(&self.bytes, 0x3c).expect("parsed DOS header") as usize;
+        read_u16(&self.bytes, pe + 24 + 68).expect("parsed optional header")
     }
 
     /// Data-directory index of the exception (`.pdata`) table.
@@ -451,5 +471,33 @@ mod tests {
     fn parse_rejects_truncated_input() {
         assert!(PeFile::parse(b"MZ").is_err());
         assert!(PeFile::parse(&[]).is_err());
+    }
+
+    #[test]
+    fn header_accessors_preserve_declared_values() {
+        let mut bytes = vec![0; 0x200];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        bytes[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+        bytes[0x94..0x96].copy_from_slice(&0xf0u16.to_le_bytes());
+        bytes[0x96..0x98].copy_from_slice(&0x2002u16.to_le_bytes());
+        bytes[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
+        bytes[0xb0..0xb8].copy_from_slice(&0x140000000u64.to_le_bytes());
+        bytes[0xdc..0xde].copy_from_slice(&2u16.to_le_bytes());
+        bytes[0x104..0x108].copy_from_slice(&16u32.to_le_bytes());
+        bytes[0x168..0x16c].copy_from_slice(&0x2000u32.to_le_bytes());
+        bytes[0x16c..0x170].copy_from_slice(&40u32.to_le_bytes());
+        let pe = PeFile::parse(&bytes).unwrap();
+        assert!(pe.is_dll());
+        assert_eq!(pe.subsystem(), 2);
+        assert_eq!(pe.data_directory(12), Some((Rva::new(0x2000), 40)));
+        assert_eq!(pe.data_directory(0), Some((Rva::ZERO, 0)));
+        assert_eq!(pe.data_directory(16), None);
+        bytes[0x96..0x98].copy_from_slice(&2u16.to_le_bytes());
+        bytes[0xdc..0xde].copy_from_slice(&3u16.to_le_bytes());
+        let pe = PeFile::parse(&bytes).unwrap();
+        assert!(!pe.is_dll());
+        assert_eq!(pe.subsystem(), 3);
     }
 }
