@@ -4,6 +4,7 @@
 //! [`commands`]. Each subcommand maps to a `commands::<name>::run` call.
 
 mod commands;
+mod target;
 
 use std::path::PathBuf;
 
@@ -46,6 +47,9 @@ enum Command {
         /// Write the report here instead of stdout.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Preview which functions match these name globs (repeatable).
+        #[arg(long)]
+        select: Vec<String>,
     },
     /// Apply transforms per a protection profile.
     Protect {
@@ -181,9 +185,12 @@ fn main() -> anyhow::Result<()> {
         ansi: None,
     })?;
     match cli.command {
-        Command::Analyze { input, pdb, output } => {
-            commands::analyze::run(&input, pdb.as_deref(), output.as_deref())
-        }
+        Command::Analyze {
+            input,
+            pdb,
+            output,
+            select,
+        } => commands::analyze::run(&input, pdb.as_deref(), output.as_deref(), &select),
         Command::Protect {
             input,
             profile,

@@ -6,12 +6,18 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::Context as _;
+use kamy_config::SymbolSelector;
 use kamy_core::{Rva, SymbolKind};
 use kamy_disasm::discover_functions;
 use kamy_pdb::PdbSymbols;
 use kamy_pe::PeFile;
 
-pub(crate) fn run(input: &Path, pdb: Option<&Path>, output: Option<&Path>) -> anyhow::Result<()> {
+pub(crate) fn run(
+    input: &Path,
+    pdb: Option<&Path>,
+    output: Option<&Path>,
+    select: &[String],
+) -> anyhow::Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
     let pe = PeFile::parse(&bytes).with_context(|| format!("parsing {}", input.display()))?;
 
@@ -72,13 +78,34 @@ pub(crate) fn run(input: &Path, pdb: Option<&Path>, output: Option<&Path>) -> an
         None => writeln!(report, "pdb symbols   <none> ({named} named via exports)")?,
     }
 
+    let selected = if select.is_empty() {
+        None
+    } else {
+        let selectors: Vec<SymbolSelector> = select
+            .iter()
+            .map(|p| SymbolSelector::Pattern(p.clone()))
+            .collect();
+        let set = crate::target::resolve_targets(&selectors, &functions, &label);
+        writeln!(
+            report,
+            "selected      {} (globs: {})",
+            set.len(),
+            select.join(", ")
+        )?;
+        Some(set)
+    };
+
     let mut sorted: Vec<&kamy_core::Function> = functions.iter().collect();
     sorted.sort_by_key(|f| f.entry.get());
     writeln!(report, "\nfunctions:")?;
     for f in sorted {
+        let mark = match &selected {
+            Some(s) if s.contains(&f.entry) => '*',
+            _ => ' ',
+        };
         writeln!(
             report,
-            "  {:#010x}  {:>3} blocks  {}",
+            "{mark} {:#010x}  {:>3} blocks  {}",
             f.entry.get(),
             f.blocks.len(),
             label(f.entry)
