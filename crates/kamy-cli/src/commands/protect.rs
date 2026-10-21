@@ -160,11 +160,19 @@ fn with_profile(
             }
         });
 
+    let mut options = kamy_link::Options::default();
+    let section_name = &cfg.module_settings.custom_section_name;
+    if section_name.enabled {
+        options.code_section.clone_from(&section_name.value);
+        options.metadata_section.clone_from(&section_name.value);
+        options.pdata_section.clone_from(&section_name.value);
+    }
+
     let (image, report) = kamy_link::protect_with_transforms(
         &pe,
         &module,
         &module.functions,
-        &kamy_link::Options::default(),
+        &options,
         &cc,
         &mut *transform_fn,
     )?;

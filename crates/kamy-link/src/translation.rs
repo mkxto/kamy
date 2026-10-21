@@ -151,6 +151,41 @@ mod tests {
     }
 
     #[test]
+    fn helper_encodes_its_actual_home_and_shared_metadata_home() {
+        for (helper_rva, table_rva) in [(0x2000, 0x9000), (0x9000, 0x2000)] {
+            let bytes = helper(Register::RAX, helper_rva, table_rva).unwrap();
+            let mut decoder = Decoder::with_ip(
+                64,
+                &bytes,
+                0x140000000 + u64::from(helper_rva),
+                DecoderOptions::NONE,
+            );
+            let mut self_address = None;
+            let mut table_address = None;
+            let mut self_rva = None;
+            while decoder.can_decode() {
+                let instruction = decoder.decode();
+                if instruction.mnemonic() == Mnemonic::Lea && instruction.is_ip_rel_memory_operand()
+                {
+                    match instruction.op0_register() {
+                        Register::R10 => self_address = Some(instruction.ip_rel_memory_address()),
+                        Register::RAX => table_address = Some(instruction.ip_rel_memory_address()),
+                        _ => {}
+                    }
+                }
+                if instruction.mnemonic() == Mnemonic::Mov
+                    && instruction.op0_register() == Register::EAX
+                {
+                    self_rva = Some(instruction.immediate32());
+                }
+            }
+            assert_eq!(self_address, Some(0x140000000 + u64::from(helper_rva)));
+            assert_eq!(table_address, Some(0x140000000 + u64::from(table_rva)));
+            assert_eq!(self_rva, Some(helper_rva));
+        }
+    }
+
+    #[test]
     fn table_is_sorted_and_has_unchanged_miss_sentinel() {
         let addresses = BTreeMap::from([
             (Rva::new(0x2000), Rva::new(0x6000)),

@@ -240,6 +240,30 @@ exclude:
   reason: "test functions"
 ```
 
+`module_settings.custom_section_name` is optional and disabled by default. It applies
+only to the Windows x86-64 PE32+ pipeline; it does not enable payload injection.
+With `enabled: false`, the value is ignored: emitted code and read-only metadata
+use `.kamy`, and the fresh exception table uses `.pdata`.
+
+With `enabled: true`, `value` is an exact section-name override shared by emitted
+code, read-only metadata, and the exception table. A nonempty decoy MUST contain
+only ASCII bytes, MUST NOT contain NUL, and MUST be at most eight bytes. Invalid
+enabled values fail profile loading with `module_settings.custom_section_name`
+context; names are never silently truncated. Short names are NUL-padded in the
+eight-byte PE header field.
+
+An enabled empty value (`value: ''`) blanks those output names, the section
+containing the final entry point, and any retired exception-table slot reused
+for live helpers. A nonempty decoy rebrands only the obfuscator-owned output
+family; unrelated resident code sections keep their names, and a recycled helper
+slot is named `.text`. This policy changes names, not entry-point code bytes or
+residency. Library callers select blank policy by making `Options.code_section`,
+`Options.metadata_section`, and `Options.pdata_section` all empty.
+
+Section names are cosmetic. Windows loads code and finds directories through
+RVAs, section characteristics, and directory records, not these names. Rebuilding
+and relocation correctness MUST NOT depend on the configured spelling.
+
 **Selection methods:**
 - By symbol name (`!Name`)
 - By pattern (`!Pattern` with glob matching)
@@ -335,10 +359,10 @@ Every pass must:
 ### 8.2 Linking & PE Emission (D37)
 - Place selected/lowered bodies in `.kamy`, using PIC rel32/RIP-relative code where possible; resolve links at final addresses.
 - Rewrite both directions, including calls/data references from resident code. Rebase absolute `.reloc` pointers and retain required loader fixups ([#19](https://github.com/mkxto/kamy/issues/19), [#30](https://github.com/mkxto/kamy/issues/30)).
-- Regenerate `.pdata`/`.xdata` for moved host and module functions, matching generated prologues, function bounds, and supported EH scopes ([#20](https://github.com/mkxto/kamy/issues/20)). No unwind-preserving entry stub.
+- Regenerate unwind metadata for moved host and module functions, matching generated prologues, function bounds, and supported EH scopes ([#20](https://github.com/mkxto/kamy/issues/20)). Store xdata alongside the translation table and rebuilt Import/Debug/BaseReloc directories in a shared read-only `.kamy` section; emit the fresh Exception table separately in `.pdata`. No unwind-preserving entry stub.
 - Retire per-function original-VA thunks and `NoThunkSpace`. Use known address translation only where its consumer is rewritten; opaque targets stay resident ([#22](https://github.com/mkxto/kamy/issues/22)).
-- Rebuild Import/Debug/BaseReloc/Exception directories without stale duplicate descriptions; recycle/retype emptied section slots ([#27](https://github.com/mkxto/kamy/issues/27)).
-- Reclaim selective interior holes **in place** (repurpose/decoy-fill), without an `int3` thunk-flood; truncate only a contiguous dead tail. Do not slide pinned survivors. Whole-image compaction requires a complete rebasing of affected survivors and is distinct from selective reclamation.
+- Rebuild Import/Debug/BaseReloc/Exception directories without stale duplicate descriptions ([#27](https://github.com/mkxto/kamy/issues/27)). A retired Exception slot may become live RX `.text` helpers only when the retired directory wholly accounts for its contents and no active external references or other data/directories pin it. Section names alone never prove reuse is safe.
+- Reclaim selective interior holes **in place** (repurpose/decoy-fill), without an `int3` thunk-flood; truncate only a provably dead contiguous code tail. Survivors retain their original RVAs and section-header ordinals. Retain the original SectionAlignment-rounded virtual coverage independently of raw tail removal: PE mapped sections MUST stay adjacent, including a fully retired code section. Raw-file repacking is not whole-image virtual compaction; pinned survivors do not slide.
 - Rewrite LoadConfig to a consistent **non-enforcing default**: preserve valid security-cookie references, use non-enforcing CF check/dispatch targets, and clear stale function-table-present state or retain valid metadata. Enforcing CFG is a later opt-in, not a correctness gate here ([#33](https://github.com/mkxto/kamy/issues/33)).
 - Update section headers, directories, image sizes/checksum, and optionally emit a debug/address map.
 
@@ -349,7 +373,7 @@ For supported plain lowered code, `kamy-seh` derives stack/nonvolatile state fro
 - A transform-only returnable DLL entry is addressed **directly in `.kamy`**, with no `.text` stub; preserve arguments and return to the loader. Rebase moved exports' EAT RVAs and preserve DLL/header semantics ([#35](https://github.com/mkxto/kamy/issues/35)). Kernel EP remains pinned and untouched.
 - Payload injection is per-build, **off by default and off for kernel entries** ([#32](https://github.com/mkxto/kamy/issues/32)). Authored module functions use the same passes and unwind regeneration as lowered host functions; module RW data does not imply a mandatory runtime.
 - The [published vendor init loader](https://github.com/codedefender-io/plugins) forwards three entry arguments, status-checks callbacks, and shows a past-`end` `musttail`. In the shipped EXE, the original nonreturning startup is the last element **inside** `[begin,end)`; the past-`end` call is dead and MUST NOT be replicated as a continuation. A returning `DllMain` success (`TRUE`) MUST NOT be status-checked against zero. DLL injection instead preserves the entry arguments/return with payload-then-tail-entry sequencing, or a separately handled final callback. Preserve TLS ordering and CET.
-- Optional section-name blanking/rebranding is **off by default**, separate from relocation correctness; `.kamy` is the normal name ([#34](https://github.com/mkxto/kamy/issues/34)). A general public SDK remains deferred.
+- Optional section-name blanking/rebranding is **off by default**, separate from relocation correctness; `.kamy` is the normal code/metadata name and `.pdata` holds the fresh exception table ([#34](https://github.com/mkxto/kamy/issues/34)). The existing `module_settings.custom_section_name` toggle controls the policy described in §5. A general public SDK remains deferred.
 
 Vendor module claims (enforcing CFG, longjmp/SAFESEH registration, unwind-safe syscalls) are not measured sample behavior or additional gates for this epic ([vendor blog](https://codedefender.io/blog/2025/03/27)).
 

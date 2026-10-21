@@ -1,5 +1,6 @@
 //! PE parser and emitter: headers, sections, .reloc, .pdata/.xdata, imports/exports.
 
+mod directories;
 mod exports;
 mod imports;
 mod pdata;
@@ -8,7 +9,8 @@ mod references;
 mod reloc;
 mod rewrite;
 
-pub use rebuild::{BytePatch, DirectoryUpdate, NewSection, PeEdits};
+pub use directories::RebuiltImports;
+pub use rebuild::{BytePatch, DirectoryUpdate, NewSection, PeEdits, SectionUpdate};
 pub use reloc::encode_base_relocations;
 pub use rewrite::ReferenceEdits;
 
@@ -25,13 +27,13 @@ const DIR_IMPORT: usize = 1;
 const DIR_EXCEPTION: usize = 3;
 const DIR_BASERELOC: usize = 5;
 
-struct SectionRecord {
-    name: String,
-    rva: u32,
-    virtual_size: u32,
-    raw_size: u32,
-    raw_pointer: u32,
-    characteristics: u32,
+pub struct SectionRecord {
+    pub name: String,
+    pub rva: u32,
+    pub virtual_size: u32,
+    pub raw_size: u32,
+    pub raw_pointer: u32,
+    pub characteristics: u32,
 }
 
 pub struct PeFile {
@@ -147,6 +149,20 @@ impl PeFile {
             "parsed PE"
         );
         Ok(pe)
+    }
+
+    pub fn section_headers(&self) -> &[SectionRecord] {
+        &self.sections
+    }
+
+    pub fn section_data(&self, index: usize) -> Option<&[u8]> {
+        let section = self.sections.get(index)?;
+        if section.raw_size == 0 {
+            return Some(&[]);
+        }
+        let start = section.raw_pointer as usize;
+        let end = start.checked_add(section.raw_size as usize)?;
+        self.bytes.get(start..end)
     }
 
     pub fn to_module(&self) -> Module {

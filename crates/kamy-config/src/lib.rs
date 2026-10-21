@@ -24,7 +24,14 @@ pub struct Config {
 impl Config {
     /// Parse a profile from a YAML string.
     pub fn from_yaml_str(yaml: &str) -> anyhow::Result<Self> {
-        serde_norway::from_str(yaml).context("parsing YAML protection profile")
+        let config: Self =
+            serde_norway::from_str(yaml).context("parsing YAML protection profile")?;
+        let name = &config.module_settings.custom_section_name;
+        if name.enabled {
+            validate_section_name(&name.value)
+                .context("validating module_settings.custom_section_name")?;
+        }
+        Ok(config)
     }
 
     /// Load and parse a profile from a file path.
@@ -230,6 +237,19 @@ pub struct Exclude {
     pub reason: String,
 }
 
+fn validate_section_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.contains('\0'),
+        "section name MUST NOT contain NUL bytes"
+    );
+    anyhow::ensure!(
+        name.is_ascii(),
+        "section name MUST contain only ASCII bytes"
+    );
+    anyhow::ensure!(name.len() <= 8, "section name MUST contain at most 8 bytes");
+    Ok(())
+}
+
 fn one() -> u32 {
     1
 }
@@ -348,5 +368,43 @@ exclude:
             cfg.profiles[0].symbols[0],
             SymbolSelector::Address(0x1_4000_1000)
         );
+    }
+
+    #[test]
+    fn enabled_section_names_preserve_exact_bytes() {
+        for name in ["", "a", ".decoy", "12345678"] {
+            let yaml = format!(
+                "version: '1'\nmodule_settings:\n  custom_section_name:\n    enabled: true\n    value: \"{name}\"\n"
+            );
+            let cfg = Config::from_yaml_str(&yaml).expect("valid section name should parse");
+            assert!(cfg.module_settings.custom_section_name.enabled);
+            assert_eq!(cfg.module_settings.custom_section_name.value, name);
+        }
+    }
+
+    #[test]
+    fn enabled_section_names_reject_invalid_bytes() {
+        for (name, reason) in [("123456789", "at most 8"), ("é", "ASCII"), (r"a\0b", "NUL")] {
+            let yaml = format!(
+                "version: '1'\nmodule_settings:\n  custom_section_name:\n    enabled: true\n    value: \"{name}\"\n"
+            );
+            let error = Config::from_yaml_str(&yaml).expect_err("invalid section name should fail");
+            let message = format!("{error:#}");
+            assert!(message.contains("module_settings.custom_section_name"));
+            assert!(message.contains(reason));
+        }
+    }
+
+    #[test]
+    fn disabled_section_names_ignore_invalid_values() {
+        for (name, expected) in [("123456789", "123456789"), ("é", "é"), (r"a\0b", "a\0b")] {
+            let yaml = format!(
+                "version: '1'\nmodule_settings:\n  custom_section_name:\n    enabled: false\n    value: \"{name}\"\n"
+            );
+            let cfg =
+                Config::from_yaml_str(&yaml).expect("disabled section name should be ignored");
+            assert!(!cfg.module_settings.custom_section_name.enabled);
+            assert_eq!(cfg.module_settings.custom_section_name.value, expected);
+        }
     }
 }

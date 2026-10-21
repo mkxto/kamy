@@ -23,6 +23,33 @@ operands may still be patched to moved functions; this is mandatory for thunk-fr
 reference rewriting, so residency does not promise byte-identical bodies.
 
 `--profile <yaml>` retains profile-driven transforms and symbol selection.
+
+Protection targets Windows x86-64 PE32+ only. Profile-driven section naming is
+optional and off by default; `--no-transform` / `--ssa-identity` retain their
+existing identity route rather than applying profile settings.
+
+To rename the obfuscator-owned code, metadata, and exception-table sections to
+the same exact decoy name, add this to the profile:
+
+```yaml
+module_settings:
+  custom_section_name:
+    enabled: true
+    value: '.cache'
+```
+
+Use `value: ''` with `enabled: true` to blank those names, the section containing
+the final entry point, and any recycled live-helper section. With a nonempty
+decoy, unrelated resident code sections keep their names, and a recycled helper
+section remains `.text`. Disabled settings ignore `value` and use the default
+`.kamy` code/metadata and `.pdata` exception-table names.
+
+An enabled name MUST be ASCII, MUST NOT contain NUL, and MUST fit in eight bytes;
+invalid values fail profile loading with setting context. Bytes are preserved
+exactly, with PE-header NUL padding only, never truncation. Names do not drive
+loader or linker correctness: section characteristics and directory RVAs do.
+This setting does not enable payload injection.
+
 For identity and profile runs, `--debug-map <csv>` writes the linker's actual
 original/final RVA map, sorted by original RVA. The CSV header is
 `old_rva,new_rva`; values are `0x`-prefixed hexadecimal RVAs, not image VAs.

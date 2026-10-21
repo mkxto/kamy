@@ -392,7 +392,7 @@ non-enforcing (`GuardFlags=0x100` when instrumented), with cleared guard tables,
 valid cookie targets and relocated check/dispatch slots.
 
 Verified: formatting, clippy with denied warnings, workspace/all-target build,
-and **175 tests** pass. Differential corpus: **23/23 PASS**, **1314/11202
+and **197 tests** pass. Differential corpus: **23/23 PASS**, **1314/11202
 SSA-lowered (11.7%)**, zero verbatim relocations and zero `NoThunkSpace` rejects.
 The pre-change executable baseline was 21/23 PASS and 2100 SSA-lowered; coverage
 remains conservative, and the previously failing throw helpers stay resident.
@@ -407,6 +407,28 @@ and CSV maps are byte-identical; map-write failures surface with path context.
 The probe omits unanchored linker volatile metadata; such unknown references
 remain safe-rejected rather than bypassed.
 
-Remaining: #27 import rebuilding, section recycling and tail reclamation;
-optional naming (#34) and authored-module injection (#32). Exact module
-metadata remains part of #18/#32, not host inference.
+Image rebuilding (#27) repacks raw storage without sliding resident RVAs or
+changing their section ordinals. Imports retain stable IAT slots while fresh
+descriptors, lookup tables and names share read-only metadata with xdata,
+Debug and BaseReloc; the fresh Exception table stays separate. Dead code tails
+shrink only with a proven live-data/reference boundary. Retired Exception slots
+are eligible for executable helpers only when their entire ownership and lack
+of external consumers are proven. Interior retired bodies use complete NOPs,
+not entry thunks or an INT3 flood.
+
+The forced-ASLR DLL probe retains its resident caller and shrinks `.text` from
+122 to 49 virtual bytes; moved entry/EAT, absolute pointers, indirect translation
+and SEH still execute correctly. Blank and `.cache` section-name profile builds
+each pass eight differential runs of `console_cfg`. The full corpus has no
+coverage delta against the thunk-free cutover baseline. Optional naming (#34)
+does not affect correctness or enable injection.
+
+A second forced-ASLR probe recycles its old 168-byte Exception slot as live RX
+`.text` translation helpers with 51 valid fresh runtime ranges. Its retired
+original `.text` has no raw bytes but retains one virtual byte to preserve
+mapped-section adjacency. Eight differential runs pass, including SEH through
+the moved frame. A portable multi-page regression preserves rounded virtual
+coverage while removing dead raw bytes.
+
+Remaining: configurable SDK/plugin authored-module injection (#32). Exact
+module metadata remains part of #18/#32, not host inference.

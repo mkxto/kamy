@@ -270,12 +270,13 @@ impl PeFile {
         ))
     }
 
-    /// Preserves materialized POGO contributions and adds moved function ranges.
+    /// Clips POGO contributions to output sections and adds moved function ranges.
     /// Payload file pointers are resolved by `rebuild` after section placement.
     pub fn rebuild_debug_directory(
         &self,
         moves: &[(Rva, Rva, u32)],
         section_rva: Rva,
+        output_sections: Option<&[(Rva, u32, &str)]>,
     ) -> anyhow::Result<Option<(Vec<u8>, DirectoryUpdate)>> {
         self.metadata_references()?;
         let Some(&(base, size)) = self.data_directories.get(6).filter(|&&(base, _)| base != 0)
@@ -291,6 +292,18 @@ impl PeFile {
                 "invalid moved debug range for {old}"
             );
         }
+        if let Some(sections) = output_sections {
+            for &(base, length, name) in sections {
+                ensure!(
+                    base.get().checked_add(length).is_some(),
+                    "output debug section range overflow"
+                );
+                ensure!(
+                    !name.as_bytes().contains(&0),
+                    "output debug section name contains NUL"
+                );
+            }
+        }
         for offset in (0..size as usize).step_by(28) {
             let length = read_u32(&blob, offset + 16)? as usize;
             let file = read_u32(&blob, offset + 24)? as usize;
@@ -303,6 +316,7 @@ impl PeFile {
                 .context("debug payload is not file-backed")?;
             let mut payload = data.to_vec();
             if read_u32(&blob, offset + 12)? == 13 {
+                payload = data.get(..4).context("truncated POGO signature")?.to_vec();
                 let mut cursor = 4usize;
                 while cursor < data.len() {
                     let begin = read_u32(data, cursor)?;
@@ -318,13 +332,61 @@ impl PeFile {
                         .context("unterminated POGO contribution name")?
                         + 1;
                     let name = &tail[..length];
+                    if let Some(sections) = output_sections {
+                        for &(base, length, output_name) in sections {
+                            let clipped_begin = begin.max(base.get());
+                            let clipped_end = end.min(base.get() + length);
+                            if clipped_begin < clipped_end {
+                                let original = self.sections.iter().find(|section| {
+                                    begin >= section.rva
+                                        && u64::from(begin)
+                                            < u64::from(section.rva)
+                                                + u64::from(
+                                                    section.virtual_size.max(section.raw_size),
+                                                )
+                                });
+                                let contribution_name = if original
+                                    .is_some_and(|section| section.name != output_name)
+                                {
+                                    output_name.as_bytes()
+                                } else {
+                                    &name[..name.len() - 1]
+                                };
+                                append_pogo(
+                                    &mut payload,
+                                    clipped_begin,
+                                    clipped_end - clipped_begin,
+                                    contribution_name,
+                                );
+                            }
+                        }
+                    } else {
+                        append_pogo(&mut payload, begin, end - begin, &name[..name.len() - 1]);
+                    }
                     for &(old, new, new_length) in &sorted_moves {
                         if (begin..end).contains(&old.get()) && old != new {
-                            payload.extend_from_slice(&new.get().to_le_bytes());
-                            payload.extend_from_slice(&new_length.to_le_bytes());
-                            payload.extend_from_slice(name);
-                            while payload.len() % 4 != 0 {
-                                payload.push(0);
+                            if let Some(sections) = output_sections {
+                                let &(_, _, destination_name) = sections
+                                    .iter()
+                                    .find(|&&(base, length, _)| {
+                                        new.get() >= base.get()
+                                            && u64::from(new.get()) + u64::from(new_length)
+                                                <= u64::from(base.get()) + u64::from(length)
+                                    })
+                                    .context("moved POGO range is outside output sections")?;
+                                append_pogo(
+                                    &mut payload,
+                                    new.get(),
+                                    new_length,
+                                    destination_name.as_bytes(),
+                                );
+                            } else {
+                                append_pogo(
+                                    &mut payload,
+                                    new.get(),
+                                    new_length,
+                                    &name[..name.len() - 1],
+                                );
                             }
                         }
                     }
@@ -572,6 +634,16 @@ impl PeFile {
             }
         }
         Ok(fields)
+    }
+}
+
+fn append_pogo(payload: &mut Vec<u8>, begin: u32, length: u32, name: &[u8]) {
+    payload.extend_from_slice(&begin.to_le_bytes());
+    payload.extend_from_slice(&length.to_le_bytes());
+    payload.extend_from_slice(name);
+    payload.push(0);
+    while payload.len() % 4 != 0 {
+        payload.push(0);
     }
 }
 
@@ -960,6 +1032,7 @@ mod tests {
                     (Rva::new(0x1100), Rva::new(0x4000), 0x30),
                 ],
                 Rva::new(0x3000),
+                None,
             )
             .unwrap()
             .unwrap();
@@ -972,18 +1045,48 @@ mod tests {
             assert_eq!(read_u32(&blob, pogo + offset + 4).unwrap(), length);
             assert_eq!(&blob[pogo + offset + 8..pogo + offset + 14], b".text\0");
         }
+        let (clipped, _) = pe
+            .rebuild_debug_directory(
+                &[(Rva::new(0x1100), Rva::new(0x4000), 0x30)],
+                Rva::new(0x3000),
+                Some(&[
+                    (Rva::new(0x1000), 0x140, ".new"),
+                    (Rva::new(0x4000), 0x100, ".code"),
+                ]),
+            )
+            .unwrap()
+            .unwrap();
+        let clipped_pogo = (read_u32(&clipped, 20).unwrap() - 0x3000) as usize;
+        assert_eq!(read_u32(&clipped, clipped_pogo + 4).unwrap(), 0x1100);
+        assert_eq!(read_u32(&clipped, clipped_pogo + 8).unwrap(), 0x40);
+        assert_eq!(&clipped[clipped_pogo + 12..clipped_pogo + 17], b".new\0");
+        assert_eq!(read_u32(&clipped, clipped_pogo + 20).unwrap(), 0x4000);
+        assert_eq!(read_u32(&clipped, clipped_pogo + 24).unwrap(), 0x30);
+        assert_eq!(&clipped[clipped_pogo + 28..clipped_pogo + 34], b".code\0");
         let output = pe
             .rebuild(&PeEdits {
-                new_sections: vec![NewSection {
-                    name: ".kdebug".into(),
-                    rva: Rva::new(0x3000),
-                    flags: SectionFlags {
-                        read: true,
-                        write: false,
-                        execute: false,
+                new_sections: vec![
+                    NewSection {
+                        name: ".kdebug".into(),
+                        rva: Rva::new(0x3000),
+                        flags: SectionFlags {
+                            read: true,
+                            write: false,
+                            execute: false,
+                        },
+                        data: blob,
                     },
-                    data: blob,
-                }],
+                    NewSection {
+                        name: ".code".into(),
+                        rva: Rva::new(0x4000),
+                        flags: SectionFlags {
+                            read: true,
+                            write: false,
+                            execute: true,
+                        },
+                        data: vec![0xc3; 0x128],
+                    },
+                ],
                 directories: vec![update],
                 entry_point: Some(Rva::new(0x4000)),
                 clear_guard_cf: true,

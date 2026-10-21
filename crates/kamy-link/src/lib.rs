@@ -1,5 +1,6 @@
 //! Reference-rewriting linker with conservative residency and native PE output.
 
+mod layout;
 mod rewrite;
 mod translation;
 
@@ -9,7 +10,7 @@ use kamy_codegen::relocate;
 use kamy_core::ir::{CallingConvLookup, IrFunction, MapCallConv, win64_import_signature};
 use kamy_core::{Function, Module, RejectionReason, Rva, SectionFlags, SymbolKind, Terminator};
 use kamy_disasm::function_instructions;
-use kamy_pe::{BytePatch, DirectoryUpdate, NewSection, PeEdits, PeFile};
+use kamy_pe::{BytePatch, DirectoryUpdate, NewSection, PeEdits, PeFile, SectionUpdate};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 const FUNCTION_ALIGN: u32 = 16;
@@ -17,7 +18,7 @@ const FUNCTION_ALIGN: u32 = 16;
 pub struct Options {
     pub code_section: String,
     pub pdata_section: String,
-    pub xdata_section: String,
+    pub metadata_section: String,
     pub selector: Option<kamy_core::FunctionSelector>,
 }
 
@@ -25,8 +26,8 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             code_section: ".kamy".into(),
-            pdata_section: ".kamypd".into(),
-            xdata_section: ".kamyxd".into(),
+            pdata_section: ".pdata".into(),
+            metadata_section: ".kamy".into(),
             selector: None,
         }
     }
@@ -441,6 +442,10 @@ fn protect_inner(
     let eh_runtime = eh_runtime_functions(module, &runtime_fns, &funcs_by_entry);
     let has_cfg = pe.has_cfg();
     let cfg_usable = !has_cfg || pe.cfg_edits(Rva::new(code_rva), Rva::new(code_rva)).is_ok();
+    let regenerated_fields = layout::regenerated_fields(pe, module)?;
+    let blank_names = opts.code_section.is_empty()
+        && opts.metadata_section.is_empty()
+        && opts.pdata_section.is_empty();
     let has_cfg_check = has_cfg && pe.has_cfg_check();
     let mut report = Report {
         moved: Vec::new(),
@@ -564,6 +569,15 @@ fn protect_inner(
             }
         }
     });
+    let helper_slot = if has_cfg
+        || prepared
+            .iter()
+            .any(|function| !function.indirect.is_empty())
+    {
+        layout::retired_exception_slot(pe, module, &reference_model, &regenerated_fields)?
+    } else {
+        None
+    };
 
     let (
         addresses,
@@ -572,16 +586,18 @@ fn protect_inner(
         check_rva,
         check_unwind,
         code_end,
+        recycled_end,
         xdata_rva,
         mut patches,
         mut reference_edits,
     ) = loop {
         if prepared.is_empty() {
             report.rejected.sort_by_key(|&(entry, _)| entry);
-            return Ok((
-                pe.rebuild(&PeEdits::default()).context("rebuilding PE")?,
-                report,
-            ));
+            let mut edits = PeEdits::default();
+            if blank_names {
+                blank_entry_section(module, &mut edits.section_updates);
+            }
+            return Ok((pe.rebuild(&edits).context("rebuilding PE")?, report));
         }
         let mut cursor = code_rva;
         let mut addresses = BTreeMap::new();
@@ -615,20 +631,39 @@ fn protect_inner(
         if has_cfg {
             helpers.insert(Register::RAX as u32, (Register::RAX, 0));
         }
+        let mut recycled_end = helper_slot.map(|slot| slot.span.start);
         for (_, rva) in helpers.values_mut() {
-            cursor = align_up(cursor, FUNCTION_ALIGN)?;
-            *rva = cursor;
-            cursor = cursor
-                .checked_add(translation::HELPER_LEN)
-                .context("helper RVA overflow")?;
+            let recycled = match (helper_slot, recycled_end.as_mut()) {
+                (Some(slot), Some(end)) => slot.reserve(end, translation::HELPER_LEN)?,
+                _ => None,
+            };
+            if let Some(recycled) = recycled {
+                *rva = recycled;
+            } else {
+                cursor = align_up(cursor, FUNCTION_ALIGN)?;
+                *rva = cursor;
+                cursor = cursor
+                    .checked_add(translation::HELPER_LEN)
+                    .context("helper RVA overflow")?;
+            }
         }
         let check_rva = if has_cfg_check {
-            cursor = align_up(cursor, FUNCTION_ALIGN)?;
-            let rva = cursor;
-            cursor = cursor
-                .checked_add(translation::CHECK_BYTES.len() as u32)
-                .context("CFG helper RVA overflow")?;
-            Some(rva)
+            let recycled = match (helper_slot, recycled_end.as_mut()) {
+                (Some(slot), Some(end)) => {
+                    slot.reserve(end, translation::CHECK_BYTES.len() as u32)?
+                }
+                _ => None,
+            };
+            if let Some(recycled) = recycled {
+                Some(recycled)
+            } else {
+                cursor = align_up(cursor, FUNCTION_ALIGN)?;
+                let rva = cursor;
+                cursor = cursor
+                    .checked_add(translation::CHECK_BYTES.len() as u32)
+                    .context("CFG helper RVA overflow")?;
+                Some(rva)
+            }
         } else {
             None
         };
@@ -796,6 +831,7 @@ fn protect_inner(
             check_rva,
             check_unwind,
             cursor,
+            recycled_end,
             xdata_rva,
             patches,
             reference_edits,
@@ -816,6 +852,8 @@ fn protect_inner(
         .checked_sub(code_rva)
         .context("invalid code layout")? as usize;
     let mut code = Vec::with_capacity(code_len);
+    let mut recycled_code = Vec::new();
+    let mut scrubs = Vec::new();
     let mut xdata = if helpers.is_empty() {
         Vec::new()
     } else {
@@ -851,14 +889,23 @@ fn protect_inner(
                 .context("invalid owned block")?;
             let mut bytes = Vec::with_capacity(len as usize);
             append_nops(&mut bytes, len as usize);
-            patches.push(BytePatch {
+            scrubs.push(BytePatch {
                 rva: block.start,
                 bytes,
             });
         }
     }
     for helper in encoded_helpers {
-        append_code(&mut code, code_rva, helper.rva, &helper.body)?;
+        if let Some(slot) = helper_slot.filter(|slot| slot.span.contains(helper.rva)) {
+            append_code(
+                &mut recycled_code,
+                slot.span.start,
+                helper.rva,
+                &helper.body,
+            )?;
+        } else {
+            append_code(&mut code, code_rva, helper.rva, &helper.body)?;
+        }
         append_unwind(
             &mut xdata,
             &mut entries,
@@ -872,7 +919,16 @@ fn protect_inner(
         let ranges = check_unwind
             .as_deref()
             .context("missing CFG check unwind state")?;
-        append_code(&mut code, code_rva, rva, &translation::CHECK_BYTES)?;
+        if let Some(slot) = helper_slot.filter(|slot| slot.span.contains(rva)) {
+            append_code(
+                &mut recycled_code,
+                slot.span.start,
+                rva,
+                &translation::CHECK_BYTES,
+            )?;
+        } else {
+            append_code(&mut code, code_rva, rva, &translation::CHECK_BYTES)?;
+        }
         append_unwind(
             &mut xdata,
             &mut entries,
@@ -888,24 +944,25 @@ fn protect_inner(
     ensure!(code.len() <= reserved, "code exceeded reserved layout");
     let padding = reserved - code.len();
     append_nops(&mut code, padding);
-    let pdata = encode_pdata(&mut entries)?;
-    let pdata_rva = align_up(
-        xdata_rva
-            .checked_add(u32::try_from(xdata.len()).context("xdata size overflow")?)
-            .context("xdata RVA overflow")?,
-        pe.section_alignment(),
-    )?;
-    let pdata_len = u32::try_from(pdata.len()).context("pdata size overflow")?;
-    let mut new_sections = vec![
-        section(opts.code_section.clone(), code_rva, true, code),
-        section(opts.xdata_section.clone(), xdata_rva, false, xdata),
-        section(opts.pdata_section.clone(), pdata_rva, false, pdata),
-    ];
-    let mut directories = vec![DirectoryUpdate {
-        index: PeFile::EXCEPTION_DIRECTORY,
-        rva: Rva::new(pdata_rva),
-        size: pdata_len,
-    }];
+    let mut metadata_layout = layout::ReadOnlyLayout {
+        rva: xdata_rva,
+        data: xdata,
+    };
+    let mut directories = Vec::new();
+    let import_rva = metadata_layout.next_rva(8)?;
+    if let Some(mut imports) = pe
+        .rebuild_import_directory(Rva::new(import_rva))
+        .context("rebuilding import directory")?
+    {
+        metadata_layout.append(8, &imports.bytes)?;
+        directories.push(imports.directory);
+        directories.push(DirectoryUpdate {
+            index: 11,
+            rva: Rva::ZERO,
+            size: 0,
+        });
+        patches.append(&mut imports.iat_patches);
+    }
     let relocations = kamy_pe::encode_base_relocations(&reference_edits.relocations)
         .context("serializing base relocations")?;
     if relocations.is_empty() {
@@ -915,29 +972,35 @@ fn protect_inner(
             size: 0,
         });
     } else {
-        let reloc_rva = align_up(
-            pdata_rva
-                .checked_add(pdata_len)
-                .context("pdata RVA overflow")?,
-            pe.section_alignment(),
-        )?;
-        let size = u32::try_from(relocations.len()).context("relocation size overflow")?;
-        new_sections.push(section(".kamyr".into(), reloc_rva, false, relocations));
+        let rva = metadata_layout.append(4, &relocations)?;
         directories.push(DirectoryUpdate {
             index: 5,
-            rva: Rva::new(reloc_rva),
-            size,
+            rva,
+            size: u32::try_from(relocations.len()).context("relocation size overflow")?,
         });
     }
-    let last_section = new_sections.last().context("missing output section")?;
-    let debug_rva = align_up(
-        last_section
-            .rva
-            .get()
-            .checked_add(u32::try_from(last_section.data.len()).context("section size overflow")?)
-            .context("section RVA overflow")?,
-        pe.section_alignment(),
+    let mut section_updates = layout::trim_executable_tails(
+        pe,
+        module,
+        &reference_model,
+        &addresses,
+        &mut patches,
+        &mut scrubs,
+        &regenerated_fields,
     )?;
+    patches.append(&mut scrubs);
+    if let Some(slot) =
+        helper_slot.filter(|slot| recycled_end.is_some_and(|end| end > slot.span.start))
+    {
+        let padding = ((slot.span.end - slot.span.start) as usize)
+            .checked_sub(recycled_code.len())
+            .context("helpers exceed retired exception slot")?;
+        append_nops(&mut recycled_code, padding);
+        section_updates.push(layout::helper_update(slot, blank_names, recycled_code));
+    }
+    if blank_names {
+        blank_entry_section(module, &mut section_updates);
+    }
     let debug_moves = prepared
         .iter()
         .map(|function| {
@@ -948,13 +1011,49 @@ fn protect_inner(
             ))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut output_sections = Vec::with_capacity(module.sections.len() + 2);
+    for (index, section) in module.sections.iter().enumerate() {
+        let update = section_updates.iter().find(|update| update.index == index);
+        output_sections.push((
+            section.rva,
+            update
+                .and_then(|update| update.virtual_size)
+                .unwrap_or(section.virtual_size),
+            update
+                .and_then(|update| update.name.as_deref())
+                .unwrap_or(&section.name),
+        ));
+    }
+    output_sections.push((
+        Rva::new(code_rva),
+        u32::try_from(code.len()).context("code size overflow")?,
+        opts.code_section.as_str(),
+    ));
+    let debug_rva = metadata_layout.next_rva(4)?;
     if let Some((debug, directory)) = pe
-        .rebuild_debug_directory(&debug_moves, Rva::new(debug_rva))
+        .rebuild_debug_directory(&debug_moves, Rva::new(debug_rva), Some(&output_sections))
         .context("rebuilding debug directory")?
     {
-        new_sections.push(section(".kamyd".into(), debug_rva, false, debug));
+        metadata_layout.append(4, &debug)?;
         directories.push(directory);
     }
+    let pdata = encode_pdata(&mut entries)?;
+    let pdata_rva = metadata_layout.next_rva(pe.section_alignment())?;
+    directories.push(DirectoryUpdate {
+        index: PeFile::EXCEPTION_DIRECTORY,
+        rva: Rva::new(pdata_rva),
+        size: u32::try_from(pdata.len()).context("pdata size overflow")?,
+    });
+    let new_sections = vec![
+        section(opts.code_section.clone(), code_rva, true, code),
+        section(
+            opts.metadata_section.clone(),
+            xdata_rva,
+            false,
+            metadata_layout.data,
+        ),
+        section(opts.pdata_section.clone(), pdata_rva, false, pdata),
+    ];
     report.moved = addresses.keys().copied().collect();
     report.ssa_lowered = report.moved.len();
     report.ssa_lowered_rvas = report.moved.clone();
@@ -962,12 +1061,35 @@ fn protect_inner(
     report.address_map = addresses;
     let edits = PeEdits {
         new_sections,
+        section_updates,
         patches,
         directories,
         entry_point: reference_edits.entry_point,
         clear_guard_cf: has_cfg,
     };
     Ok((pe.rebuild(&edits).context("rebuilding PE")?, report))
+}
+
+fn blank_entry_section(module: &Module, updates: &mut Vec<SectionUpdate>) {
+    let Some(entry) = module.entry_point else {
+        return;
+    };
+    let Some(index) = module
+        .sections
+        .iter()
+        .position(|section| section.contains(entry))
+    else {
+        return;
+    };
+    if let Some(update) = updates.iter_mut().find(|update| update.index == index) {
+        update.name = Some(String::new());
+    } else {
+        updates.push(SectionUpdate {
+            index,
+            name: Some(String::new()),
+            ..Default::default()
+        });
+    }
 }
 
 fn section(name: String, rva: u32, execute: bool, data: Vec<u8>) -> NewSection {
