@@ -1,6 +1,6 @@
 # CodeDefender — how it operates
 
-Commercial Windows PE obfuscator (Aftermath Labs, codedefender.io), x86-64 + ARM64. A **lifter-based rewriter** with a three-stage pipeline:
+Commercial Windows PE obfuscator (Aftermath Labs / back.engineering, codedefender.io), x86-64 + ARM64, built on the vendor's **BLARE** binary-rewriting framework. A **lifter-based rewriter** with a three-stage pipeline:
 
 ```
 Analyze (refs/CFG/unwind, safe-reject)  →  Transform (composable passes)  →  Rebuild (native PE)
@@ -10,7 +10,7 @@ Marker: appended obfuscator sections (default name **`.belabs`**; rebranded buil
 
 | sample | type | profile | transform enabled |
 |---|---|---|---|
-| `HelloWorld-Injected.exe` | EXE | light | import protection only (inject model) |
+| `HelloWorld-Injected.exe` | EXE | none | **no transform** — external module only (inject model). Vendor README: "No obfuscation is applied". |
 | `code_defender_crackme.bin` | EXE | heavy | mutation + MBA + control-flow indirection (+ CFG). No VM, no import protection. |
 | `cheat.bin` (StealthVGC) | **DLL** | heavy | mutation + MBA + control-flow indirection (+ CFG). No VM, no import protection. Rebranded (`vgc.ac`), **selective per-function**. |
 
@@ -18,20 +18,22 @@ Transforms are **composable and per-build** — no sample enabled every pass, an
 
 ## Two operation models — Transform vs Inject
 
-CodeDefender operates in two distinct modes, and the PE layout tells them apart:
+CodeDefender operates in two distinct modes, and the PE layout tells them apart. The inject model is BLARE's **Module Extension System**: a C/C++/Rust module built with the vendor's llvm-msvc fork is statically linked into the already-compiled PE. Module source and both HelloWorld binaries: [codedefender-io/plugins](https://github.com/codedefender-io/plugins); mechanism: [vendor blog](https://codedefender.io/blog/2025/03/27).
 
-| | **Transform / Protect** | **Inject (SDK model)** |
+| | **Transform / Protect** | **Inject (Module Extension)** |
 |---|---|---|
 | intent | harden *existing* code | add *new* functionality to a compiled PE |
 | sample | `code_defender_crackme.bin` | `HelloWorld-Injected.exe` |
-| what it does | rewrite original functions (mutation/MBA/VM), semantics preserved | bolt on new behavior (here: a hash-resolved `MessageBox`) run before the original entry |
-| EP hijack | inline `call payload; jmp orig_start` | **init-callback array** `[payload, original_start]` walked by a loader |
-| runtime-state `.belabs` (RW) | **none** — no new behavior to register | **yes** — holds the init-callback registry/bounds |
-| new dependencies | none | resolved at runtime (PEB-walk + MurmurHash2), **no new IAT entry** |
+| what it does | rewrite original functions (mutation/MBA/VM), semantics preserved | link module functions (here: `HelloWorld`, which loads `user32.dll` and calls `MessageBoxA`) that run before the original entry |
+| EP hijack | inline `call payload; jmp orig_start` | **`init_entry_point`** loader walking the init table `[payload, original_start]` |
+| RW obfuscator section | **none** — no new behavior to register | **yes** — module data: the `SYMBOL_init_table_start`/`_end` slots |
+| new dependencies | none | resolved at runtime by the module's own `LI_FN` calls (`lazy_importer`: PEB walk + MurmurHash2), **no new IAT entry** |
 
-The RW runtime-state `.belabs` is therefore a **signature of the inject model**, not of transformation. In the Injected sample the payload (`sub_140007000`) builds `"user32.dll"`/`"Hello World!"` on the stack, walks `Ldr->InLoadOrderModuleList`, hashes module + export names with MurmurHash2 (`0x5BD1E995`), resolves `MessageBoxA`, and calls it — `user32.dll` never appears in the import table. That injected code is wired in through the init array, which is exactly what the RW section exists to hold.
+The RW `.belabs` is therefore a **signature of the inject model**, not of transformation. In the Injected sample the payload (`sub_140007000`) is the README's `HelloWorld`. It builds `"user32.dll"`/`"Hello World!"` as stack `etl::string<16>`s, and both API calls go through `LI_FN`: walk `Ldr->InLoadOrderModuleList`, hash module + export names with MurmurHash2 (`0x5BD1E995`), call `LoadLibraryA("user32.dll")`, then `MessageBoxA`. The function has exactly two indirect calls, matching the two `LI_FN` sites. `user32.dll` never appears in the import table. The hashing is **module source code, not a CodeDefender pass**; the constant shows the SDK ships a MurmurHash2 build of `lazy_importer` [INFERENCE: upstream `lazy_importer` hashes with FNV-1a].
 
 **Correction (third sample, `cheat.bin`):** an RW obfuscator section is **not** exclusive to the inject model. The transform-only `cheat.bin` also ships an RW `vgc.ac`, but it holds a **single pre-initialized code pointer** (read once at init, `mov rax, cs:off_…; mov [r8+0F8h], rax`) — not an init-callback `[begin,end)` registry. So RW *presence* alone does not imply inject; the discriminator is the **init-callback array + loader loop** (begin/end bounds over `[payload, original_start]`), which only the inject build has.
+
+**How a module is linked (vendor blog).** The module is compiled to a DLL whose data directories each sit in their own section (an llvm-msvc option stops `.idata`/`.rdata` merging). BLARE lifts its functions into `CodeSymbol`s and its `.rdata`/`.data`/`.bss` into `DataSymbol`s; module relocations are lifted into BLARE's linker. To the transform passes, module functions are indistinguishable from original ones, so any obfuscation pass can run on them. A module in a heavy-profile build can be MBA-mutated like host code; the Injected sample leaves it clean.
 
 ---
 
@@ -42,8 +44,8 @@ Recovers function boundaries, control flow, references, and unwind metadata (opt
 Composable per-function passes:
 - **Mutation + MBA + loop-encoding** — rewrite instructions into Mixed-Boolean-Arithmetic identities, magic-constant arithmetic, flag/bit junk.
 - **Control-flow** — opaque predicates, indirect branches, block duplication, reference hiding.
-- **Constant hardening + import protection** — hash-resolved API calls (PEB walk + MurmurHash2), hidden constants.
-- **Code virtualization** — key-driven handlers, isolated VM state (not seen in either sample).
+- **Constant hardening + import protection** — hidden constants; vendor-advertised import protection. *Not observed as a pass:* the only hash-resolved imports in these samples (`HelloWorld-Injected`) come from the injected module's own `lazy_importer` calls.
+- **Code virtualization** — key-driven handlers, isolated VM state (not seen in any sample).
 - **SigBreaker** — binary diversification (instruction reorder, block shuffle).
 
 ## 3. Rebuild
@@ -71,7 +73,7 @@ Reference classes rewritten during Rebuild:
 Because Rebuild regenerates the whole image, CodeDefender **recycles existing section slots and rebuilds PE directories into fresh sections** instead of only appending:
 
 - The original `.pdata` slot is **repurposed** — renamed `.text`, made executable, filled with injected helper code (fastfail/EH reporter, `memset`).
-- **Import / Debug / Base-reloc directories are rebuilt** into appended `.belabs` sections; a fresh `.pdata` is emitted for the relocated code.
+- **Import / Debug / Base-reloc directories are rebuilt** into appended `.belabs` sections; a fresh `.pdata` is emitted for the relocated code. The vendor's module diagram labels `.pdata`/`.idata`/`.edata`/`.xdata`/`.reloc` "lifted and not symbolized": parsed, then regenerated rather than carried over.
 - EP is **hijacked** to a payload-then-original sequence (see §4).
 
 This is the opposite of an append-only protector (e.g. Kamy), which leaves every original structure in place and duplicates tables — producing extra sections and stale directories.
@@ -92,14 +94,14 @@ CodeDefender hides the original entrypoint by **redirecting** it, not by TLS or 
 | mechanic | sample | effect |
 |---|---|---|
 | EP → `.belabs` payload stub | crackme, `bootmgfw.efi` | EP stub `…; call <.belabs payload>; jmp rbx` — original OEP displaced, reached indirectly |
-| init-callback array | HelloWorld-Injected | EP → loader loop over `[payload, original_start]`; the real entry is an anonymous array element reached by computed iteration (strongest form) |
+| init-callback array | HelloWorld-Injected | EP → `init_entry_point` loop over `[payload, original_start]`; the real entry is an anonymous array element reached by computed iteration (strongest form) |
 | control-flow indirection at EP | crackme, `bootmgfw.efi` | stub uses the `jmp` / `call;jmp reg` continuation idiom — tracing from the EP is obfuscated |
 | section-name blanking around EP | `ntoskrnl2.exe` | the section holding the EP has its **name zeroed** — breaks section-name EP heuristics |
 | EP → appended-section entry (DLL) | `cheat.bin` | `AddressOfEntryPoint` points *into* the obfuscator code section at the moved+mutated `_DllMainCRTStartup`; no `.text` trampoline fronts it. The `call <body>; jmp rbx` stub still exists in `.text` but is demoted to a residual/internal path |
 
 Evidence: `bootmgfw.efi` EP = `push rbx; sub rsp,0x20; jmp 0xa2ce3; call .belabs:0x10ba366` (payload), then `jmp rbx`.
 
-Evidence (`cheat.bin`, DLL): EP RVA `0x10b003e` is inside the appended `vgc.ac` code section and `jmp`s straight into the 381 KB MBA `_DllMainCRTStartup` body (`rcx`/`rdx`/`r8` = hinst/reason/reserved spilled, `reason==1` test, single `ret`). **Why no `.text` stub:** an EXE entry (`mainCRTStartup`) is fire-and-forget (`ExitProcess`), so CD fronts it with a `call payload; jmp orig` trampoline; a DLL entry is a *returnable* `DllMain`, so CD just repoints `AddressOfEntryPoint` at the relocated entry and lets it `ret` to the loader — nothing to sequence. The enabling condition is a **transform-only** build: no injected pre-entry payload to run first (the RW section holds a lone pointer, not an init array).
+Evidence (`cheat.bin`, DLL): EP RVA `0x10b003e` is inside the appended `vgc.ac` code section and `jmp`s straight into the 381 KB MBA `_DllMainCRTStartup` body (`rcx`/`rdx`/`r8` = hinst/reason/reserved spilled, `reason==1` test, single `ret`). **Why no `.text` stub:** an EXE entry (`mainCRTStartup`) is fire-and-forget (`ExitProcess`), so CD fronts it with a `call payload; jmp orig` trampoline; a DLL entry is a *returnable* `DllMain`, so CD just repoints `AddressOfEntryPoint` at the relocated entry and lets it `ret` to the loader — nothing to sequence. The enabling condition is a **transform-only** build: no injected pre-entry payload to run first (the RW section holds a lone pointer, not an init array). The init-table loader could not front a DLL entry as-is anyway: it `__fastfail`s on any nonzero return, and `DllMain` returns `TRUE` (1) [INFERENCE].
 
 **Not used (these samples):** no **TLS callbacks** (TLS directory absent in all research binaries, `cheat.bin` included); no `AddressOfEntryPoint=0` / forwarder trick.
 
@@ -263,6 +265,9 @@ The full CRT startup/teardown machinery is present and consistent: `_initterm`/`
 ### Takeaway
 A complete, rebaseable reference model plus byte-faithful relocation keeps these structures valid: code moves without changing instruction semantics (segments and cookie framing survive), the cookie global is pinned while its rip-relative references are rebased, and the CFG/LoadConfig directory is rewritten to a consistent non-enforcing state instead of left stale.
 
+### Injected modules — vendor claims (not observed)
+Per the [vendor blog](https://codedefender.io/blog/2025/03/27): module functions are added to the CFG function table when the host has CFG; `longjmp` targets go into the CFG longjmp target table; with SAFESEH, EH continuation blocks are registered in the SafeSEH table; the SDK offers unwind-safe direct syscalls. None of this is exercised by the samples.
+
 ## Observed section maps
 
 ### crackme — `code_defender_crackme.bin`
@@ -274,17 +279,17 @@ A complete, rebaseable reference model plus byte-faithful relocation keeps these
 | `0x677000` | `.pdata` | R | regenerated unwind table |
 | `0x678000` | **`.belabs`** | R | **`.xdata`** unwind for relocated code (123 `.pdata` xrefs, no code refs) |
 
-### HelloWorld-Injected — three `.belabs` (light / import-protection profile)
+### HelloWorld-Injected — three `.belabs` (no transform; external module only)
 | VA | section | flags | serves |
 |---|---|---|---|
-| `0x1000` | `.text` | R-X | EP-hijack loader (`start`) + stubs |
+| `0x1000` | `.text` | R-X | EP loader `init_entry_point` (`start`, `0x14000152d`) + stubs |
 | `0x4000` | **`.text`** | R-X | old `.pdata` slot **repurposed** to code (fastfail/EH reporter, `memset`) |
-| `0x7000` | **`.belabs`** | R-X | payload (PEB-walk + MurmurHash2 → `MessageBoxA`) + relocated CRT startup |
-| `0x8000` | **`.belabs`** | **RW** | **runtime state** — init-array bounds + ~4 KB zero scratch |
+| `0x7000` | **`.belabs`** | R-X | module `HelloWorld` payload (`LI_FN`: PEB-walk + MurmurHash2 → `LoadLibraryA`, `MessageBoxA`) + relocated CRT startup |
+| `0x8000` | **`.belabs`** | **RW** | module data — `SYMBOL_init_table_start`/`_end` slots + ~4 KB zero (likely module `.bss`) |
 | `0x9000` | **`.belabs`** | R | rebuilt Import / Debug / Base-reloc directories |
 | `0xa000` | `.pdata` | R | regenerated unwind table |
 
-Payload resolves `user32!MessageBoxA` via PEB `InLoadOrderModuleList` + MurmurHash2 (`0x5BD1E995`) — no IAT landmark.
+Payload resolves `LoadLibraryA` and `user32!MessageBoxA` through the module's `lazy_importer` (PEB `InLoadOrderModuleList` + MurmurHash2 `0x5BD1E995`) — no IAT landmark.
 
 ### cheat.bin (StealthVGC) — DLL, transform-only, rebranded `vgc.ac`
 | VA | section | flags | serves |
@@ -299,26 +304,28 @@ Payload resolves `user32!MessageBoxA` via PEB `InLoadOrderModuleList` + MurmurHa
 
 Four `vgc.ac` sections (R-- dirs, RW state, R-X code, R `.xdata`); the EP lands in the R-X one. IAT fully intact (KERNEL32 89 / USER32 9 / WININET 6, no hash resolver); relocations 931 total, only **1** into the code section (PIC); CFG non-enforcing (`GuardFlags=0x100`, dispatch→nop thunk) — same consistent-but-neutered state as the crackme. Only **1** residual jump-table switch survives; no VM dispatcher (895 `jmp reg` + 2086 `call reg` are the computed-continuation idiom, spread across registers, with a lone `__guard_dispatch_icall_fptr`). Confirmed CodeDefender via forged CodeView (`RSDS`, Age 3, name `"Protected by StealthVGC"`, not a `.pdb`).
 
-> **Obfuscator-section layout is per-build, not fixed — 2 to 4 sections observed, and the name may be rebranded (`.belabs` default, `vgc.ac` in `cheat.bin`).** Roles seen: **R-X** relocated code (always); **RW** runtime state (inject *or* transform); **R** rebuilt directories *and/or* `.xdata`. Crackme = 2 (R-X code + R `.xdata`); Injected = 3 (adds RW state + R directories); `cheat.bin` = 4 (R dirs + RW state + R-X code + R `.xdata`). Do not assume a fixed count, a fixed name, or that an RW section implies the inject model.
+> **Obfuscator-section layout is per-build, not fixed — 2 to 4 sections observed, and the name may be rebranded (`.belabs` default, `vgc.ac` in `cheat.bin`).** Roles seen: **R-X** relocated code (always); **RW** data (inject init-table slots *or* a lone pointer in a transform-only build); **R** rebuilt directories *and/or* `.xdata`. Crackme = 2 (R-X code + R `.xdata`); Injected = 3 (adds RW data + R directories); `cheat.bin` = 4 (R dirs + RW data + R-X code + R `.xdata`). Do not assume a fixed count, a fixed name, or that an RW section implies the inject model.
 
-#### How the RW runtime-state `.belabs` works
-It is a **CRT-style initializer table** (`_initterm_e` shape), not a scratch heap. The RW `.belabs` stores the bounds of a startup callback array:
+#### How the RW `.belabs` works (init table)
+The RW `.belabs` holds the bounds of the module's startup callback array: the SDK's `DECLARE_SYMBOL(init_table_start)` / `DECLARE_SYMBOL(init_table_end)` slots, filled in by BLARE's linker. The section as a whole is most likely the module's `.data`/`.bss` emitted as `DataSymbol`s [INFERENCE: the blog states module `.data`/`.bss` become separate symbols; the zero tail is unwritten in the static image].
 
 ```
-.belabs:8000  begin = 0x1400027f0
-.belabs:8008  end   = 0x140002800
-array (.rdata): [0x27f0] = payload  sub_140007000
+.belabs:8000  SYMBOL_init_table_start = 0x1400027f0
+.belabs:8008  SYMBOL_init_table_end   = 0x140002800
+array (.rdata): [0x27f0] = payload  sub_140007000 (HelloWorld)
                 [0x27f8] = original CRT start  sub_140001497
-.belabs:8010  … ~4 KB zero scratch (reserved; unwritten in the static image)
+                [0x2800] = 0xCCCCCCCC (int3 padding)
+.belabs:8010  … ~4 KB zero (likely module .bss)
 ```
 
-The hijacked EP (`start` = `sub_14000152d`) walks `[begin,end)` calling each `callback(argc,argv,envp)`; a nonzero return triggers `__fastfail` (`int 29h`). The **payload runs first** (shows the MessageBox); the **final callback is the original CRT start**, which runs the program and exits — so control never returns to the loader. The bounds sit in a *writable* section because CodeDefender models them like the MSVC CRT initializer iterators (`__xi_a`/`__xi_z`). The crackme has no equivalent: it hijacks the EP inline (`sub rsp; call payload; jmp orig_start`) with no array, loader, or writable state.
+The hijacked EP (`start` = `sub_14000152d`) is the README's `init_entry_point`; it decompiles one-to-one. It walks `[begin,end)` calling each `callback(a1, a2, a3)` with the entry's three register arguments forwarded unchanged (not `argc`/`argv`/`envp`; for an EXE `rcx` is the PEB [INFERENCE]). A nonzero return triggers `__fastfail(status)` (`int 29h`). The **payload runs first** (shows the MessageBox); the **last callback is the original CRT start**, which runs the program and exits, so control never returns to the loader. The source ends with `[[clang::musttail]] return (*fns_begin)(a1, a2, a3)`, a tail call through `*end`; in this build that slot is `int3` padding, so the path is dead and safe only because the original start never returns. The crackme has no equivalent: it hijacks the EP inline (`sub rsp; call payload; jmp orig_start`) with no array, loader, or writable state.
 
-`cheat.bin` sits between the two: transform-only (no init array, like the crackme) yet still shipping an RW `vgc.ac` — but holding just **one** pre-initialized code pointer, read once and stored into a runtime struct field (`mov [r8+0F8h], rax`), not a `[begin,end)` iterator. So the RW section's *presence* does not distinguish the models; its *shape* (lone pointer vs begin/end bounds + loader loop) does.
+`cheat.bin` sits between the two: transform-only (no init array, like the crackme) yet still shipping an RW `vgc.ac` — but holding just **one** pre-initialized code pointer, read once and stored into a runtime struct field (`mov [r8+0F8h], rax`), not a `[begin,end)` iterator. So the RW section's *presence* does not distinguish the models; its *shape* (lone pointer vs begin/end bounds + loader loop) does. [INFERENCE: that pointer may likewise be module or SDK data rather than CodeDefender runtime state.]
 
 ---
 
 ## Reversing notes
 - **Markers:** appended obfuscator section(s) — name `.belabs` or rebranded (`vgc.ac`); forged CodeView debug entry (`RSDS`, Age 3, non-`.pdb` name, e.g. `"Protected by StealthVGC"`); EP = `.text` `sub rsp; call <code sec>; jmp <orig start>` (EXE/EFI) **or** `AddressOfEntryPoint` pointing straight into the code section at a mutated `DllMain` (DLL); `.pdata`-only residual `.text` stubs.
-- **Weaknesses (as configured in these samples):** everything is **native** — no VM bytecode to lift. Mutation is MBA, mechanically simplifiable to identities; the heavy profile is tedious (state smeared across a large stack frame, indirect continuations) but not opaque. Light profiles leave the IAT fully visible.
-- **Strengths:** complete rebuild (clean/compact `.text`, rebuilt directories, valid SEH/CFG), composable transforms, and — where enabled — hash-resolved imports that erase IAT landmarks.
+- **Inject fingerprint:** EP = `init_entry_point` — five pushes, `sub rsp,20h`, rip-relative loads of two adjacent qwords in the RW section, `call qword ptr [r15]` loop, `test eax,eax` → `int 29h`, tail `jmp rax` through `[end]`. Holds regardless of module language (C/C++/Rust).
+- **Weaknesses (as configured in these samples):** everything is **native** — no VM bytecode to lift. Mutation is MBA, mechanically simplifiable to identities; the heavy profile is tedious (state smeared across a large stack frame, indirect continuations) but not opaque. No sample enables an import-protection pass, so the host IAT stays fully visible; only injected module code hides its own imports.
+- **Strengths:** complete rebuild (clean/compact `.text`, rebuilt directories, valid SEH/CFG), composable transforms, and statically linked modules that are lifted like host code — obfuscatable by the same passes and free to hide their own imports (`lazy_importer`).
