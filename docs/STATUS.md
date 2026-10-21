@@ -39,7 +39,7 @@ Living document. Updated as work lands.
 | MBA pass (add/sub/xor rules, D13 config shape) | Done | `1cfc37b` |
 | MBA probability fix | Done | `fa6b941` |
 | MBA visible output | ✅ Done | Exposed two real lowering bugs (now fixed): constant shifts routed the count through `CL`, clobbering a live RCX the allocator does not model — now emit the immediate-form shift (`shl r,imm`); and `emit_void` hardcoded I64 store width, truncating sub-qword stores — now threads the real operand width. `sw`/`sw2`/`sw3`/`target` with MBA (`probability:100`): exit matches original, `kamy verify` PASS (200 runs), output deterministic, bytes differ from `probability:0`. **94/203 via SSA** on `sw` (was a deterministic crash before the fix). |
-| Win32metadata calling-convention DB | Deferred | Trait wired + Win64Default + WinmdLookup todo!() |
+| Win32metadata calling-convention DB (D14) | ✅ Done | Embedded 18.2k-fn table generated offline from `Windows.Win32.winmd` (`tools/win32cc-gen`, workspace-excluded) + curated CRT supplement; `MapCallConv` resolves import slots (`call [rip+slot]`) and single-block import thunks to precise per-arg GPR/XMM classes + return class; variadic/aggregate-return omitted (sound). Cross-checked vs IDA 9.4 til (1168 common names, 0 float/vararg errors, 19 diffs all on legacy fns where metadata is authoritative). Corpus 21/23, RegisterPressure 3576→3531, SSA-lowered 2113→2158. |
 | Pressure-aware transform budgeting (D28) | Partial | Intensity knob on the MBA pass landed (`run_with_intensity`); the retry-at-lower-intensity ladder is not wired. |
 | .pdata/UNWIND_INFO emission for generated prologues (D31) | ✅ Done | `.kamyxd` section + UNWIND_INFO describing the push/align prologue; body frame-alloc codes are Phase 3. |
 | Differential self-test harness (kamy-verify) | ✅ Done | `kamy verify --original X --protected Y`: exit + stdout diff over N seeded runs. The Phase 2 shipping gate. |
@@ -71,8 +71,11 @@ Living document. Updated as work lands.
    `verify` PASS.
 4. **Return-address push is materialized.** `Store(rsp, const_return_addr)` before
    Call could be folded into the Call node. Optimization, not correctness.
-5. **Over-approximated call args.** Win64Default passes 4 args for every call.
-   Resolved by Win32metadata DB (D14) or PDB symbol lookup.
+5. ✅ **FIXED — Over-approximated call args (D14).** `Win64Default` passed four
+   args for every call. `MapCallConv` now resolves named imports (Win32metadata
+   DB + curated CRT) to precise register-arg counts and per-arg GPR/XMM class;
+   unresolved targets keep the sound four-arg default. Own-function signatures
+   await PDB ingest (#28).
 6. ✅ **MOSTLY FIXED — Runaway function recovery.** Recovery followed far branch
    targets across `.pdata` boundaries, producing functions with multi-hundred-KiB
    spans (kernel32 max 478 KiB) that swallowed neighbors, falsely tripped
