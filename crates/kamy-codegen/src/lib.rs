@@ -1,4 +1,4 @@
-//! Instruction selector, linear-scan register allocator, and assembler.
+//! Memory-backed lowering, bounded instruction selection, and assembly.
 
 pub mod encode;
 pub mod isel;
@@ -8,10 +8,24 @@ pub mod regalloc;
 pub use encode::assemble;
 pub use isel::select_instructions;
 pub use references::{InstructionReference, SelectedInstructions, bind_references};
-pub use regalloc::{
-    CALLEE_SAVED_GPRS, RegAllocation, RegCopy, allocate_registers, callee_saved_used,
-    callee_saved_xmms_used,
-};
+pub use regalloc::{RegAllocation, allocate_registers};
+
+pub const MEMORY_SCRATCH_GPRS: [kamy_core::ir::PhysReg; 7] = [
+    kamy_core::ir::PhysReg::Gpr(kamy_core::ir::Gpr::Rax),
+    kamy_core::ir::PhysReg::Gpr(kamy_core::ir::Gpr::Rcx),
+    kamy_core::ir::PhysReg::Gpr(kamy_core::ir::Gpr::Rdx),
+    kamy_core::ir::PhysReg::Gpr(kamy_core::ir::Gpr::R8),
+    kamy_core::ir::PhysReg::Gpr(kamy_core::ir::Gpr::R9),
+    kamy_core::ir::PhysReg::Gpr(kamy_core::ir::Gpr::R10),
+    kamy_core::ir::PhysReg::Gpr(kamy_core::ir::Gpr::R11),
+];
+
+pub const MEMORY_SCRATCH_XMMS: [kamy_core::ir::PhysReg; 4] = [
+    kamy_core::ir::PhysReg::Xmm(kamy_core::ir::XmmReg::Xmm0),
+    kamy_core::ir::PhysReg::Xmm(kamy_core::ir::XmmReg::Xmm1),
+    kamy_core::ir::PhysReg::Xmm(kamy_core::ir::XmmReg::Xmm2),
+    kamy_core::ir::PhysReg::Xmm(kamy_core::ir::XmmReg::Xmm3),
+];
 
 use iced_x86::{BlockEncoder, BlockEncoderOptions, Instruction, InstructionBlock};
 

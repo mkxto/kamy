@@ -26,6 +26,14 @@ pub struct HostReference {
     pub kind: ReferenceKind,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetadataReferences {
+    pub references: Vec<HostReference>,
+    /// Validated metadata storage with no unenumerated address fields.
+    /// Unknown payloads MUST remain outside these half-open ranges.
+    pub classified_ranges: Vec<std::ops::Range<Rva>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SymbolicExpression {
     Symbol {

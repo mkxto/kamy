@@ -13,6 +13,21 @@ pub enum IrOp {
     // --- constants ---
     Const(u64),
     Address(crate::Reference),
+    /// Original stack-object coordinate relative to the function's entry RSP.
+    FrameAddress(i64),
+    /// A statically known displacement of a runtime original-stack pointer.
+    FrameOffset(i64),
+    /// Unary extraction of a proved frame pointer's original entry-RSP-based
+    /// numeric address. The result is scalar data, not a relocated object pointer.
+    FrameLogical,
+    /// Runtime object address from a frame base, byte index, and displacement.
+    /// Bounds are proved by the SSA producer before rewriting. Operand changes
+    /// MUST preserve values; the bounds are a semantic contract, not a hint.
+    FrameIndex {
+        displacement: i64,
+        subtract: bool,
+        bounds: crate::frame::FramePointerBounds,
+    },
     Undef,
 
     // --- data flow ---
@@ -99,17 +114,22 @@ pub enum IrOp {
     Mov128,
 
     // --- native passthrough ---
+    /// Arguments bind reads; subsequent pinned `Undef` values capture writes.
     NativeInline(NativeInst),
+
+    /// Probe `[logical_rsp - requested_size, logical_rsp)` before allocation.
+    StackProbe,
 
     // --- live-out marker (DCE root, no codegen output) ---
     Use,
     // --- call ---
+    /// Pinned register values, unpinned last-byte addresses of known stack
+    /// argument slots, then the logical RSP. Frameless IR may omit that tail.
     Call {
         target: crate::Reference,
         clobbers: Vec<PhysReg>,
     },
-    /// Indirect call; `args[0]` is the target address, `args[1..]` the ABI
-    /// argument values. Lowered to `call reg`.
+    /// `args[0]` is the target; remaining operands follow [`IrOp::Call`].
     CallIndirect {
         clobbers: Vec<PhysReg>,
     },

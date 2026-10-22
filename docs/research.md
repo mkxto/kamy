@@ -43,9 +43,18 @@ Custom disassembler → SSA IR → optimization pipeline → compiler backend (i
 - Concrete-RSP lifting: RSP starts concrete (everything else symbolic) so stack-pointer arithmetic constant-folds and the generic load/store machinery handles stack accesses with no special casing. Limitation they accept: functions with dynamic stack allocations (alloca/VLA) are unsupported.
 - Stack-frame high-water-mark reconstruction: the concretized RSP at sink points (calls, boxed instructions) reveals the original frame size, and the prolog/epilog is rebuilt from it. If spilling ever happens, the original frame is placed after the recompiler's own spill frame.
 
-These zero-spill observations concern devirtualization. They do not override
-the measured protector memory-backed model in `code_defender.md` or D40's
-confirmed lowering policy. Concrete frame reconstruction remains applicable.
+These published zero-spill observations are measured devirtualization prior
+art, not a universal protector rule. They do not override the measured
+protector memory-backed model in `code_defender.md` or settled D40 policy.
+Kamy's H2 producer/consumer contracts use one concrete frame and memory-backed
+intermediates, with bounded scratch sets, actual outgoing storage and generated
+unwind; pressure-driven intensity reduction and caller/self-recursion rejects
+are retired. The active API and coordinate mapping are documented once in
+[architecture.md §8.1](architecture.md#81-code-generation). Current exercised
+acceptance and residual semantic limits belong in [STATUS.md](STATUS.md), not
+inferences of vendor parity. H3 compiled Rust startup/std/lifecycle and H4
+whole-image compaction remain pending. The published stack-layout observation
+above remains prior art, not Kamy's frame-zone convention.
 
 Sources: [Themida devirt](https://aftermathlabs.net/blog/09/05/2026/), [Tencent VM devirt](https://aftermathlabs.net/blog/31/07/2026/)
 

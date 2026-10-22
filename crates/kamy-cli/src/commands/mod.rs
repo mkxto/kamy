@@ -174,6 +174,7 @@ mod tests {
                     lowered: true,
                     transformed: true,
                     intensity: 0.5,
+                    allocation: None,
                 },
                 kamy_link::FunctionReport {
                     symbol: symbols[1].clone(),
@@ -182,6 +183,7 @@ mod tests {
                     lowered: true,
                     transformed: false,
                     intensity: 0.0,
+                    allocation: None,
                 },
                 kamy_link::FunctionReport {
                     symbol: symbols[2].clone(),
@@ -190,6 +192,7 @@ mod tests {
                     lowered: false,
                     transformed: false,
                     intensity: 0.0,
+                    allocation: None,
                 },
             ],
             ..Default::default()

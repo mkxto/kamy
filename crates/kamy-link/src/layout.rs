@@ -834,7 +834,7 @@ mod tests {
         let pe = PeFile::parse(bytes).unwrap();
         let module = pe.to_module();
         let model = ReferenceModel {
-            references: pe.metadata_references().unwrap(),
+            references: pe.metadata_references().unwrap().references,
             ..Default::default()
         };
         let regenerated = regenerated_fields(&pe, &module).unwrap();
@@ -976,7 +976,7 @@ mod tests {
             })
             .collect();
         let model = ReferenceModel {
-            references: pe.metadata_references().unwrap(),
+            references: pe.metadata_references().unwrap().references,
             ..Default::default()
         };
         let regenerated = regenerated_fields(&pe, &module).unwrap();

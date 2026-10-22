@@ -1,45 +1,68 @@
 use std::collections::BTreeMap;
 
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
 use kamy_core::{RelocKind, Relocation, Rva};
 
-/// Parse a `.reloc` directory (`IMAGE_BASE_RELOCATION` block sequence).
-///
-/// Each block is `{ PageRVA: u32, BlockSize: u32 }` followed by
-/// `(BlockSize - 8) / 2` little-endian `u16` entries. An entry packs
-/// `(type << 12) | offset`; only types `0` (Absolute padder), `3` (HighLow)
-/// and `10` (Dir64) are retained, other types are skipped.
-pub(crate) fn parse_relocations(data: &[u8]) -> Vec<Relocation> {
+/// Parse complete `IMAGE_BASE_RELOCATION` blocks with DWORD-aligned headers.
+/// A terminal block may end on a WORD boundary; only subsequent headers need DWORD alignment.
+/// See <https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-reloc-section-image-only>.
+/// Unsupported types fail because their entry widths and fixups are not modeled.
+pub(crate) fn parse_relocations(data: &[u8]) -> anyhow::Result<Vec<Relocation>> {
     let mut out = Vec::new();
     let mut off = 0usize;
-    while off + 8 <= data.len() {
-        let page = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-        let block_size = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap()) as usize;
-        if block_size < 8 {
-            break;
-        }
-        let Some(end) = off.checked_add(block_size).filter(|&e| e <= data.len()) else {
-            break;
-        };
-        let mut e = off + 8;
-        while e + 2 <= end {
-            let entry = u16::from_le_bytes(data[e..e + 2].try_into().unwrap());
-            e += 2;
-            let offset = u32::from(entry & 0x0fff);
-            let kind = match entry >> 12 {
-                0 => RelocKind::Absolute,
-                3 => RelocKind::HighLow,
-                10 => RelocKind::Dir64,
-                _ => continue,
+    while off < data.len() {
+        ensure!(
+            off % 4 == 0,
+            "unaligned base relocation block header at {off:#x}"
+        );
+        let header = data
+            .get(off..)
+            .and_then(|remaining| remaining.get(..8))
+            .with_context(|| format!("truncated base relocation block header at {off:#x}"))?;
+        let page = u32::from_le_bytes(header[..4].try_into().expect("four-byte page RVA"));
+        let block_size =
+            u32::from_le_bytes(header[4..8].try_into().expect("four-byte block size")) as usize;
+        ensure!(
+            page & 0xfff == 0,
+            "unaligned base relocation page {page:#x} at block {off:#x}"
+        );
+        ensure!(
+            block_size >= 8 && block_size % 2 == 0,
+            "invalid base relocation block size {block_size:#x} at {off:#x}"
+        );
+        let end = off
+            .checked_add(block_size)
+            .with_context(|| format!("base relocation block extent overflows at {off:#x}"))?;
+        let entries = data
+            .get(off + 8..end)
+            .with_context(|| format!("truncated base relocation block at {off:#x}"))?;
+        for (index, encoded) in entries.chunks_exact(2).enumerate() {
+            let entry = u16::from_le_bytes(encoded.try_into().expect("two-byte relocation entry"));
+            let (kind, width) = match entry >> 12 {
+                0 => (RelocKind::Absolute, 0u64),
+                3 => (RelocKind::HighLow, 4),
+                10 => (RelocKind::Dir64, 8),
+                kind => bail!(
+                    "unsupported base relocation type {kind} at block {off:#x}, entry {index}"
+                ),
             };
+            let rva = page
+                .checked_add(u32::from(entry & 0x0fff))
+                .with_context(|| {
+                    format!("base relocation RVA overflow at block {off:#x}, entry {index}")
+                })?;
+            ensure!(
+                u64::from(rva) + width <= u64::from(u32::MAX) + 1,
+                "base relocation field overflows RVA space at block {off:#x}, entry {index}"
+            );
             out.push(Relocation {
-                rva: Rva::new(page.saturating_add(offset)),
+                rva: Rva::new(rva),
                 kind,
             });
         }
         off = end;
     }
-    out
+    Ok(out)
 }
 
 pub fn encode_base_relocations(relocations: &[Relocation]) -> anyhow::Result<Vec<u8>> {
@@ -121,6 +144,7 @@ mod tests {
         assert_eq!(read32(&data, 16), 12);
         assert_eq!(&data[20..24], &[0x18, 0xa0, 0, 0]);
         let fixups: Vec<_> = parse_relocations(&data)
+            .unwrap()
             .into_iter()
             .filter(|relocation| relocation.kind != RelocKind::Absolute)
             .collect();

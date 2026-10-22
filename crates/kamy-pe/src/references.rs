@@ -1,22 +1,24 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, bail, ensure};
-use kamy_core::{HostReference, ReferenceKind, Rva};
+use kamy_core::{HostReference, MetadataReferences, ReferenceKind, Rva};
 
 use crate::{PeFile, read_u32, read_u64};
 
 mod dynamic;
 
 impl PeFile {
-    /// Enumerates known PE fields; opaque references pin code whose metadata cannot be rewritten.
+    /// Enumerates known PE fields and validated storage that needs no raw pointer scan.
+    /// Opaque references pin code whose metadata cannot be rewritten.
     /// Handler-specific payloads remain unclassified unless the handler identifies their layout.
-    /// Callers MUST combine these references with conservative analysis of unclassified bytes.
+    /// Callers MUST conservatively analyze bytes outside the classified ranges and reference fields.
     /// Unlocalizable encoded metadata and malformed records return errors.
-    pub fn metadata_references(&self) -> anyhow::Result<Vec<HostReference>> {
+    pub fn metadata_references(&self) -> anyhow::Result<MetadataReferences> {
         let _span = tracing::debug_span!("pe_metadata_references").entered();
         let mut collector = Collector {
             pe: self,
             references: Vec::new(),
+            classified_ranges: Vec::new(),
         };
         if self.entry_point != 0 {
             collector.add(0, self.entry_point, ReferenceKind::EntryPoint, false)?;
@@ -25,14 +27,19 @@ impl PeFile {
         collector.tls()?;
         collector.load_config()?;
         collector.debug()?;
+        collector.base_relocations()?;
         collector.exceptions()?;
-        Ok(collector.references)
+        Ok(MetadataReferences {
+            references: collector.references,
+            classified_ranges: collector.classified_ranges,
+        })
     }
 }
 
 struct Collector<'a> {
     pe: &'a PeFile,
     references: Vec<HostReference>,
+    classified_ranges: Vec<std::ops::Range<Rva>>,
 }
 
 #[derive(Default)]
@@ -113,6 +120,18 @@ impl Collector<'_> {
         };
         self.add(source, relative, ReferenceKind::Absolute, boundary)?;
         Ok(Some(relative))
+    }
+
+    fn base_relocations(&mut self) -> anyhow::Result<()> {
+        let Some((base, size)) = self.directory(crate::DIR_BASERELOC)? else {
+            return Ok(());
+        };
+        let end = base
+            .checked_add(size)
+            .context("base relocation directory RVA range overflow")?;
+        // PeFile::parse validates every encoded block before retaining this directory.
+        self.classified_ranges.push(Rva::new(base)..Rva::new(end));
+        Ok(())
     }
 
     fn exports(&mut self) -> anyhow::Result<()> {
@@ -533,6 +552,8 @@ impl Collector<'_> {
             .checked_add(4 + ((u32::from(header[2]) + 1) & !1) * 2)
             .context("unwind record overflow")?;
         self.bytes(unwind, tail - unwind)?;
+        self.classified_ranges
+            .push(Rva::new(unwind)..Rva::new(tail));
         let opaque = if flags & 4 != 0 {
             self.bytes(tail, 12)?;
             self.runtime_function(tail, state, depth + 1)?
@@ -690,6 +711,7 @@ mod tests {
         assert!(
             pe.metadata_references()
                 .unwrap()
+                .references
                 .iter()
                 .any(|reference| reference.source == Rva::new(0x1240)
                     && reference.target == Rva::new(0x1180))
@@ -697,6 +719,7 @@ mod tests {
         assert!(
             !pe.metadata_references()
                 .unwrap()
+                .references
                 .iter()
                 .any(|reference| reference.source == Rva::new(0x1244))
         );
@@ -746,7 +769,7 @@ mod tests {
             pe.bytes[(table - 0x1000 + 4) as usize] = 0xff;
             put32(&mut pe, table + 5, target + 0x10);
         }
-        let references = pe.metadata_references().unwrap();
+        let references = pe.metadata_references().unwrap().references;
         for (source, target) in [(0x1405, 0x1110), (0x1505, 0x1150), (0x1605, 0x1190)] {
             assert!(references.contains(&HostReference {
                 source: Rva::new(source),
@@ -764,7 +787,7 @@ mod tests {
         put32(&mut pe, 0x1204, 0x1180);
         put32(&mut pe, 0x1208, 0x1300);
         pe.bytes[0x300] = 1;
-        let references = pe.metadata_references().unwrap();
+        let references = pe.metadata_references().unwrap().references;
         assert_eq!(
             references
                 .iter()
@@ -776,6 +799,61 @@ mod tests {
             !references
                 .iter()
                 .any(|reference| reference.kind == ReferenceKind::Opaque)
+        );
+    }
+
+    #[test]
+    fn unwind_classification_stops_before_unknown_handler_payload() {
+        for flags in [0, 1, 4] {
+            let mut pe = fixture();
+            pe.data_directories[3] = (0x1200, 12);
+            runtime(&mut pe, 0x1200, 0x1100, 0x1180, 0x1300);
+            pe.bytes[0x300..0x308].copy_from_slice(&[1 | (flags << 3), 4, 1, 0, 4, 0x12, 0, 0]);
+            if flags == 4 {
+                runtime(&mut pe, 0x1308, 0x1600, 0x1680, 0x1400);
+                pe.bytes[0x400] = 1;
+            } else {
+                put32(&mut pe, 0x1308, 0x1500);
+                put32(&mut pe, 0x130c, 0x1140);
+            }
+            let metadata = pe.metadata_references().unwrap();
+            let mut expected_ranges = vec![Rva::new(0x1300)..Rva::new(0x1308)];
+            if flags == 4 {
+                expected_ranges.push(Rva::new(0x1400)..Rva::new(0x1404));
+            }
+            assert_eq!(metadata.classified_ranges, expected_ranges);
+            for (source, target) in [(0x1200, 0x1100), (0x1204, 0x1180), (0x1208, 0x1300)] {
+                assert!(metadata.references.contains(&HostReference {
+                    source: Rva::new(source),
+                    target: Rva::new(target),
+                    kind: ReferenceKind::Unwind,
+                }));
+            }
+            if flags == 1 {
+                assert!(metadata.references.contains(&HostReference {
+                    source: Rva::new(0x1308),
+                    target: Rva::new(0x1500),
+                    kind: ReferenceKind::Opaque,
+                }));
+                assert!(
+                    !metadata
+                        .references
+                        .iter()
+                        .any(|reference| reference.source == Rva::new(0x130c))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_unwind_code_storage_remains_an_error() {
+        let mut pe = fixture();
+        pe.data_directories[3] = (0x1200, 12);
+        runtime(&mut pe, 0x1200, 0x1100, 0x1180, 0x1ff8);
+        pe.bytes[0xff8..0xffc].copy_from_slice(&[1, 4, 3, 0]);
+        assert!(
+            format!("{:#}", pe.metadata_references().unwrap_err())
+                .contains("UNWIND_INFO at 0x1ff8")
         );
     }
 
@@ -795,14 +873,14 @@ mod tests {
     #[test]
     fn empty_iltcg_debug_record_preserves_payload_reference() {
         let mut pe = fixture();
-        let baseline = pe.metadata_references().unwrap();
+        let baseline = pe.metadata_references().unwrap().references;
         pe.data_directories[6] = (0x1200, 28);
         put32(&mut pe, 0x120c, 14);
-        assert_eq!(pe.metadata_references().unwrap(), baseline);
+        assert_eq!(pe.metadata_references().unwrap().references, baseline);
 
         put32(&mut pe, 0x1214, 0x1400);
         put32(&mut pe, 0x1218, 0x400);
-        let references = pe.metadata_references().unwrap();
+        let references = pe.metadata_references().unwrap().references;
         let mut expected = baseline;
         expected.push(HostReference {
             source: Rva::new(0x1214),
@@ -855,7 +933,7 @@ mod tests {
         put32(&mut pe, 0x1304, 0x1700);
         put32(&mut pe, 0x1308, u32::MAX);
         pe.bytes[0x400] = 1;
-        let references = pe.metadata_references().unwrap();
+        let references = pe.metadata_references().unwrap().references;
         for target in [0x1100, 0x1180, 0x1700] {
             assert!(
                 has_opaque(&references, target),
@@ -875,6 +953,7 @@ mod tests {
         assert!(
             !pe.metadata_references()
                 .unwrap()
+                .references
                 .iter()
                 .any(|reference| reference.kind == ReferenceKind::Opaque)
         );
@@ -890,7 +969,7 @@ mod tests {
         runtime(&mut pe, 0x1304, 0x1600, 0x1680, 0x1400);
         pe.bytes[0x400] = 1 | (1 << 3);
         put32(&mut pe, 0x1404, 0x1700);
-        let references = pe.metadata_references().unwrap();
+        let references = pe.metadata_references().unwrap().references;
         for target in [0x1100, 0x1180, 0x1600, 0x1700] {
             assert!(
                 has_opaque(&references, target),
@@ -943,7 +1022,7 @@ mod tests {
         put32(&mut pe, 0x1314, 0x1600);
         put32(&mut pe, 0x1318, 0x1700);
         c_handler(&mut pe);
-        let references = pe.metadata_references().unwrap();
+        let references = pe.metadata_references().unwrap().references;
         for target in [0x1100, 0x1120, 0x1160, 0x1500, 0x1600, 0x1700] {
             assert!(
                 has_opaque(&references, target),
@@ -974,7 +1053,7 @@ mod tests {
                 .contains("C scope table at 0x1308")
         );
         pe.imports[0].name = "__CxxFrameHandler3".into();
-        let references = pe.metadata_references().unwrap();
+        let references = pe.metadata_references().unwrap().references;
         assert!(has_opaque(&references, 0x1100));
         assert!(has_opaque(&references, 0x1500));
     }
@@ -991,7 +1070,7 @@ mod tests {
         put32(&mut pe, 0x1414, 80);
         put32(&mut pe, 0x1548, 0x1600);
         pe.bytes[0x600..0x608].copy_from_slice(b"lib.dll\0");
-        let references = pe.metadata_references().unwrap();
+        let references = pe.metadata_references().unwrap().references;
         for (source, target) in [(0x1410, 0x1500), (0x1548, 0x1600)] {
             assert!(
                 references
@@ -1024,7 +1103,7 @@ mod tests {
         pe.bytes[0x700] = 1;
         for (min, max) in [(3_u16, 3_u16), (0x8003, 0x8003), (1, 0x8003), (0x8001, 3)] {
             put32(&mut pe, 0x1404, u32::from(min) | (u32::from(max) << 16));
-            let references = pe.metadata_references().unwrap();
+            let references = pe.metadata_references().unwrap().references;
             for target in [0x1120, 0x1160, 0x11a0, 0x1260] {
                 assert!(
                     has_opaque(&references, target),
@@ -1075,7 +1154,7 @@ mod tests {
         put32(&mut pe, 0x1404, 0x1100);
         put32(&mut pe, 0x1408, 0x10);
         pe.bytes[0x40c..0x410].copy_from_slice(b"f\0\0\0");
-        let references = pe.metadata_references().unwrap();
+        let references = pe.metadata_references().unwrap().references;
         assert!(references.contains(&HostReference {
             source: Rva::new(0x1404),
             target: Rva::new(0x1100),

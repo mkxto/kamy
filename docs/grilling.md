@@ -168,13 +168,12 @@ The PE/COFF spec is well-documented (Microsoft's PE specification). The parsing/
 
 ### D5 — Register Allocator (revised by D40)
 
-**Decision:** D40 supersedes the original zero-spill prohibition. Memory-backed
-intermediates and bounded scratch-register working sets are the lowering
-baseline. Register-resident optimization may avoid memory traffic, but pressure
-must not force rejection or reduce requested transform intensity for otherwise
-supported functions. Concrete frame reconstruction and actual-body unwind
-semantics remain required. The implementation cutover belongs to handoff 2;
-handoff 1 must report the existing pressure ladder's actual outcome honestly.
+**Decision:** D40 supersedes the original zero-spill prohibition. The backend
+uses memory-backed intermediates and bounded scratch working sets in one
+concrete frame. Pressure MUST NOT reject otherwise supported functions or
+reduce requested intensity. Actual-body unwind describes the real frame.
+Handoff 2 implements this cutover; the former pressure ladder is historical
+handoff-1 behavior, not an active fallback. Evidence is in [STATUS.md](STATUS.md).
 
 ---
 
@@ -501,18 +500,25 @@ Together: per-build variance that breaks signature matching (SigBreaker model).
 
 **Decision:** Structured rejection report (JSON/YAML) with per-function reasons.
 
-**Rejection reasons:** safe rejection remains binding; the historical thunk-size reason is explicitly superseded below.
+**Rejection reasons:** safe rejection remains binding. Current frame failures
+describe semantic proof or explicit resource limits, not register pressure.
 | Reason | Meaning |
 |--------|---------|
-| `NoThunkSpace` (retired target, D37) | Historical original-VA thunk size check; removed by #22, not a rejection in the approved design |
-| `BadIndirectBranch` | Unresolvable indirect jump (not a recognized jump table pattern) |
-| `UnsupportedInstruction` | Instruction the lifter can't model and can't safely pass through |
-| `LiftFailure` | Lifter error (e.g., malformed code, data-in-code confusion) |
-| `SEHComplex` | SEH scope structure too complex for current support |
-| `StackTooLarge` | Stack frame exceeds `max_stack_copy_size` |
-| `SymbolizationUncertain` | Symbolization confidence below threshold |
-| `CodegenFailure` | Register allocator or instruction selector failed |
-| `RegisterPressure` | Current backend limitation until D40's memory-backed lowering cutover; never proof of full requested transformation |
+| `BadIndirectBranch` | Unresolvable indirect jump |
+| `UnsupportedInstruction` | Instruction neither modeled nor safely passed through |
+| `LiftFailure` | Lifter failure, such as malformed code |
+| `SEHComplex` / `EhNoBucketCreation` | Unsupported EH structure or unproved generated unwind bucket |
+| `StackTooLarge` | Configured stack-copy bound exceeded |
+| `SymbolizationUncertain` | Insufficient reference/symbolization evidence |
+| `CodegenFailure` | Structured code-generation failure |
+| `FrameDynamic` | Logical RSP depends on an unproved runtime value |
+| `FrameConflict` | Reachable stack states disagree or violate call/return contracts |
+| `FrameOverflow` | Frame arithmetic or displacement is not representable |
+| `FrameResourceLimit` | Concrete frame exceeds the 16 MiB implementation bound |
+
+`NoThunkSpace`, `RegisterPressure`, caller-frame and self-recursion exclusions
+are retired, not current rejection choices. The report retains actual reasons
+for unsupported native/ISA/EH cases; memory homes do not prove those semantics.
 
 Output included in the protection report alongside transformation stats. Machine-readable for CI (assert rejection rate below threshold).
 
@@ -611,11 +617,12 @@ For parallelism determinism: per-function sub-seeds derived from `hash(global_se
 
 ### D28 — Coverage Robustness (revised by D40)
 
-**Decision:** D40 supersedes pressure-driven intensity reduction as the target
-design. Keep one SSA engine and safe rejection for genuinely unmodeled
-semantics/references. The current retry ladder remains an implementation limit
-until handoff 2 replaces it; reports must distinguish its actual intensity and
-identity outcomes from requested protection. No verbatim relocation fallback.
+**Decision:** One SSA engine, one memory-backed backend, one concrete frame and
+one link plan. Lower supported functions once at requested intensity; identity
+reports zero actual transformation. No pressure-driven intensity ladder and no
+verbatim relocation fallback. Genuinely unmodeled semantics/references still
+fail closed with their specific reasons. H1 ladder measurements remain
+historical evidence, not the current policy; see [STATUS.md](STATUS.md).
 
 ---
 
@@ -636,6 +643,10 @@ identity outcomes from requested protection. No verbatim relocation fallback.
 ---
 
 ### D31 — Phase Reordering: Unwind Kernel into Phase 2; SEH before Obfuscation
+
+**Historical scheduling record:** the completion set and measurements below
+describe the pre-D40 backend. D40/H2 supersede its push/pop allocation design
+and pressure ladder. They do not establish current ISA or full EH acceptance.
 
 **Decision:** The unwind-correctness kernel moves into Phase 2; full SEH (was Phase 4) runs before Obfuscation Passes (was Phase 3).
 
@@ -666,8 +677,8 @@ a terminal-first `tracing-subscriber` stack (compact/tree/json formats,
 library surface, so typed error enums bought matching that no caller used — every
 caller either propagated or counted rejects. `anyhow` removes the per-crate error
 boilerplate while `.context()` preserves the failure chain. Degradation and
-rejection are first-class product signals (**D28** pressure ladder, **D22**
-rejects): routing them through leveled, per-scope `tracing` lets an operator or
+rejection are first-class product signals (**D22**, with the former **D28**
+pressure ladder now historical): routing them through leveled, per-scope `tracing` lets an operator or
 agent see exactly which layer degraded or failed without scattering `println!`.
 tracing + tracing-subscriber + tracing-tree are the de-facto Rust standard and
 pass **C1/C2**.
@@ -744,12 +755,16 @@ incompatible implementation restrictions in D5, D28 and D37–D39.
   native code; unvalidated diagnostic text, mangled names and guessed Win64
   defaults are not substitutes for validated contracts. Rust-only authoring remains.
 - Handoff 2 implements concrete frames and memory-backed intermediates with
-  bounded scratch sets and explicit flags. Pressure must not reject supported
-  functions or reduce requested intensity. Register-resident optimization is
-  permitted without weakening that guarantee; unwind describes the real frame.
+  bounded scratch sets and explicit flags. Pressure/caller-frame/self-recursion
+  exclusions and intensity retries are retired. One actual frame and backend
+  preserve original outgoing storage and incoming coordinates; unwind describes
+  that real frame. Specific dynamic/conflict/overflow/resource failures remain.
 - Handoff 3 integrates compiled Rust startup, ordinary imports and Rust `std`
   with `panic=abort`. DLL initialization runs only on process attach, before
   the original entry. No hidden worker/deferred-init workaround.
+  It MUST consume H2 concrete-frame/ABI/unwind interfaces and regression
+  fixtures without introducing duplicate conventions. H3 remains pending;
+  current generated startup is intentional H1 behavior, not compiled std support.
 - Handoff 4 adds whole-image virtual compaction to the same link plan, or
   fails specifically when global placement cannot be justified. Selective
   reclamation and raw repacking are not whole-image compaction.
@@ -793,7 +808,7 @@ incompatible implementation restrictions in D5, D28 and D37–D39.
 | D25 | Test corpus | Adopt aftermathlabs/bintests |
 | D26 | PRNG | Configurable seed, deterministic ChaCha8Rng |
 | D27 | /GL handling | Detect and warn, fall back to split-on-calls |
-| D28 | Coverage robustness | D40 supersedes pressure-driven intensity reduction; report current limits honestly |
+| D28 | Coverage robustness | One requested-intensity attempt; specific safe rejects, no pressure ladder or verbatim fallback |
 | D29 | Stub stealth | Superseded by D37; no per-function entry stubs |
 | D30 | Runtime & plugin SDK | Superseded by D38; optional authored modules, entry-ABI-specific redirection |
 | D31 | Phase order | Unwind kernel into Phase 2; SEH before obfuscation |

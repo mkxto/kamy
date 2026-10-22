@@ -44,6 +44,7 @@ pub fn lift_function(
         .map(|symbol| symbol.id.clone())
         .unwrap_or(kamy_core::SymbolId::Host { rva: entry_rva });
     let signature = cc.lookup_symbol(&source);
+    let native_flag_liveness = native::native_flag_liveness(module, func, signature.as_ref());
     let _s = tracing::debug_span!("lift", rva = %entry_rva).entered();
 
     let mut ordered_bbs: Vec<&kamy_core::BasicBlock> = Vec::with_capacity(func.blocks.len());
@@ -99,6 +100,7 @@ pub fn lift_function(
         lift_state.source_start = entry_rva;
         lift_state.image_base = module.image_base;
         lift_state.references = references;
+        lift_state.symbols = &module.symbols;
         lift_state.signature = signature.as_ref();
         if lift_state.authored() && lift_state.signature.is_none() {
             lift_state.unsupported = true;
@@ -123,6 +125,10 @@ pub fn lift_function(
             let start_pos = decoder.position();
             let insn = decoder.decode();
             lift_state.instruction = kamy_core::Rva::new((insn.ip() - module.image_base) as u32);
+            lift_state.native_live_after_flags = native_flag_liveness
+                .as_ref()
+                .and_then(|live| live.get(&lift_state.instruction))
+                .copied();
             let constants = decoder.get_constant_offsets(&insn);
             for operand in 0..insn.op_count() {
                 let (offset, size) = if insn.op_kind(operand) == OpKind::Memory {
@@ -499,6 +505,11 @@ fn dispatch(
         Mnemonic::Nop | Mnemonic::Int3 => {}
 
         Mnemonic::Movaps | Mnemonic::Movups => control::lift_movaps(insn, builder, state),
+        Mnemonic::Movsd | Mnemonic::Movss
+            if insn.op0_kind() == OpKind::Register && insn.op1_kind() == OpKind::Register =>
+        {
+            native::native_inline_fallback(insn, insn_bytes, builder, state);
+        }
         Mnemonic::Movsd => control::lift_movsd(insn, builder, state),
         Mnemonic::Movss => control::lift_movss(insn, builder, state),
         Mnemonic::Xorps => control::lift_xorps(insn, builder, state),
@@ -1051,23 +1062,12 @@ mod tests {
         };
         let mut lifted = lift_function(&module, &func, &cc, std::slice::from_ref(&operand));
         assert!(!lifted.unsupported);
-        ssa::construct_ssa(&mut lifted);
+        ssa::construct_ssa(&mut lifted).unwrap();
         kamy_transforms::optimize(&mut lifted.func);
-        let alloc = kamy_codegen::allocate_registers(
-            &lifted.func,
-            &kamy_codegen::CALLEE_SAVED_GPRS,
-            &lifted.rsp_chain,
-            &lifted.reg_pins,
-        )
-        .unwrap();
-        let selected = kamy_codegen::select_instructions(
-            &lifted.func,
-            &alloc,
-            BASE,
-            BASE + u64::from(TEXT_RVA),
-            &kamy_codegen::callee_saved_used(&alloc),
-            &kamy_codegen::callee_saved_xmms_used(&alloc),
-        );
+        let alloc =
+            kamy_codegen::allocate_registers(&lifted.func, &lifted.rsp_chain, &lifted.reg_pins)
+                .unwrap();
+        let selected = kamy_codegen::select_instructions(&lifted.func, &alloc);
         let readonly = authored_symbol("aggregate", "coff:0:section:7:piece:0");
         let other_module = authored_symbol("other", "coff:0:section:7:piece:0");
         let code_va = BASE + 0x8000;
@@ -1094,19 +1094,6 @@ mod tests {
             assert_eq!(adds[0].op0_register(), Register::XMM0);
             assert!(adds[0].is_ip_rel_memory_operand());
             assert_eq!(adds[0].ip_rel_memory_address(), storage_va);
-            assert!(decoded.iter().any(|inst| {
-                inst.mnemonic() == iced_x86::Mnemonic::Movdqu
-                    && inst.op0_register() == Register::XMM0
-                    && inst.memory_base() == Register::RDX
-                    && inst.memory_displacement64() == 0
-            }));
-            assert!(decoded.iter().any(|inst| {
-                inst.mnemonic() == iced_x86::Mnemonic::Movdqu
-                    && inst.op0_kind() == OpKind::Memory
-                    && inst.op1_register() == Register::XMM0
-                    && inst.memory_base() == Register::RCX
-                    && inst.memory_displacement64() == 0
-            }));
             assert!(decoded.iter().any(|inst| {
                 (0..inst.op_count()).any(|index| {
                     matches!(
@@ -1181,7 +1168,7 @@ mod tests {
             }];
             let mut lifted = lift_function(&module, &func, &cc, &operands);
             assert!(!lifted.unsupported);
-            construct_ssa(&mut lifted);
+            construct_ssa(&mut lifted).unwrap();
             let ops = &lifted.func.blocks[0].insts;
             assert!(
                 ops.iter()
@@ -1199,8 +1186,12 @@ mod tests {
 
     #[test]
     fn authored_calls_have_independent_integer_and_float_results_and_no_default() {
-        let (mut module, func) =
-            single_block_module(&[0xe8, 0xfb, 0x0f, 0, 0, 0xc3], Terminator::Return);
+        let (mut module, func) = single_block_module(
+            &[
+                0x48, 0x83, 0xec, 0x28, 0xe8, 0xf7, 0x0f, 0, 0, 0x48, 0x83, 0xc4, 0x28, 0xc3,
+            ],
+            Terminator::Return,
+        );
         let source = authored_symbol("module", "object:0:symbol:1");
         let target = authored_symbol("module", "object:0:symbol:2");
         mark_authored(&mut module, source.clone());
@@ -1220,11 +1211,11 @@ mod tests {
             noreturn: false,
         };
         let operands = [kamy_core::OperandReference {
-            instruction: Rva::new(TEXT_RVA),
+            instruction: Rva::new(TEXT_RVA + 4),
             operand: 0,
             reference: kamy_core::Reference {
                 source: source.clone(),
-                offset: 1,
+                offset: 5,
                 expression: kamy_core::SymbolicExpression::symbol(target.clone()),
                 field: kamy_core::LinkField::Relative32 { bias: 0 },
                 origin: kamy_core::ReferenceOrigin::Authored,
@@ -1236,7 +1227,7 @@ mod tests {
         ]));
         let mut lifted = lift_function(&module, &func, &cc, &operands);
         assert!(!lifted.unsupported);
-        construct_ssa(&mut lifted);
+        construct_ssa(&mut lifted).unwrap();
         let results: Vec<_> = lifted.func.blocks[0]
             .insts
             .iter()
@@ -1371,7 +1362,7 @@ mod tests {
                 .flatten()
                 .all(|value| !lifted.reg_pins.contains_key(value))
         );
-        construct_ssa(&mut lifted);
+        construct_ssa(&mut lifted).unwrap();
         kamy_transforms::optimize(&mut lifted.func);
         assert!(
             lifted
@@ -1381,21 +1372,10 @@ mod tests {
                 .flat_map(|block| &block.phis)
                 .all(|phi| !lifted.reg_pins.contains_key(&phi.dest))
         );
-        let alloc = kamy_codegen::allocate_registers(
-            &lifted.func,
-            &kamy_codegen::CALLEE_SAVED_GPRS,
-            &lifted.rsp_chain,
-            &lifted.reg_pins,
-        )
-        .unwrap();
-        let mut selected = kamy_codegen::select_instructions(
-            &lifted.func,
-            &alloc,
-            BASE,
-            BASE + u64::from(TEXT_RVA),
-            &kamy_codegen::callee_saved_used(&alloc),
-            &kamy_codegen::callee_saved_xmms_used(&alloc),
-        );
+        let alloc =
+            kamy_codegen::allocate_registers(&lifted.func, &lifted.rsp_chain, &lifted.reg_pins)
+                .unwrap();
+        let mut selected = kamy_codegen::select_instructions(&lifted.func, &alloc);
         assert_eq!(selected.references.len(), 3);
         let addresses = HashMap::from([
             (authored_symbol("module", "table_begin"), BASE + 0x2008),
@@ -1406,9 +1386,191 @@ mod tests {
         kamy_codegen::relocate(&selected.instructions, BASE + 0x4000).unwrap();
     }
 
+    #[test]
+    fn chkstk_metadata_preserves_arguments_and_proves_extent() {
+        let code = [
+            0xb8, 0, 0x50, 0, 0, 0xe8, 0xf6, 0x0f, 0, 0, 0x48, 0x29, 0xc4, 0x48, 0x81, 0xc4, 0,
+            0x50, 0, 0, 0xc3,
+        ];
+        for name in ["__chkstk", "__chkstk_like"] {
+            let (mut module, func) = single_block_module(&code, Terminator::Return);
+            module.symbols.push(kamy_core::Symbol {
+                id: kamy_core::SymbolId::Host {
+                    rva: Rva::new(0x2000),
+                },
+                name: name.into(),
+                rva: Rva::new(0x2000),
+                kind: kamy_core::SymbolKind::Function,
+            });
+            let mut lifted = lift_function(&module, &func, &Win64Default, &[]);
+            assert!(!lifted.unsupported);
+            if name != "__chkstk" {
+                assert!(
+                    lifted.func.blocks[0]
+                        .insts
+                        .iter()
+                        .any(|inst| matches!(inst.op, IrOp::Call { .. }))
+                );
+                continue;
+            }
+            let probe = lifted.func.blocks[0]
+                .insts
+                .iter()
+                .find(|inst| matches!(inst.op, IrOp::StackProbe))
+                .unwrap();
+            assert_eq!(probe.args[0], lifted.block_exit[0][Gpr::Rax.index()]);
+            for register in [Gpr::Rcx, Gpr::Rdx, Gpr::R8, Gpr::R9, Gpr::Rbx] {
+                assert_eq!(
+                    lifted.block_entry[0][register.index()],
+                    lifted.block_exit[0][register.index()]
+                );
+            }
+            for register in [Gpr::R10, Gpr::R11] {
+                assert_ne!(
+                    lifted.block_entry[0][register.index()],
+                    lifted.block_exit[0][register.index()]
+                );
+            }
+            assert!(
+                !lifted.func.blocks[0]
+                    .insts
+                    .iter()
+                    .any(|inst| matches!(inst.op, IrOp::Call { .. }))
+            );
+            construct_ssa(&mut lifted).unwrap();
+            kamy_transforms::optimize(&mut lifted.func);
+            let analysis = kamy_core::FrameAnalysis::analyze(
+                &lifted.func,
+                &lifted.rsp_chain,
+                &lifted.reg_pins,
+            )
+            .unwrap();
+            assert_eq!(analysis.original_size, 0x5008);
+            assert_eq!(analysis.outgoing_size, 0);
+        }
+    }
+
+    #[test]
+    fn unknown_host_return_keeps_integer_and_float_candidates() {
+        let (module, func) = single_block_module(&[0xc3], Terminator::Return);
+        let lifted = lift_function(&module, &func, &Win64Default, &[]);
+        for register in [PhysReg::Gpr(Gpr::Rax), PhysReg::Xmm(XmmReg::Xmm0)] {
+            assert!(
+                lifted.func.blocks[0]
+                    .insts
+                    .iter()
+                    .filter(|inst| matches!(inst.op, IrOp::Use))
+                    .flat_map(|inst| &inst.args)
+                    .any(|value| lifted.reg_pins.get(value) == Some(&register))
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_register_moves_preserve_destination_upper_lanes_in_emitted_code() {
+        for (prefix, bits) in [(0xf2, 64), (0xf3, 32)] {
+            let code = [prefix, 0x0f, 0x10, 0xc1, 0xc3];
+            let (module, func) = single_block_module(&code, Terminator::Return);
+            let mut lifted = lift_function(&module, &func, &Win64Default, &[]);
+            assert!(!lifted.unsupported);
+            assert!(
+                lifted.func.blocks[0]
+                    .insts
+                    .iter()
+                    .any(|inst| matches!(inst.op, IrOp::NativeInline(_)))
+            );
+            construct_ssa(&mut lifted).unwrap();
+            kamy_transforms::optimize(&mut lifted.func);
+            let alloc =
+                kamy_codegen::allocate_registers(&lifted.func, &lifted.rsp_chain, &lifted.reg_pins)
+                    .unwrap();
+            let selected = kamy_codegen::select_instructions(&lifted.func, &alloc);
+            let code_va = BASE + 0x4000;
+            let encoded = kamy_codegen::relocate(&selected.instructions, code_va).unwrap();
+            let returned = execute_boundary_code(&encoded, code_va, &[]);
+            let initial = (0x1234_5678_9abc_def0u128 << 64) | 0x0fed_cba9_beef_0000;
+            let mask = (1u128 << bits) - 1;
+            assert_eq!(
+                returned[&PhysReg::Xmm(XmmReg::Xmm0)],
+                (initial & !mask) | ((initial + 1) & mask)
+            );
+        }
+    }
+
+    #[test]
+    fn every_call_signature_retains_unpinned_logical_rsp() {
+        for (register_args, stack_bits, expected_outgoing) in [
+            (0, None, 32u32),
+            (4, None, 32),
+            (5, Some(64u16), 40),
+            (5, Some(32), 40),
+        ] {
+            let code = [
+                0x48, 0x83, 0xec, 0x28, 0xe8, 0xf7, 0x0f, 0, 0, 0x48, 0x83, 0xc4, 0x28, 0xc3,
+            ];
+            let (mut module, func) = single_block_module(&code, Terminator::Return);
+            let source = authored_symbol("rsp", "caller");
+            let target = authored_symbol("rsp", "callee");
+            mark_authored(&mut module, source.clone());
+            let mut signature = Win64Default::default_signature();
+            signature.args.truncate(4.min(register_args));
+            if let Some(bits) = stack_bits {
+                for slot in signature.args.len()..register_args {
+                    signature.args.push(kamy_core::ir::AbiValue {
+                        location: kamy_core::ir::AbiLocation::Stack {
+                            offset: 8 + 8 * slot as i32,
+                        },
+                        class: kamy_core::ir::AbiClass::Integer,
+                        bits,
+                        passing: kamy_core::ir::AbiPassing::Direct,
+                    });
+                }
+            }
+            let stack_args = signature.args.len() - 4.min(register_args);
+            let cc = AuthoredCc(HashMap::from([
+                (source.clone(), signature.clone()),
+                (target.clone(), signature),
+            ]));
+            let reference = kamy_core::OperandReference {
+                instruction: Rva::new(TEXT_RVA + 4),
+                operand: 0,
+                reference: kamy_core::Reference {
+                    source,
+                    offset: 5,
+                    expression: kamy_core::SymbolicExpression::symbol(target),
+                    field: kamy_core::LinkField::Relative32 { bias: 0 },
+                    origin: kamy_core::ReferenceOrigin::Authored,
+                },
+            };
+            let mut lifted = lift_function(&module, &func, &cc, &[reference]);
+            assert!(!lifted.unsupported);
+            construct_ssa(&mut lifted).unwrap();
+            kamy_transforms::optimize(&mut lifted.func);
+            let (index, call) = lifted.func.blocks[0]
+                .insts
+                .iter()
+                .enumerate()
+                .find(|(_, inst)| matches!(inst.op, IrOp::Call { .. }))
+                .unwrap();
+            assert_eq!(call.args.len(), 4.min(register_args) + stack_args + 1);
+            let rsp = call.args.last().unwrap();
+            assert!(lifted.rsp_chain.contains(rsp));
+            assert!(!lifted.reg_pins.contains_key(rsp));
+            let analysis = kamy_core::FrameAnalysis::analyze(
+                &lifted.func,
+                &lifted.rsp_chain,
+                &lifted.reg_pins,
+            )
+            .unwrap();
+            assert_eq!(analysis.call_deltas[&(BlockId(0), index)], -40);
+            assert_eq!(analysis.original_size, 40);
+            assert_eq!(analysis.outgoing_size, expected_outgoing);
+        }
+    }
+
     fn successor_module(code: &[u8]) -> (Module, Function) {
         let (mut module, mut func) = single_block_module(code, Terminator::Return);
-        let successor = Rva::new(TEXT_RVA + 5);
+        let successor = Rva::new(TEXT_RVA + 9);
         func.blocks[0].start = successor;
         func.blocks.insert(
             0,
@@ -1423,78 +1585,257 @@ mod tests {
         (module, func)
     }
 
-    fn execute_boundary_allocation(
-        func: &IrFunction,
-        alloc: &kamy_codegen::RegAllocation,
+    fn execute_boundary_code(
+        code: &[u8],
+        code_va: u64,
         call_returns: &[(u64, u128)],
     ) -> HashMap<PhysReg, u128> {
-        let mut registers: HashMap<_, _> = Gpr::ALL
-            .into_iter()
-            .map(|gpr| (PhysReg::Gpr(gpr), 0xdead_0000 + gpr.index() as u128))
-            .chain(
-                XmmReg::ALL
-                    .into_iter()
-                    .map(|xmm| (PhysReg::Xmm(xmm), 0xbeef_0000 + xmm.index() as u128)),
-            )
-            .collect();
-        let mut call_returns = call_returns.iter();
-        let mut block = func.entry;
-        loop {
-            let current = func.block(block);
-            assert!(current.phis.is_empty());
-            for inst in &current.insts {
-                let input = |index: usize| registers[&alloc.assignments[&inst.args[index]]];
-                let value = match &inst.op {
-                    IrOp::Undef | IrOp::Use | IrOp::CallResult { .. } => None,
-                    IrOp::Const(value) => Some(u128::from(*value)),
-                    IrOp::Copy | IrOp::Mov128 => Some(input(0)),
-                    IrOp::Add => Some(u128::from((input(0) as u64).wrapping_add(input(1) as u64))),
-                    IrOp::Call { clobbers, .. } => {
-                        for phys in clobbers {
-                            registers.insert(*phys, 0xcccc_cccc_cccc_cccc);
-                        }
-                        let &(integer, xmm) = call_returns.next().unwrap();
-                        registers.insert(PhysReg::Gpr(Gpr::Rax), u128::from(integer));
-                        registers.insert(PhysReg::Xmm(XmmReg::Xmm0), xmm);
-                        None
-                    }
-                    IrOp::NativeInline(native) => {
-                        let decoded = iced_x86::Decoder::new(
-                            64,
-                            &native.bytes,
-                            iced_x86::DecoderOptions::NONE,
-                        )
-                        .decode();
-                        assert_eq!(decoded.mnemonic(), iced_x86::Mnemonic::Rdtsc);
-                        assert_eq!(native.writes.len(), 2);
-                        assert!(native.writes.contains(&PhysReg::Gpr(Gpr::Rax)));
-                        assert!(native.writes.contains(&PhysReg::Gpr(Gpr::Rdx)));
-                        registers.insert(PhysReg::Gpr(Gpr::Rax), 0x1234_5678);
-                        registers.insert(PhysReg::Gpr(Gpr::Rdx), 0x9abc_def0);
-                        None
-                    }
-                    other => panic!("unexpected boundary fixture operation: {other:?}"),
-                };
-                if let Some(value) = value {
-                    registers.insert(alloc.assignments[&inst.dest.unwrap()], value);
+        struct Machine {
+            registers: HashMap<PhysReg, u128>,
+            memory: HashMap<u64, u8>,
+            entry_rsp: u64,
+        }
+
+        impl Machine {
+            fn physical(register: Register) -> PhysReg {
+                if let Some(gpr) = iced_reg_to_gpr(register) {
+                    PhysReg::Gpr(gpr)
+                } else {
+                    PhysReg::Xmm(iced_reg_to_xmm(register).unwrap())
                 }
             }
-            match current.term {
-                IrTerminator::Jump(next) => block = next,
-                IrTerminator::Ret => {
-                    assert!(call_returns.next().is_none());
-                    return registers;
+
+            fn read_register(&self, register: Register) -> u128 {
+                let value = self.registers[&Self::physical(register)];
+                if matches!(
+                    register,
+                    Register::AH | Register::BH | Register::CH | Register::DH
+                ) {
+                    return (value >> 8) & 0xff;
                 }
-                ref other => panic!("unexpected boundary fixture terminator: {other:?}"),
+                let bits = register.size() * 8;
+                if bits == 128 {
+                    value
+                } else {
+                    value & ((1u128 << bits) - 1)
+                }
+            }
+
+            fn write_register(&mut self, register: Register, value: u128) {
+                let physical = Self::physical(register);
+                let bits = register.size() * 8;
+                let value = if bits == 128 {
+                    value
+                } else if matches!(
+                    register,
+                    Register::AH | Register::BH | Register::CH | Register::DH
+                ) {
+                    (self.registers[&physical] & !0xff00) | ((value & 0xff) << 8)
+                } else if bits < 32 {
+                    let mask = (1u128 << bits) - 1;
+                    (self.registers[&physical] & !mask) | (value & mask)
+                } else {
+                    value & ((1u128 << bits) - 1)
+                };
+                self.registers.insert(physical, value);
+            }
+
+            fn address(&self, insn: &Instruction) -> u64 {
+                if insn.is_ip_rel_memory_operand() {
+                    return insn.ip_rel_memory_address();
+                }
+                let read = |register| {
+                    if register == Register::None {
+                        0
+                    } else {
+                        self.read_register(register) as u64
+                    }
+                };
+                read(insn.memory_base())
+                    .wrapping_add(
+                        read(insn.memory_index())
+                            .wrapping_mul(u64::from(insn.memory_index_scale())),
+                    )
+                    .wrapping_add(insn.memory_displacement64())
+            }
+
+            fn check_address(&self, address: u64, size: usize) {
+                assert!(address >= self.entry_rsp - 16 * 1024 * 1024);
+                assert!(address.checked_add(size as u64).unwrap() <= self.entry_rsp + 8);
+            }
+
+            fn read_memory(&self, address: u64, size: usize) -> u128 {
+                self.check_address(address, size);
+                assert!(size <= 16);
+                (0..size).fold(0, |value, byte| {
+                    value | (u128::from(self.memory[&(address + byte as u64)]) << (byte * 8))
+                })
+            }
+
+            fn write_memory(&mut self, address: u64, size: usize, value: u128) {
+                self.check_address(address, size);
+                assert!(size <= 16);
+                for byte in 0..size {
+                    self.memory
+                        .insert(address + byte as u64, (value >> (byte * 8)) as u8);
+                }
+            }
+
+            fn read(&self, insn: &Instruction, operand: u32) -> u128 {
+                match insn.op_kind(operand) {
+                    OpKind::Register => self.read_register(insn.op_register(operand)),
+                    OpKind::Memory => {
+                        self.read_memory(self.address(insn), insn.memory_size().size())
+                    }
+                    _ => u128::from(get_immediate(insn, operand)),
+                }
+            }
+
+            fn write(&mut self, insn: &Instruction, value: u128) {
+                match insn.op0_kind() {
+                    OpKind::Register => self.write_register(insn.op0_register(), value),
+                    OpKind::Memory => {
+                        self.write_memory(self.address(insn), insn.memory_size().size(), value)
+                    }
+                    other => panic!("unexpected boundary destination: {other:?}"),
+                }
             }
         }
+
+        let registers: HashMap<_, _> = Gpr::ALL
+            .into_iter()
+            .map(|gpr| (PhysReg::Gpr(gpr), 0xdead_0000 + gpr.index() as u128))
+            .chain(XmmReg::ALL.into_iter().map(|xmm| {
+                let index = xmm.index() as u128;
+                (
+                    PhysReg::Xmm(xmm),
+                    ((0x1234_5678_9abc_def0u128 + index) << 64) | (0x0fed_cba9_beef_0000 + index),
+                )
+            }))
+            .collect();
+        let original = registers.clone();
+        let mut machine = Machine {
+            registers,
+            memory: HashMap::new(),
+            entry_rsp: 0x1000_0008,
+        };
+        machine.write_register(Register::RSP, u128::from(machine.entry_rsp));
+        machine.write_memory(machine.entry_rsp, 8, 0xfeed_face);
+        let decoded: Vec<_> = Decoder::with_ip(64, code, code_va, DecoderOptions::NONE)
+            .into_iter()
+            .collect();
+        let targets: HashMap<_, _> = decoded
+            .iter()
+            .enumerate()
+            .map(|(index, insn)| (insn.ip(), index))
+            .collect();
+        let mut call_returns = call_returns.iter();
+        let mut pc = 0;
+        for _ in 0..100_000 {
+            let insn = &decoded[pc];
+            pc += 1;
+            match insn.mnemonic() {
+                Mnemonic::Mov
+                | Mnemonic::Movzx
+                | Mnemonic::Movaps
+                | Mnemonic::Movups
+                | Mnemonic::Movdqu
+                | Mnemonic::Movdqa
+                | Mnemonic::Movq
+                | Mnemonic::Movd => {
+                    let value = machine.read(insn, 1);
+                    machine.write(insn, value);
+                }
+                Mnemonic::Movsd | Mnemonic::Movss => {
+                    let mask = if insn.mnemonic() == Mnemonic::Movsd {
+                        u128::from(u64::MAX)
+                    } else {
+                        u128::from(u32::MAX)
+                    };
+                    let source = machine.read(insn, 1);
+                    let value = if insn.op0_kind() == OpKind::Register
+                        && insn.op1_kind() == OpKind::Register
+                    {
+                        (machine.read(insn, 0) & !mask) | (source & mask)
+                    } else {
+                        source & mask
+                    };
+                    machine.write(insn, value);
+                }
+                Mnemonic::Lea => machine.write(insn, u128::from(machine.address(insn))),
+                Mnemonic::Add
+                | Mnemonic::Sub
+                | Mnemonic::Xor
+                | Mnemonic::And
+                | Mnemonic::Or
+                | Mnemonic::Pxor
+                | Mnemonic::Xorps
+                | Mnemonic::Xorpd => {
+                    let left = machine.read(insn, 0);
+                    let right = machine.read(insn, 1);
+                    let value = match insn.mnemonic() {
+                        Mnemonic::Add => left.wrapping_add(right),
+                        Mnemonic::Sub => left.wrapping_sub(right),
+                        Mnemonic::And => left & right,
+                        Mnemonic::Or => left | right,
+                        _ => left ^ right,
+                    };
+                    machine.write(insn, value);
+                }
+                Mnemonic::Call => {
+                    let rsp = machine.read_register(Register::RSP) as u64;
+                    assert_eq!(rsp & 15, 0);
+                    machine.write_memory(rsp - 8, 8, u128::from(insn.next_ip()));
+                    for byte in 0..32 {
+                        machine.check_address(rsp + byte, 1);
+                        machine.memory.insert(rsp + byte, 0xcc);
+                    }
+                    for register in win64_volatiles() {
+                        machine.registers.insert(register, 0xcccc_cccc_cccc_cccc);
+                    }
+                    let &(integer, xmm) = call_returns.next().unwrap();
+                    machine
+                        .registers
+                        .insert(PhysReg::Gpr(Gpr::Rax), u128::from(integer));
+                    machine.registers.insert(PhysReg::Xmm(XmmReg::Xmm0), xmm);
+                }
+                Mnemonic::Rdtsc => {
+                    machine.write_register(Register::EAX, 0x1234_5678);
+                    machine.write_register(Register::EDX, 0x9abc_def0);
+                }
+                Mnemonic::Jmp => pc = targets[&insn.near_branch_target()],
+                Mnemonic::Nop => {}
+                Mnemonic::Ret => {
+                    assert!(call_returns.next().is_none());
+                    assert_eq!(
+                        machine.read_register(Register::RSP),
+                        u128::from(machine.entry_rsp)
+                    );
+                    assert_eq!(machine.read_memory(machine.entry_rsp, 8), 0xfeed_face);
+                    for register in Gpr::ALL {
+                        if register != Gpr::Rsp && !register.is_volatile_win64() {
+                            let physical = PhysReg::Gpr(register);
+                            assert_eq!(machine.registers[&physical], original[&physical]);
+                        }
+                    }
+                    for register in XmmReg::ALL.into_iter().skip(6) {
+                        let physical = PhysReg::Xmm(register);
+                        assert_eq!(machine.registers[&physical], original[&physical]);
+                    }
+                    return machine.registers;
+                }
+                other => panic!("unexpected emitted boundary instruction: {other:?}"),
+            }
+        }
+        panic!("boundary fixture did not return");
     }
 
     #[test]
     fn successor_moves_preserve_integer_and_xmm_call_results_across_a_later_call() {
         let code = [
-            0xe8, 0xfb, 0x0f, 0, 0, 0x48, 0x89, 0xc3, 0x0f, 0x28, 0xf0, 0xe8, 0xf0, 0x0f, 0, 0,
-            0x48, 0x83, 0xc3, 1, 0x48, 0x89, 0xd8, 0x0f, 0x28, 0xc6, 0xc3,
+            0x48, 0x83, 0xec, 0x28, 0xe8, 0xf7, 0x0f, 0, 0, 0x48, 0x89, 0xc3, 0x0f, 0x28, 0xf0,
+            0xe8, 0xec, 0x0f, 0, 0, 0x48, 0x83, 0xc3, 1, 0x48, 0x89, 0xd8, 0x0f, 0x28, 0xc6, 0x48,
+            0x83, 0xc4, 0x28, 0xc3,
         ];
         let (mut module, func) = successor_module(&code);
         let source = authored_symbol("module", "caller");
@@ -1518,7 +1859,7 @@ mod tests {
             (source.clone(), signature.clone()),
             (target.clone(), signature),
         ]));
-        let references: Vec<_> = [0, 11]
+        let references: Vec<_> = [4, 15]
             .into_iter()
             .map(|offset| kamy_core::OperandReference {
                 instruction: Rva::new(TEXT_RVA + offset),
@@ -1534,7 +1875,7 @@ mod tests {
             .collect();
         let mut lifted = lift_function(&module, &func, &cc, &references);
         assert!(!lifted.unsupported);
-        construct_ssa(&mut lifted);
+        construct_ssa(&mut lifted).unwrap();
         kamy_transforms::optimize(&mut lifted.func);
         let instructions: Vec<_> = lifted
             .func
@@ -1572,45 +1913,27 @@ mod tests {
         let saved_floating = moved(floating, true);
         assert!(!lifted.reg_pins.contains_key(&saved_integer));
         assert!(!lifted.reg_pins.contains_key(&saved_floating));
-        let alloc = kamy_codegen::allocate_registers(
-            &lifted.func,
-            &kamy_codegen::CALLEE_SAVED_GPRS,
-            &lifted.rsp_chain,
-            &lifted.reg_pins,
-        )
-        .unwrap();
-        assert_eq!(alloc.assignments[&integer], PhysReg::Gpr(Gpr::Rax));
-        assert_eq!(alloc.assignments[&floating], PhysReg::Xmm(XmmReg::Xmm0));
-        assert!(
-            matches!(alloc.assignments[&saved_integer], PhysReg::Gpr(gpr) if !gpr.is_volatile_win64())
-        );
-        assert!(
-            matches!(alloc.assignments[&saved_floating], PhysReg::Xmm(xmm) if xmm.index() >= 6)
-        );
-        let returned = execute_boundary_allocation(&lifted.func, &alloc, &[(41, 3), (99, 7)]);
-        assert_eq!(returned[&PhysReg::Gpr(Gpr::Rax)], 42);
-        assert_eq!(returned[&PhysReg::Xmm(XmmReg::Xmm0)], 3);
-        let mut selected = kamy_codegen::select_instructions(
-            &lifted.func,
-            &alloc,
-            BASE,
-            BASE + u64::from(TEXT_RVA),
-            &kamy_codegen::callee_saved_used(&alloc),
-            &kamy_codegen::callee_saved_xmms_used(&alloc),
-        );
+        let alloc =
+            kamy_codegen::allocate_registers(&lifted.func, &lifted.rsp_chain, &lifted.reg_pins)
+                .unwrap();
+        let mut selected = kamy_codegen::select_instructions(&lifted.func, &alloc);
         assert_eq!(selected.references.len(), 2);
         kamy_codegen::bind_references(&mut selected, BASE, |symbol| {
             (symbol == &target).then_some(BASE + 0x2000)
         })
         .unwrap();
-        kamy_codegen::relocate(&selected.instructions, BASE + 0x4000).unwrap();
+        let code_va = BASE + 0x4000;
+        let encoded = kamy_codegen::relocate(&selected.instructions, code_va).unwrap();
+        let returned = execute_boundary_code(&encoded, code_va, &[(41, 3), (99, 7)]);
+        assert_eq!(returned[&PhysReg::Gpr(Gpr::Rax)], 42);
+        assert_eq!(returned[&PhysReg::Xmm(XmmReg::Xmm0)], 3);
     }
 
     #[test]
     fn successor_move_preserves_a_call_result_across_native_register_writes() {
         let code = [
-            0xe8, 0xfb, 0x0f, 0, 0, 0x48, 0x89, 0xc3, 0x0f, 0x31, 0x48, 0x83, 0xc3, 1, 0x48, 0x89,
-            0xd8, 0xc3,
+            0x48, 0x83, 0xec, 0x28, 0xe8, 0xf7, 0x0f, 0, 0, 0x48, 0x89, 0xc3, 0x0f, 0x31, 0x48,
+            0x83, 0xc3, 1, 0x48, 0x89, 0xd8, 0x48, 0x83, 0xc4, 0x28, 0xc3,
         ];
         let (mut module, func) = successor_module(&code);
         let source = authored_symbol("module", "native_caller");
@@ -1623,11 +1946,11 @@ mod tests {
             (target.clone(), signature),
         ]));
         let reference = kamy_core::OperandReference {
-            instruction: Rva::new(TEXT_RVA),
+            instruction: Rva::new(TEXT_RVA + 4),
             operand: 0,
             reference: kamy_core::Reference {
                 source,
-                offset: 1,
+                offset: 5,
                 expression: kamy_core::SymbolicExpression::symbol(target.clone()),
                 field: kamy_core::LinkField::Relative32 { bias: 0 },
                 origin: kamy_core::ReferenceOrigin::Authored,
@@ -1635,7 +1958,7 @@ mod tests {
         };
         let mut lifted = lift_function(&module, &func, &cc, &[reference]);
         assert!(!lifted.unsupported);
-        construct_ssa(&mut lifted);
+        construct_ssa(&mut lifted).unwrap();
         kamy_transforms::optimize(&mut lifted.func);
         let result = lifted.func.blocks[0]
             .insts
@@ -1655,31 +1978,18 @@ mod tests {
             .dest
             .unwrap();
         assert!(!lifted.reg_pins.contains_key(&saved));
-        let alloc = kamy_codegen::allocate_registers(
-            &lifted.func,
-            &kamy_codegen::CALLEE_SAVED_GPRS,
-            &lifted.rsp_chain,
-            &lifted.reg_pins,
-        )
-        .unwrap();
-        assert_eq!(alloc.assignments[&result], PhysReg::Gpr(Gpr::Rax));
-        assert_ne!(alloc.assignments[&saved], PhysReg::Gpr(Gpr::Rax));
-        assert_ne!(alloc.assignments[&saved], PhysReg::Gpr(Gpr::Rdx));
-        let returned = execute_boundary_allocation(&lifted.func, &alloc, &[(41, 0)]);
-        assert_eq!(returned[&PhysReg::Gpr(Gpr::Rax)], 42);
-        let mut selected = kamy_codegen::select_instructions(
-            &lifted.func,
-            &alloc,
-            BASE,
-            BASE + u64::from(TEXT_RVA),
-            &kamy_codegen::callee_saved_used(&alloc),
-            &kamy_codegen::callee_saved_xmms_used(&alloc),
-        );
+        let alloc =
+            kamy_codegen::allocate_registers(&lifted.func, &lifted.rsp_chain, &lifted.reg_pins)
+                .unwrap();
+        let mut selected = kamy_codegen::select_instructions(&lifted.func, &alloc);
         kamy_codegen::bind_references(&mut selected, BASE, |symbol| {
             (symbol == &target).then_some(BASE + 0x2000)
         })
         .unwrap();
-        let encoded = kamy_codegen::relocate(&selected.instructions, BASE + 0x4000).unwrap();
+        let code_va = BASE + 0x4000;
+        let encoded = kamy_codegen::relocate(&selected.instructions, code_va).unwrap();
+        let returned = execute_boundary_code(&encoded, code_va, &[(41, 0)]);
+        assert_eq!(returned[&PhysReg::Gpr(Gpr::Rax)], 42);
         assert!(
             iced_x86::Decoder::new(64, &encoded, iced_x86::DecoderOptions::NONE)
                 .into_iter()
@@ -1702,7 +2012,7 @@ mod tests {
         mark_authored(&mut module, source.clone());
         let mut lifted = lift_function(&module, &func, &cc, &[]);
         assert!(!lifted.unsupported);
-        construct_ssa(&mut lifted);
+        construct_ssa(&mut lifted).unwrap();
         for register in [
             PhysReg::Gpr(Gpr::Rcx),
             PhysReg::Gpr(Gpr::R11),
@@ -1972,7 +2282,7 @@ mod tests {
             .count();
         assert!(iszero >= 2, "expected >=2 equality tests, got {iszero}");
         // No table reference survives: the dispatch keeps no indirect jump.
-        construct_ssa(&mut ir);
+        construct_ssa(&mut ir).unwrap();
         assert!(
             !ir.func
                 .blocks

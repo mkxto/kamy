@@ -13,6 +13,7 @@ pub(crate) struct LiftState<'a> {
     pub(crate) reg_pins: HashMap<ValueId, PhysReg>,
     pub(crate) unsupported: bool,
     pub(crate) noreturn: bool,
+    pub(crate) native_live_after_flags: Option<u32>,
     pub(crate) source: kamy_core::SymbolId,
     pub(crate) source_start: kamy_core::Rva,
     pub(crate) image_base: u64,
@@ -20,6 +21,7 @@ pub(crate) struct LiftState<'a> {
     pub(crate) operand_offsets: [u8; 5],
     pub(crate) operand_biases: [u8; 5],
     pub(crate) references: &'a [kamy_core::OperandReference],
+    pub(crate) symbols: &'a [kamy_core::Symbol],
     pub(crate) signature: Option<&'a kamy_core::ir::FnSignature>,
 }
 
@@ -57,6 +59,7 @@ impl<'a> LiftState<'a> {
             reg_pins,
             unsupported: false,
             noreturn: false,
+            native_live_after_flags: None,
             source: kamy_core::SymbolId::Host {
                 rva: kamy_core::Rva::ZERO,
             },
@@ -66,6 +69,7 @@ impl<'a> LiftState<'a> {
             operand_offsets: [0; 5],
             operand_biases: [0; 5],
             references: &[],
+            symbols: &[],
             signature: None,
         }
     }

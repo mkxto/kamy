@@ -26,20 +26,16 @@ pub enum RejectionReason {
     SymbolizationUncertain,
     /// Register allocator or instruction selector failed.
     CodegenFailure,
-    /// Transforms would require spills, violating the zero-spill constraint (D5).
-    RegisterPressure,
-    /// A branch/`setcc` consumes a variable-count shift flag (`shl cl;jc`): the
-    /// count lives in CL, which the zero-spill allocator does not model.
+    /// Logical RSP depends on an unprovable runtime value.
+    FrameDynamic,
+    /// Reachable stack states disagree or violate the call/return contract.
+    FrameConflict,
+    /// Frame arithmetic or an address displacement is not representable.
+    FrameOverflow,
+    /// The concrete frame exceeds the 16 MiB implementation bound.
+    FrameResourceLimit,
+    /// A flag dependency cannot be represented by the supported IR semantics.
     UnsupportedFlags,
-    /// Function calls its own entry; the lowered prologue would stack a second
-    /// frame on top of the original (D5 frame reconstruction pending).
-    SelfRecursive,
-    /// Reads or writes its caller's stack frame — the shadow-space home slots
-    /// or an incoming stack argument (a positive offset from the entry RSP).
-    /// The generated callee-saved push prologue shifts RSP, so those accesses
-    /// would land on the pushed registers; rejected until shrink-wrapping
-    /// reuses the function's own register saves (D5).
-    CallerFrameAccess,
     /// Excluded from SSA lowering by an explicit [`crate::FunctionSelector`].
     /// Its body remains resident; verified reference operands may be rebased.
     /// This is not an engine limitation.
@@ -93,10 +89,11 @@ impl RejectionReason {
             Self::StackTooLarge => "StackTooLarge",
             Self::SymbolizationUncertain => "SymbolizationUncertain",
             Self::CodegenFailure => "CodegenFailure",
-            Self::RegisterPressure => "RegisterPressure",
+            Self::FrameDynamic => "FrameDynamic",
+            Self::FrameConflict => "FrameConflict",
+            Self::FrameOverflow => "FrameOverflow",
+            Self::FrameResourceLimit => "FrameResourceLimit",
             Self::UnsupportedFlags => "UnsupportedFlags",
-            Self::SelfRecursive => "SelfRecursive",
-            Self::CallerFrameAccess => "CallerFrameAccess",
             Self::Deselected => "Deselected",
             Self::FallthroughToFunction => "FallthroughToFunction",
             Self::FarJump => "FarJump",

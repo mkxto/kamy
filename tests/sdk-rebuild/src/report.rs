@@ -228,6 +228,166 @@ pub struct Inspection {
     pub bss_rvas: Vec<(u32, u32)>,
 }
 
+pub(crate) fn inspect_allocation(function: &Value, require_homes: bool) -> Result<()> {
+    let lowered = function["lowered"]
+        .as_bool()
+        .context("missing lowered outcome")?;
+    let allocation = &function["allocation"];
+    if !lowered {
+        ensure!(
+            allocation.is_null(),
+            "unlowered function claims final allocation: {function}"
+        );
+        return Ok(());
+    }
+    ensure!(
+        allocation.is_object(),
+        "lowered function omitted concrete allocation: {function}"
+    );
+    let homes = number(allocation, "memory_homes")?;
+    let frame = number(allocation, "frame_size")?;
+    let maximum = number(allocation, "max_frame_size")?;
+    ensure!(
+        maximum != 0 && frame <= maximum,
+        "allocation exceeds concrete frame resource bound: {function}"
+    );
+    ensure!(
+        !require_homes || (homes != 0 && frame != 0),
+        "witness did not use memory-backed lowering: {function}"
+    );
+    ensure!(
+        number(allocation, "scratch_gprs")? <= 7 && number(allocation, "scratch_xmms")? <= 4,
+        "allocation exceeds the bounded memory-backed scratch working set: {function}"
+    );
+    ensure!(
+        number(allocation, "original_frame_size")? <= frame
+            && number(allocation, "outgoing_frame_size")? <= frame,
+        "reported frame zones exceed their containing allocation: {function}"
+    );
+    Ok(())
+}
+
+fn inspect_directory_storage(
+    before: &Pe,
+    pe: &Pe,
+    directory: &Value,
+    placements: &[Value],
+    functions: &[Value],
+    modules: &[&str],
+) -> Result<()> {
+    let index = usize::try_from(number(directory, "index")?)?;
+    ensure!(matches!(index, 3 | 5), "unexpected rebuilt directory index");
+    ensure!(
+        (number(directory, "rva")?, number(directory, "size")?) == pe.directories[index],
+        "reported directory does not target active PE directory {index}"
+    );
+    let name = if index == 3 {
+        "directory-3"
+    } else {
+        "directory-5"
+    };
+    let mut tables = placements.iter().filter(|placement| {
+        origin(placement).is_ok_and(|origin| origin == "generated")
+            && source_symbol(placement).is_ok_and(|symbol| symbol == name)
+            && placement.get("ownership").and_then(Value::as_str) != Some("retired")
+    });
+    if let Some(table) = tables.next() {
+        ensure!(
+            tables.next().is_none() && text(table, "ownership")? == "generated",
+            "expected one live generated directory-{index} placement, not an intermediate host-only table"
+        );
+        ensure!(
+            (number(table, "rva")?, number(table, "size")?) == pe.directories[index],
+            "live generated table storage is not the final active directory-{index}"
+        );
+        if before.directories[index].0 != pe.directories[index].0
+            && before.directories[index].1 != 0
+        {
+            ensure!(
+                placements.iter().any(|placement| {
+                    placement.get("ownership").and_then(Value::as_str) == Some("retired")
+                        && origin(placement).is_ok_and(|origin| origin == "host")
+                        && placement["symbol"]["host_source_rva"].as_u64()
+                            == Some(u64::from(before.directories[index].0))
+                        && placement["rva"].as_u64() == Some(u64::from(before.directories[index].0))
+                        && placement["size"].as_u64()
+                            == Some(u64::from(before.directories[index].1))
+                }),
+                "replaced original directory-{index} storage lacks explicit retired ownership"
+            );
+        }
+        return Ok(());
+    }
+    ensure!(
+        modules.is_empty()
+            && functions.iter().all(|function| {
+                function["lowered"].as_bool() == Some(false)
+                    && origin(function).is_ok_and(|origin| origin == "host")
+                    && placements
+                        .iter()
+                        .any(|placement| placement.get("symbol") == function.get("symbol"))
+            }),
+        "directory-{index} lacks generated storage despite emitted/injected functions"
+    );
+    let (rva, size) = before.directories[index];
+    ensure!(
+        rva != 0 && size != 0 && pe.directories[index] == (rva, size),
+        "directory-{index} without generated storage MUST retain the original active pointer/extent"
+    );
+    ensure!(
+        before.slice(rva, size as usize)? == pe.slice(rva, size as usize)?,
+        "retained directory-{index} table contents changed without generated ownership"
+    );
+    ensure!(
+        pe.image_base == before.image_base && pe.entry == before.entry,
+        "retained directory graph has a changed image base or entry point"
+    );
+    let contributions = array(directory, "contributions")?;
+    for record in placements.iter().chain(contributions) {
+        ensure!(
+            matches!(text(record, "ownership")?, "retained" | "resident")
+                && origin(record)? == "host"
+                && record["symbol"]["source_module"].is_null()
+                && number(&record["symbol"], "host_source_rva")? == number(record, "rva")?,
+            "directory-{index} without generated storage has non-retained/moved source ownership"
+        );
+    }
+    if index == 3 {
+        for contribution in contributions {
+            let mut owners = placements.iter().filter(|placement| {
+                ["symbol", "ownership", "rva", "size"]
+                    .iter()
+                    .all(|field| placement.get(field) == contribution.get(field))
+            });
+            ensure!(
+                owners.next().is_some() && owners.next().is_none(),
+                "retained runtime contribution lacks exactly one matching source/ownership placement"
+            );
+        }
+        for (begin, end, _) in before.runtime_ranges()? {
+            ensure!(
+                before.slice(begin, (end - begin) as usize)?
+                    == pe.slice(begin, (end - begin) as usize)?,
+                "retained Exception table covers modified host code without generated ownership"
+            );
+        }
+    } else {
+        ensure!(
+            contributions
+                .iter()
+                .all(|contribution| contribution["ownership"].as_str() == Some("retained")),
+            "original BaseReloc fields lack retained ownership"
+        );
+        for field in before.relocations()? {
+            ensure!(
+                before.qword(field)? == pe.qword(field)?,
+                "retained BaseReloc field changed without generated ownership"
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn inspect(
     original: &Path,
     output: &Path,
@@ -276,6 +436,7 @@ pub fn inspect(
     let relocations = pe.relocations()?;
     let directories = array(&report, "directories")?;
     let placements = array(&report, "placements")?;
+    let functions = array(&report, "functions")?;
     let mut probed = BTreeSet::new();
     let mut unwind_ranges = Vec::new();
     for index in [3u32, 5] {
@@ -290,11 +451,6 @@ pub fn inspect(
             "report MUST have one active directory contribution set for index {index}"
         );
         let directory = matching[0];
-        ensure!(
-            (number(directory, "rva")?, number(directory, "size")?)
-                == pe.directories[index as usize],
-            "reported directory does not target active PE directory {index}"
-        );
         let mut reported = BTreeSet::new();
         let mut origins = BTreeSet::new();
         let mut loader_runtime = false;
@@ -405,42 +561,7 @@ pub fn inspect(
                 "active BaseReloc fields differ from source-owned contributions"
             );
         }
-    }
-    for index in [3usize, 5] {
-        let name = format!("directory-{index}");
-        let tables: Vec<_> = placements
-            .iter()
-            .filter(|placement| {
-                origin(placement).is_ok_and(|origin| origin == "generated")
-                    && source_symbol(placement).is_ok_and(|symbol| symbol == name)
-                    && placement.get("ownership").and_then(Value::as_str) != Some("retired")
-            })
-            .collect();
-        ensure!(
-            tables.len() == 1,
-            "expected one live generated directory-{index} placement, not an intermediate host-only table"
-        );
-        ensure!(
-            (number(tables[0], "rva")?, number(tables[0], "size")?) == pe.directories[index],
-            "live generated table storage is not the final active directory-{index}"
-        );
-        if before.directories[index].0 != pe.directories[index].0
-            && before.directories[index].1 != 0
-        {
-            ensure!(
-                placements.iter().any(|placement| {
-                    placement.get("ownership").and_then(Value::as_str) == Some("retired")
-                        && placement
-                            .get("symbol")
-                            .and_then(|symbol| symbol.get("host_source_rva"))
-                            .and_then(Value::as_u64)
-                            == Some(u64::from(before.directories[index].0))
-                        && placement.get("size").and_then(Value::as_u64)
-                            == Some(u64::from(before.directories[index].1))
-                }),
-                "replaced original directory-{index} storage lacks explicit retired ownership"
-            );
-        }
+        inspect_directory_storage(&before, &pe, directory, placements, functions, modules)?;
     }
     let mut bss_rvas = Vec::new();
     let mut saw_read_only = false;
@@ -614,7 +735,8 @@ pub fn inspect(
             .all(|module| mapped_modules.contains(*module)),
         "map omitted an injected module instance"
     );
-    for function in array(&report, "functions")? {
+    for function in functions {
+        inspect_allocation(function, false)?;
         if identity {
             ensure!(
                 function.get("transformed").and_then(Value::as_bool) == Some(false),
@@ -651,4 +773,284 @@ pub fn inspect(
         unwind_ranges: unwind_ranges.join(","),
         bss_rvas,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pe::Section;
+    use serde_json::json;
+
+    fn host_record(rva: u32, size: u32, ownership: &str) -> Value {
+        json!({
+            "symbol": {
+                "origin": "host",
+                "source_module": null,
+                "source_symbol": format!("host:{rva:#010x}"),
+                "host_source_rva": rva,
+            },
+            "ownership": ownership,
+            "rva": rva,
+            "size": size,
+        })
+    }
+
+    fn retained_graph() -> (Pe, Vec<Value>, Vec<Value>, [Value; 2]) {
+        let mut bytes = vec![0; 0x800];
+        bytes[..9].copy_from_slice(&[0x48, 0x83, 0xec, 0x28, 0x48, 0x83, 0xc4, 0x28, 0xc3]);
+        bytes[0x10..0x13].copy_from_slice(&[0x53, 0x5b, 0xc3]);
+        bytes[0x200..0x208].copy_from_slice(&0x0001_8000_2010u64.to_le_bytes());
+        bytes[0x300..0x310]
+            .copy_from_slice(&[1, 4, 1, 0, 4, 0x42, 0, 0, 1, 1, 1, 0, 1, 0x30, 0, 0]);
+        for (offset, value) in [0x1000u32, 0x1009, 0x2100, 0x1010, 0x1013, 0x2108]
+            .into_iter()
+            .enumerate()
+        {
+            bytes[0x400 + offset * 4..0x404 + offset * 4].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes[0x600..0x60c].copy_from_slice(&[0, 0x20, 0, 0, 12, 0, 0, 0, 0, 0xa0, 0, 0]);
+        let mut directories = [(0, 0); 16];
+        directories[3] = (0x3000, 24);
+        directories[5] = (0x4000, 12);
+        let pe = Pe {
+            bytes,
+            image_base: 0x0001_8000_0000,
+            entry: 0x1000,
+            image_size: 0x5000,
+            sections: [".text", ".rdata", ".pdata", ".reloc"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| Section {
+                    name: name.to_owned(),
+                    rva: (index as u32 + 1) * 0x1000,
+                    virtual_size: 0x200,
+                    raw_size: 0x200,
+                    raw: index as u32 * 0x200,
+                    flags: if index == 0 { 0x6000_0020 } else { 0x4000_0040 },
+                })
+                .collect(),
+            directories,
+        };
+        let placements = vec![
+            host_record(0x1000, 9, "resident"),
+            host_record(0x1010, 3, "retained"),
+        ];
+        let functions = placements
+            .iter()
+            .map(|placement| json!({"symbol": placement["symbol"], "lowered": false}))
+            .collect();
+        let exception = json!({
+            "index": 3, "rva": 0x3000, "size": 24, "contributions": placements,
+        });
+        let relocations = json!({
+            "index": 5, "rva": 0x4000, "size": 12,
+            "contributions": [host_record(0x2000, 8, "retained")],
+        });
+        (pe, placements, functions, [exception, relocations])
+    }
+
+    fn copy_pe(pe: &Pe) -> Pe {
+        Pe {
+            bytes: pe.bytes.clone(),
+            image_base: pe.image_base,
+            entry: pe.entry,
+            image_size: pe.image_size,
+            sections: pe.sections.clone(),
+            directories: pe.directories,
+        }
+    }
+
+    #[test]
+    fn unchanged_host_graph_retains_nonempty_original_tables() {
+        let (before, placements, functions, directories) = retained_graph();
+        for directory in &directories {
+            inspect_directory_storage(&before, &before, directory, &placements, &functions, &[])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn retained_tables_require_unmoved_host_ownership_and_no_emission() {
+        let (before, placements, functions, directories) = retained_graph();
+        let mut moved = placements.clone();
+        moved[0]["rva"] = json!(0x1020);
+        let mut generated = placements.clone();
+        generated[0]["ownership"] = json!("generated");
+        let mut lowered = functions.clone();
+        lowered[0]["lowered"] = json!(true);
+        for directory in &directories {
+            for invalid in [moved.as_slice(), generated.as_slice(), &placements[1..]] {
+                assert!(
+                    inspect_directory_storage(
+                        &before,
+                        &before,
+                        directory,
+                        invalid,
+                        &functions,
+                        &[]
+                    )
+                    .is_err()
+                );
+            }
+            assert!(
+                inspect_directory_storage(&before, &before, directory, &placements, &lowered, &[])
+                    .is_err()
+            );
+            assert!(
+                inspect_directory_storage(
+                    &before,
+                    &before,
+                    directory,
+                    &placements,
+                    &functions,
+                    &["injected"],
+                )
+                .is_err()
+            );
+            let mut invalid = directory.clone();
+            invalid["contributions"][0]["ownership"] = json!("retired");
+            assert!(
+                inspect_directory_storage(&before, &before, &invalid, &placements, &functions, &[])
+                    .is_err()
+            );
+        }
+        let mut inconsistent = directories[0].clone();
+        inconsistent["contributions"][0]["ownership"] = json!("retained");
+        assert!(
+            inspect_directory_storage(
+                &before,
+                &before,
+                &inconsistent,
+                &placements,
+                &functions,
+                &[]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn retained_tables_reject_changed_pointers_contents_code_and_fixups() {
+        let (before, placements, functions, directories) = retained_graph();
+        for directory in &directories {
+            let index = number(directory, "index").unwrap() as usize;
+            let mut changed = copy_pe(&before);
+            changed.directories[index].0 += 4;
+            assert!(
+                inspect_directory_storage(
+                    &before,
+                    &changed,
+                    directory,
+                    &placements,
+                    &functions,
+                    &[]
+                )
+                .is_err()
+            );
+            let mut changed = copy_pe(&before);
+            let raw = if index == 3 { 0x400 } else { 0x600 };
+            changed.bytes[raw] ^= 1;
+            assert!(
+                inspect_directory_storage(
+                    &before,
+                    &changed,
+                    directory,
+                    &placements,
+                    &functions,
+                    &[]
+                )
+                .is_err()
+            );
+        }
+        for (directory, raw) in [(&directories[0], 0), (&directories[1], 0x200)] {
+            let mut changed = copy_pe(&before);
+            changed.bytes[raw] ^= 1;
+            assert!(
+                inspect_directory_storage(
+                    &before,
+                    &changed,
+                    directory,
+                    &placements,
+                    &functions,
+                    &[]
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn generated_tables_require_one_exact_active_owner_and_retire_original_storage() {
+        let (before, mut placements, functions, directories) = retained_graph();
+        for directory in &directories {
+            let index = number(directory, "index").unwrap() as usize;
+            let (rva, size) = before.directories[index];
+            let mut pe = copy_pe(&before);
+            pe.directories[index].0 += 0x20;
+            let raw = if index == 3 { 0x400 } else { 0x600 };
+            pe.bytes.copy_within(raw..raw + size as usize, raw + 0x20);
+            let mut active = directory.clone();
+            active["rva"] = json!(rva + 0x20);
+            let table = json!({
+                "symbol": {
+                    "origin": "generated", "source_module": null,
+                    "source_symbol": format!("directory-{index}"), "host_source_rva": null,
+                },
+                "ownership": "generated", "rva": rva + 0x20, "size": size,
+            });
+            let original_len = placements.len();
+            placements.push(table.clone());
+            assert!(
+                inspect_directory_storage(
+                    &before,
+                    &pe,
+                    &active,
+                    &placements,
+                    &functions,
+                    &["module"]
+                )
+                .is_err()
+            );
+            placements.push(host_record(rva, size, "retired"));
+            inspect_directory_storage(&before, &pe, &active, &placements, &functions, &["module"])
+                .unwrap();
+            assert!(
+                inspect_directory_storage(
+                    &before,
+                    &pe,
+                    directory,
+                    &placements,
+                    &functions,
+                    &["module"]
+                )
+                .is_err()
+            );
+            placements.push(table);
+            assert!(
+                inspect_directory_storage(
+                    &before,
+                    &pe,
+                    &active,
+                    &placements,
+                    &functions,
+                    &["module"]
+                )
+                .is_err()
+            );
+            placements.pop();
+            placements[original_len]["rva"] = json!(rva);
+            assert!(
+                inspect_directory_storage(
+                    &before,
+                    &pe,
+                    &active,
+                    &placements,
+                    &functions,
+                    &["module"]
+                )
+                .is_err()
+            );
+            placements.truncate(original_len);
+        }
+    }
 }

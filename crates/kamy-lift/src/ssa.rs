@@ -1,4 +1,5 @@
 use kamy_core::ir::*;
+use kamy_core::{FrameAnalysis, RejectionReason};
 
 use crate::LiftResult;
 
@@ -35,7 +36,185 @@ fn replace_in_block(block: &mut IrBlock, old: ValueId, new: ValueId) {
     }
 }
 
-pub fn construct_ssa(result: &mut LiftResult) {
+fn scalar_frame_operands(inst: &Inst, analysis: &FrameAnalysis) -> bool {
+    // An unknown operand can alias a relocated frame object, so both sides must share coordinates.
+    matches!(
+        inst.op,
+        IrOp::Sub | IrOp::BorrowSub | IrOp::OverflowSub | IrOp::AuxBorrowSub
+    ) && inst.args.len() == 2
+        && inst.args.iter().all(|value| {
+            analysis.offsets.contains_key(value) || analysis.pointer_bounds.contains_key(value)
+        })
+}
+
+pub fn construct_ssa(result: &mut LiftResult) -> Result<(), RejectionReason> {
+    construct_graph(result)?;
+    let analysis = FrameAnalysis::analyze(&result.func, &result.rsp_chain, &result.reg_pins)?;
+    let mut next_value = result.func.next_value;
+    for block in &mut result.func.blocks {
+        for inst in &mut block.insts {
+            if let Some(delta) = inst.dest.and_then(|value| analysis.offsets.get(&value)) {
+                inst.op = IrOp::FrameAddress(*delta);
+                inst.args.clear();
+            } else if let Some(indexed) = inst
+                .dest
+                .and_then(|value| analysis.indexed_offsets.get(&value))
+            {
+                inst.op = IrOp::FrameIndex {
+                    displacement: indexed.displacement,
+                    subtract: indexed.subtract,
+                    bounds: indexed.bounds,
+                };
+                inst.args.clear();
+                inst.args.extend([indexed.base, indexed.index]);
+            } else if let Some((source, offset)) = inst
+                .dest
+                .and_then(|value| analysis.derived_offsets.get(&value))
+            {
+                inst.op = IrOp::FrameOffset(*offset);
+                inst.args.clear();
+                inst.args.push(*source);
+            }
+        }
+        let alias_count = block
+            .phis
+            .iter()
+            .filter(|phi| analysis.offsets.contains_key(&phi.dest))
+            .count();
+        if alias_count != 0 {
+            let mut insts = Vec::with_capacity(alias_count + block.insts.len());
+            insts.extend(block.phis.iter().filter_map(|phi| {
+                analysis.offsets.get(&phi.dest).map(|delta| Inst {
+                    dest: Some(phi.dest),
+                    op: IrOp::FrameAddress(*delta),
+                    args: vec![],
+                    ty: IrType::I64,
+                })
+            }));
+            block
+                .phis
+                .retain(|phi| !analysis.offsets.contains_key(&phi.dest));
+            insts.append(&mut block.insts);
+            block.insts = insts;
+        }
+        let induction_count = block
+            .phis
+            .iter()
+            .filter(|phi| analysis.induction_bounds.contains_key(&phi.dest))
+            .count();
+        if induction_count != 0 {
+            let zero = ValueId(next_value);
+            next_value = next_value
+                .checked_add(1)
+                .ok_or(RejectionReason::FrameOverflow)?;
+            let mut insts = Vec::with_capacity(block.insts.len() + induction_count + 1);
+            insts.push(Inst {
+                dest: Some(zero),
+                op: IrOp::Const(0),
+                args: vec![],
+                ty: IrType::I64,
+            });
+            for phi in &mut block.phis {
+                let Some(&bounds) = analysis.induction_bounds.get(&phi.dest) else {
+                    continue;
+                };
+                let dest = phi.dest;
+                phi.dest = ValueId(next_value);
+                next_value = next_value
+                    .checked_add(1)
+                    .ok_or(RejectionReason::FrameOverflow)?;
+                insts.push(Inst {
+                    dest: Some(dest),
+                    op: IrOp::FrameIndex {
+                        displacement: 0,
+                        subtract: false,
+                        bounds,
+                    },
+                    args: vec![phi.dest, zero],
+                    ty: IrType::I64,
+                });
+            }
+            insts.append(&mut block.insts);
+            block.insts = insts;
+        }
+    }
+    for block in &mut result.func.blocks {
+        let extra = block
+            .insts
+            .iter()
+            .filter(|inst| scalar_frame_operands(inst, &analysis))
+            .flat_map(|inst| &inst.args)
+            .count();
+        if extra == 0 {
+            continue;
+        }
+        let mut insts = Vec::with_capacity(block.insts.len() + extra);
+        let mut logical_values = std::collections::HashMap::new();
+        for mut inst in std::mem::take(&mut block.insts) {
+            if scalar_frame_operands(&inst, &analysis) {
+                for value in &mut inst.args {
+                    let logical = if let Some(&logical) = logical_values.get(value) {
+                        logical
+                    } else {
+                        let logical = ValueId(next_value);
+                        next_value = next_value
+                            .checked_add(1)
+                            .ok_or(RejectionReason::FrameOverflow)?;
+                        insts.push(Inst {
+                            dest: Some(logical),
+                            op: IrOp::FrameLogical,
+                            args: vec![*value],
+                            ty: IrType::I64,
+                        });
+                        logical_values.insert(*value, logical);
+                        logical
+                    };
+                    *value = logical;
+                }
+            }
+            insts.push(inst);
+        }
+        block.insts = insts;
+    }
+    result.func.next_value = next_value;
+    if analysis.original_size != 0 {
+        let delta = -i64::from(analysis.original_size);
+        let entry = result.func.block(result.func.entry);
+        let rooted = entry.insts.windows(2).any(|pair| {
+            matches!(pair[0].op, IrOp::FrameAddress(offset) if offset == delta)
+                && matches!(pair[1].op, IrOp::Use)
+                && pair[1].args.as_slice() == pair[0].dest.as_slice()
+        });
+        if !rooted {
+            result
+                .func
+                .next_value
+                .checked_add(2)
+                .ok_or(RejectionReason::FrameOverflow)?;
+            let value = result.func.alloc_value();
+            result.func.block_mut(result.func.entry).insts.splice(
+                0..0,
+                [
+                    Inst {
+                        dest: Some(value),
+                        op: IrOp::FrameAddress(delta),
+                        args: vec![],
+                        ty: IrType::I64,
+                    },
+                    Inst {
+                        dest: None,
+                        op: IrOp::Use,
+                        args: vec![value],
+                        ty: IrType::I64,
+                    },
+                ],
+            );
+        }
+    }
+    Ok(())
+}
+
+fn construct_graph(result: &mut LiftResult) -> Result<(), RejectionReason> {
     let num_blocks = result.func.blocks.len();
 
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
@@ -78,7 +257,8 @@ pub fn construct_ssa(result: &mut LiftResult) {
                 let old = result.block_entry[bi][r];
                 let new = result.block_exit[pred_idx][r];
                 if old != new {
-                    resolve_entry(&mut result.func, &mut result.reg_pins, bi, old, new);
+                    resolve_entry(result, bi, old, new);
+                    result.block_entry[bi][r] = new;
                     propagate_exit(&mut result.block_exit[bi], old, new);
                 }
             }
@@ -92,10 +272,16 @@ pub fn construct_ssa(result: &mut LiftResult) {
 
                 if all_same {
                     if old != first_val {
-                        resolve_entry(&mut result.func, &mut result.reg_pins, bi, old, first_val);
+                        resolve_entry(result, bi, old, first_val);
+                        result.block_entry[bi][r] = first_val;
                         propagate_exit(&mut result.block_exit[bi], old, first_val);
                     }
                 } else {
+                    result
+                        .func
+                        .next_value
+                        .checked_add(1)
+                        .ok_or(RejectionReason::FrameOverflow)?;
                     let new_vid = result.func.alloc_value();
                     let ty = reg_type(r);
                     let phi_args: Vec<(BlockId, ValueId)> = block_preds
@@ -109,12 +295,14 @@ pub fn construct_ssa(result: &mut LiftResult) {
                     });
                     // The back-edge arg may reference `old`; threading it here turns
                     // a loop-carried pass-through into a proper self-referential phi.
-                    resolve_entry(&mut result.func, &mut result.reg_pins, bi, old, new_vid);
+                    resolve_entry(result, bi, old, new_vid);
+                    result.block_entry[bi][r] = new_vid;
                     propagate_exit(&mut result.block_exit[bi], old, new_vid);
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// After a block-entry value is resolved to its incoming definition, any register
@@ -135,26 +323,17 @@ fn propagate_exit(exit: &mut [ValueId; 38], old: ValueId, new: ValueId) {
 /// placeholders are unique per block/register, so a global phi-arg rewrite only
 /// touches genuine references (issue #24).
 ///
-/// A placeholder carries a `reg_pins` entry when a lift-time consumer required it
-/// in a fixed register — a call argument bound to its ABI register, or a
-/// NativeInline read. For a cross-block value that binding lives on the
-/// placeholder, not on the incoming definition, so transfer it to `new` or the
-/// pin is orphaned and the allocator is free to place the argument off its ABI
-/// register (issue #23: `FlsFree(dwTlsIndex)` received `-1`). Keep any pin `new`
-/// already has: a distinct required register for the same value is a real
-/// conflict the allocator resolves (reject), never silently overwritten.
-fn resolve_entry(
-    func: &mut IrFunction,
-    reg_pins: &mut std::collections::HashMap<ValueId, PhysReg>,
-    bi: usize,
-    old: ValueId,
-    new: ValueId,
-) {
-    if let Some(&p) = reg_pins.get(&old) {
-        reg_pins.entry(new).or_insert(p);
+/// Physical boundary constraints and logical RSP identity follow the resolved
+/// definition; dead placeholders must not remain frame-analysis seeds.
+fn resolve_entry(result: &mut LiftResult, bi: usize, old: ValueId, new: ValueId) {
+    if let Some(p) = result.reg_pins.remove(&old) {
+        result.reg_pins.entry(new).or_insert(p);
     }
-    replace_in_block(&mut func.blocks[bi], old, new);
-    for (j, block) in func.blocks.iter_mut().enumerate() {
+    if result.rsp_chain.remove(&old) {
+        result.rsp_chain.insert(new);
+    }
+    replace_in_block(&mut result.func.blocks[bi], old, new);
+    for (j, block) in result.func.blocks.iter_mut().enumerate() {
         if j == bi {
             continue;
         }
@@ -302,7 +481,7 @@ mod tests {
             unsupported: false,
         };
 
-        construct_ssa(&mut result);
+        construct_graph(&mut result).unwrap();
 
         for inst in &result.func.blocks[1].insts {
             for arg in &inst.args {
@@ -401,7 +580,7 @@ mod tests {
             unsupported: false,
         };
 
-        construct_ssa(&mut result);
+        construct_graph(&mut result).unwrap();
 
         assert_eq!(result.func.blocks[1].insts[0].args[0], add_result);
         assert_eq!(
@@ -543,7 +722,7 @@ mod tests {
             unsupported: false,
         };
 
-        construct_ssa(&mut result);
+        construct_graph(&mut result).unwrap();
 
         let block_d = &result.func.blocks[3];
 
@@ -684,7 +863,7 @@ mod tests {
             unsupported: false,
         };
 
-        construct_ssa(&mut result);
+        construct_graph(&mut result).unwrap();
 
         for block in &result.func.blocks {
             for phi in &block.phis {
@@ -716,6 +895,399 @@ mod tests {
         assert_eq!(
             back_arg, header_phi.dest,
             "loop-invariant back-edge arg must be the self-referential phi, not Undef"
+        );
+    }
+
+    #[test]
+    fn logical_rsp_phi_is_canonical_and_extent_survives_dce() {
+        let rsp = Gpr::Rsp.index();
+        let mut entry = [ValueId(100); 38];
+        entry[rsp] = ValueId(0);
+        let mut entry_exit = entry;
+        entry_exit[rsp] = ValueId(2);
+        let mut header = [ValueId(200); 38];
+        header[rsp] = ValueId(3);
+        let mut header_exit = header;
+        header_exit[rsp] = ValueId(5);
+        let mut exit = [ValueId(300); 38];
+        exit[rsp] = ValueId(7);
+        let mut exit_exit = exit;
+        exit_exit[rsp] = ValueId(8);
+        let inst = |dest, op, args| Inst {
+            dest: Some(ValueId(dest)),
+            op,
+            args,
+            ty: IrType::I64,
+        };
+        let mut result = LiftResult {
+            func: IrFunction {
+                entry: BlockId(0),
+                next_value: 400,
+                blocks: vec![
+                    IrBlock {
+                        id: BlockId(0),
+                        phis: vec![],
+                        insts: vec![
+                            undef_inst(ValueId(0), IrType::I64),
+                            inst(1, IrOp::Const(40), vec![]),
+                            inst(2, IrOp::Sub, vec![ValueId(0), ValueId(1)]),
+                        ],
+                        term: IrTerminator::Jump(BlockId(1)),
+                    },
+                    IrBlock {
+                        id: BlockId(1),
+                        phis: vec![],
+                        insts: vec![
+                            undef_inst(ValueId(3), IrType::I64),
+                            inst(4, IrOp::Const(0), vec![]),
+                            inst(5, IrOp::Add, vec![ValueId(3), ValueId(4)]),
+                            inst(6, IrOp::Const(0), vec![]),
+                        ],
+                        term: IrTerminator::Branch {
+                            cond: ValueId(6),
+                            taken: BlockId(1),
+                            not_taken: BlockId(2),
+                        },
+                    },
+                    IrBlock {
+                        id: BlockId(2),
+                        phis: vec![],
+                        insts: vec![
+                            undef_inst(ValueId(7), IrType::I64),
+                            inst(8, IrOp::Add, vec![ValueId(7), ValueId(1)]),
+                            Inst {
+                                dest: None,
+                                op: IrOp::Use,
+                                args: vec![ValueId(8)],
+                                ty: IrType::I64,
+                            },
+                        ],
+                        term: IrTerminator::Ret,
+                    },
+                ],
+            },
+            block_entry: vec![entry, header, exit],
+            block_exit: vec![entry_exit, header_exit, exit_exit],
+            rsp_chain: [0, 2, 3, 5, 7, 8].into_iter().map(ValueId).collect(),
+            reg_pins: std::collections::HashMap::new(),
+            unsupported: false,
+        };
+        construct_ssa(&mut result).unwrap();
+        let header_rsp = result.block_entry[1][rsp];
+        assert!(result.rsp_chain.contains(&header_rsp));
+        assert!(!result.rsp_chain.contains(&ValueId(3)));
+        assert!(!result.rsp_chain.contains(&ValueId(7)));
+        assert!(result.func.blocks[1].insts.iter().any(|inst| {
+            inst.dest == Some(header_rsp) && matches!(inst.op, IrOp::FrameAddress(-40))
+        }));
+        assert!(
+            !result.func.blocks[1]
+                .phis
+                .iter()
+                .any(|phi| phi.dest == header_rsp)
+        );
+        kamy_transforms::optimize(&mut result.func);
+        let analysis =
+            FrameAnalysis::analyze(&result.func, &result.rsp_chain, &result.reg_pins).unwrap();
+        assert_eq!(analysis.original_size, 40);
+    }
+
+    #[test]
+    fn synthetic_frame_extent_ids_are_checked() {
+        for next_value in [u32::MAX - 1, u32::MAX] {
+            let make = |extent| {
+                let mut insts = vec![Inst {
+                    dest: Some(ValueId(0)),
+                    op: IrOp::FrameAddress(0),
+                    args: vec![],
+                    ty: IrType::I64,
+                }];
+                if extent {
+                    insts.push(Inst {
+                        dest: Some(ValueId(1)),
+                        op: IrOp::FrameAddress(-8),
+                        args: vec![],
+                        ty: IrType::I64,
+                    });
+                }
+                insts.push(Inst {
+                    dest: None,
+                    op: IrOp::Use,
+                    args: vec![ValueId(0)],
+                    ty: IrType::I64,
+                });
+                LiftResult {
+                    func: IrFunction {
+                        entry: BlockId(0),
+                        next_value,
+                        blocks: vec![IrBlock {
+                            id: BlockId(0),
+                            phis: vec![],
+                            insts,
+                            term: IrTerminator::Ret,
+                        }],
+                    },
+                    block_entry: vec![[ValueId(0); 38]],
+                    block_exit: vec![[ValueId(0); 38]],
+                    rsp_chain: [ValueId(0)].into_iter().collect(),
+                    reg_pins: std::collections::HashMap::new(),
+                    unsupported: false,
+                }
+            };
+            let mut framed = make(true);
+            assert_eq!(
+                construct_ssa(&mut framed),
+                Err(RejectionReason::FrameOverflow)
+            );
+            let mut frameless = make(false);
+            construct_ssa(&mut frameless).unwrap();
+            assert_eq!(frameless.func.next_value, next_value);
+        }
+    }
+
+    #[test]
+    fn finite_frame_offsets_survive_mba_without_excluding_data_arithmetic() {
+        use kamy_transforms::mba::{MbaBitwidths, MbaConfig, MbaSemantics};
+
+        let inst = |dest, op, args| Inst {
+            dest: Some(ValueId(dest)),
+            op,
+            args,
+            ty: IrType::I64,
+        };
+        let mut result = LiftResult {
+            func: IrFunction {
+                entry: BlockId(0),
+                next_value: 64,
+                blocks: vec![
+                    IrBlock {
+                        id: BlockId(0),
+                        phis: vec![],
+                        insts: vec![
+                            inst(20, IrOp::FrameAddress(0), vec![]),
+                            inst(0, IrOp::FrameAddress(-8), vec![]),
+                            inst(1, IrOp::FrameAddress(-16), vec![]),
+                            inst(2, IrOp::Undef, vec![]),
+                            inst(10, IrOp::Undef, vec![]),
+                        ],
+                        term: IrTerminator::Branch {
+                            cond: ValueId(2),
+                            taken: BlockId(1),
+                            not_taken: BlockId(2),
+                        },
+                    },
+                    IrBlock {
+                        id: BlockId(1),
+                        phis: vec![],
+                        insts: vec![],
+                        term: IrTerminator::Jump(BlockId(3)),
+                    },
+                    IrBlock {
+                        id: BlockId(2),
+                        phis: vec![],
+                        insts: vec![],
+                        term: IrTerminator::Jump(BlockId(3)),
+                    },
+                    IrBlock {
+                        id: BlockId(3),
+                        phis: vec![Phi {
+                            dest: ValueId(3),
+                            ty: IrType::I64,
+                            args: vec![(BlockId(1), ValueId(0)), (BlockId(2), ValueId(1))],
+                        }],
+                        insts: vec![
+                            inst(4, IrOp::Copy, vec![ValueId(3)]),
+                            inst(5, IrOp::Const((-16i64) as u64), vec![]),
+                            inst(6, IrOp::Add, vec![ValueId(4), ValueId(5)]),
+                            inst(7, IrOp::Load, vec![ValueId(6)]),
+                            inst(9, IrOp::Add, vec![ValueId(10), ValueId(5)]),
+                            Inst {
+                                dest: None,
+                                op: IrOp::Use,
+                                args: vec![ValueId(7), ValueId(9)],
+                                ty: IrType::I64,
+                            },
+                            Inst {
+                                dest: None,
+                                op: IrOp::Use,
+                                args: vec![ValueId(20)],
+                                ty: IrType::I64,
+                            },
+                        ],
+                        term: IrTerminator::Ret,
+                    },
+                ],
+            },
+            block_entry: vec![[ValueId(20); 38]; 4],
+            block_exit: vec![[ValueId(20); 38]; 4],
+            rsp_chain: [ValueId(20)].into_iter().collect(),
+            reg_pins: std::collections::HashMap::new(),
+            unsupported: false,
+        };
+        construct_ssa(&mut result).unwrap();
+        let pass = kamy_transforms::MbaPass {
+            seed: 7,
+            config: MbaConfig {
+                iterations: 2,
+                probability: 100,
+                semantics: MbaSemantics {
+                    add: true,
+                    sub: true,
+                    xor: true,
+                },
+                bitwidths: MbaBitwidths {
+                    bit64: true,
+                    ..MbaBitwidths::default()
+                },
+            },
+        };
+        assert!(pass.run_with_intensity(&mut result.func, 1.0));
+        let block = &result.func.blocks[3];
+        let address = block
+            .insts
+            .iter()
+            .find(|inst| inst.dest == Some(ValueId(6)))
+            .unwrap();
+        assert!(matches!(address.op, IrOp::FrameOffset(-16)));
+        assert_eq!(address.args, [ValueId(4)]);
+        let data = block
+            .insts
+            .iter()
+            .find(|inst| inst.dest == Some(ValueId(9)))
+            .unwrap();
+        assert_ne!(data.args.as_slice(), &[ValueId(10), ValueId(5)]);
+        let analysis =
+            FrameAnalysis::analyze(&result.func, &result.rsp_chain, &result.reg_pins).unwrap();
+        assert_eq!(analysis.original_size, 40);
+        assert_eq!(analysis.derived_offsets[&ValueId(6)], (ValueId(4), -16));
+    }
+
+    #[test]
+    fn scalar_coordinates_require_a_fully_proved_subtractive_pair() {
+        use kamy_transforms::mba::{MbaBitwidths, MbaConfig, MbaSemantics};
+
+        let inst = |dest, op, args| Inst {
+            dest: Some(ValueId(dest)),
+            ty: if matches!(
+                op,
+                IrOp::BorrowSub | IrOp::OverflowSub | IrOp::AuxBorrowSub | IrOp::IsZero
+            ) {
+                IrType::I8
+            } else {
+                IrType::I64
+            },
+            op,
+            args,
+        };
+        let mut result = LiftResult {
+            func: IrFunction {
+                entry: BlockId(0),
+                next_value: 32,
+                blocks: vec![IrBlock {
+                    id: BlockId(0),
+                    phis: vec![],
+                    insts: vec![
+                        inst(0, IrOp::FrameAddress(0), vec![]),
+                        inst(1, IrOp::FrameAddress(-8), vec![]),
+                        inst(2, IrOp::FrameAddress(16), vec![]),
+                        inst(3, IrOp::Undef, vec![]),
+                        inst(4, IrOp::Const(8), vec![]),
+                        inst(5, IrOp::Sub, vec![ValueId(3), ValueId(1)]),
+                        inst(6, IrOp::Sub, vec![ValueId(1), ValueId(3)]),
+                        inst(7, IrOp::Sub, vec![ValueId(2), ValueId(1)]),
+                        inst(8, IrOp::BorrowSub, vec![ValueId(3), ValueId(1)]),
+                        inst(9, IrOp::OverflowSub, vec![ValueId(1), ValueId(3)]),
+                        inst(10, IrOp::AuxBorrowSub, vec![ValueId(3), ValueId(1)]),
+                        inst(11, IrOp::BorrowSub, vec![ValueId(2), ValueId(1)]),
+                        inst(12, IrOp::Sub, vec![ValueId(3), ValueId(4)]),
+                        inst(13, IrOp::Sub, vec![ValueId(1), ValueId(4)]),
+                        inst(14, IrOp::IsZero, vec![ValueId(1)]),
+                        inst(15, IrOp::OverflowSub, vec![ValueId(2), ValueId(1)]),
+                        inst(16, IrOp::AuxBorrowSub, vec![ValueId(2), ValueId(1)]),
+                        Inst {
+                            dest: None,
+                            op: IrOp::Use,
+                            args: (5..=16).map(ValueId).collect(),
+                            ty: IrType::I64,
+                        },
+                    ],
+                    term: IrTerminator::Ret,
+                }],
+            },
+            block_entry: vec![[ValueId(0); 38]],
+            block_exit: vec![[ValueId(0); 38]],
+            rsp_chain: [ValueId(0)].into_iter().collect(),
+            reg_pins: std::collections::HashMap::new(),
+            unsupported: false,
+        };
+        construct_ssa(&mut result).unwrap();
+        let block = &result.func.blocks[0];
+        let find = |dest| {
+            block
+                .insts
+                .iter()
+                .find(|inst| inst.dest == Some(ValueId(dest)))
+                .unwrap()
+        };
+        for (dest, args) in [
+            (5, vec![ValueId(3), ValueId(1)]),
+            (6, vec![ValueId(1), ValueId(3)]),
+            (8, vec![ValueId(3), ValueId(1)]),
+            (9, vec![ValueId(1), ValueId(3)]),
+            (10, vec![ValueId(3), ValueId(1)]),
+            (12, vec![ValueId(3), ValueId(4)]),
+            (14, vec![ValueId(1)]),
+        ] {
+            assert_eq!(find(dest).args, args);
+        }
+        assert!(matches!(find(13).op, IrOp::FrameAddress(-16)));
+        let logical: std::collections::HashMap<_, _> = block
+            .insts
+            .iter()
+            .filter(|inst| matches!(inst.op, IrOp::FrameLogical))
+            .map(|inst| (inst.args[0], inst.dest.unwrap()))
+            .collect();
+        assert_eq!(logical.len(), 2);
+        for dest in [7, 11, 15, 16] {
+            assert_eq!(
+                find(dest).args,
+                [logical[&ValueId(2)], logical[&ValueId(1)]]
+            );
+        }
+        let pass = kamy_transforms::MbaPass {
+            seed: 7,
+            config: MbaConfig {
+                iterations: 2,
+                probability: 100,
+                semantics: MbaSemantics {
+                    add: true,
+                    sub: true,
+                    xor: true,
+                },
+                bitwidths: MbaBitwidths {
+                    bit64: true,
+                    ..MbaBitwidths::default()
+                },
+            },
+        };
+        assert!(pass.run_with_intensity(&mut result.func, 1.0));
+        for (dest, args) in [
+            (5, [ValueId(3), ValueId(1)]),
+            (6, [ValueId(1), ValueId(3)]),
+            (12, [ValueId(3), ValueId(4)]),
+        ] {
+            let transformed = result.func.blocks[0]
+                .insts
+                .iter()
+                .find(|inst| inst.dest == Some(ValueId(dest)))
+                .unwrap();
+            assert_ne!(transformed.args, args);
+        }
+        assert!(
+            result.func.blocks[0]
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.op, IrOp::FrameLogical))
         );
     }
 }

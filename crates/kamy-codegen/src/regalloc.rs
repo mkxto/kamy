@@ -1,50 +1,32 @@
 use std::collections::{HashMap, HashSet};
 
-use kamy_core::RejectionReason;
-use kamy_core::ir::{
-    BlockId, Gpr, IrFunction, IrOp, IrTerminator, IrType, PhysReg, ValueId, XmmReg,
+use iced_x86::{
+    Code, Decoder, DecoderOptions, FlowControl, InstructionInfoFactory, OpKind, Register,
 };
 
-#[derive(Debug, Clone)]
-pub struct RegCopy {
-    pub point: usize,
-    pub from: PhysReg,
-    pub to: PhysReg,
-    pub ty: IrType,
-}
+use kamy_core::RejectionReason;
+use kamy_core::frame::{
+    ConcreteFrame, FrameAnalysis, FrameHome, FrameSave, MAX_FRAME_SIZE, ValueClass,
+};
+use kamy_core::ir::{
+    Gpr, Inst, IrFunction, IrOp, IrTerminator, IrType, Phi, PhysReg, ValueId, XmmReg,
+};
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct RegAllocation {
+    // Boundary hints, not register-resident live ranges.
     pub assignments: HashMap<ValueId, PhysReg>,
-    pub copies: Vec<RegCopy>,
-    pub edge_copies: HashMap<(BlockId, BlockId), Vec<RegCopy>>,
     pub flag_scratch: Option<PhysReg>,
+    pub homes: HashMap<ValueId, FrameHome>,
+    pub frame: ConcreteFrame,
+    pub analysis: FrameAnalysis,
+    pub pins: HashMap<ValueId, PhysReg>,
+    pub constants: HashMap<ValueId, u64>,
+    pub value_types: HashMap<ValueId, IrType>,
+    pub used: HashSet<ValueId>,
 }
 
-#[derive(Debug, Clone)]
-struct LiveInterval {
-    value: ValueId,
-    ty: IrType,
-    start: usize,
-    end: usize,
-    pinned: Option<PhysReg>,
-    clobbers: u64,
-}
-
-// Win64 volatile (caller-saved) GPRs. RSI/RDI are NON-volatile on Win64 and
-// therefore excluded here (unlike the SysV ABI).
-const VOLATILE_GPRS: [Gpr; 7] = [
-    Gpr::Rax,
-    Gpr::Rcx,
-    Gpr::Rdx,
-    Gpr::R8,
-    Gpr::R9,
-    Gpr::R10,
-    Gpr::R11,
-];
-
-/// Win64 callee-saved GPR pool in canonical push order.
-pub const CALLEE_SAVED_GPRS: [PhysReg; 8] = [
+const CALLEE_SAVED_GPRS: [PhysReg; 8] = [
     PhysReg::Gpr(Gpr::Rbx),
     PhysReg::Gpr(Gpr::Rbp),
     PhysReg::Gpr(Gpr::Rsi),
@@ -53,6 +35,19 @@ pub const CALLEE_SAVED_GPRS: [PhysReg; 8] = [
     PhysReg::Gpr(Gpr::R13),
     PhysReg::Gpr(Gpr::R14),
     PhysReg::Gpr(Gpr::R15),
+];
+
+const CALLEE_SAVED_XMMS: [XmmReg; 10] = [
+    XmmReg::Xmm6,
+    XmmReg::Xmm7,
+    XmmReg::Xmm8,
+    XmmReg::Xmm9,
+    XmmReg::Xmm10,
+    XmmReg::Xmm11,
+    XmmReg::Xmm12,
+    XmmReg::Xmm13,
+    XmmReg::Xmm14,
+    XmmReg::Xmm15,
 ];
 
 fn gpr_to_iced(gpr: Gpr) -> iced_x86::Register {
@@ -76,1808 +71,1462 @@ fn gpr_to_iced(gpr: Gpr) -> iced_x86::Register {
     }
 }
 
-/// Callee-saved GPRs actually used by `alloc`, in canonical pool order, mapped
-/// to iced registers. Drives prologue push emission and UNWIND_INFO.
-pub fn callee_saved_used(alloc: &RegAllocation) -> Vec<iced_x86::Register> {
-    CALLEE_SAVED_GPRS
-        .iter()
-        .filter(|saved| alloc.assignments.values().any(|v| v == *saved))
-        .filter_map(|saved| match saved {
-            PhysReg::Gpr(g) => Some(gpr_to_iced(*g)),
-            _ => None,
-        })
-        .collect()
+#[derive(Clone, Copy)]
+enum Definition<'a> {
+    Inst(&'a Inst),
+    Phi(&'a Phi),
 }
 
-/// Callee-saved XMMs actually used by `alloc`, in canonical pool order, as iced
-/// registers. Drives the prologue movups save area and the UNWIND stack alloc.
-pub fn callee_saved_xmms_used(alloc: &RegAllocation) -> Vec<iced_x86::Register> {
-    CALLEE_SAVED_XMMS
-        .iter()
-        .filter(|saved| {
-            alloc
-                .assignments
-                .values()
-                .any(|v| matches!(v, PhysReg::Xmm(x) if x == *saved))
-        })
-        .map(|saved| xmm_to_iced(*saved))
-        .collect()
-}
+impl Definition<'_> {
+    fn ty(self) -> IrType {
+        match self {
+            Self::Inst(inst) => inst.ty,
+            Self::Phi(phi) => phi.ty,
+        }
+    }
 
-const VOLATILE_XMMS: [XmmReg; 6] = [
-    XmmReg::Xmm0,
-    XmmReg::Xmm1,
-    XmmReg::Xmm2,
-    XmmReg::Xmm3,
-    XmmReg::Xmm4,
-    XmmReg::Xmm5,
-];
-
-/// Win64 callee-saved XMM pool (XMM6..XMM15). Saved with movups in the generated
-/// prologue; drives epilogue restore and the UNWIND stack allocation.
-const CALLEE_SAVED_XMMS: [XmmReg; 10] = [
-    XmmReg::Xmm6,
-    XmmReg::Xmm7,
-    XmmReg::Xmm8,
-    XmmReg::Xmm9,
-    XmmReg::Xmm10,
-    XmmReg::Xmm11,
-    XmmReg::Xmm12,
-    XmmReg::Xmm13,
-    XmmReg::Xmm14,
-    XmmReg::Xmm15,
-];
-
-fn is_callee_saved_xmm(x: XmmReg) -> bool {
-    CALLEE_SAVED_XMMS.contains(&x)
-}
-
-fn xmm_to_iced(x: XmmReg) -> iced_x86::Register {
-    use iced_x86::Register as R;
-    match x {
-        XmmReg::Xmm0 => R::XMM0,
-        XmmReg::Xmm1 => R::XMM1,
-        XmmReg::Xmm2 => R::XMM2,
-        XmmReg::Xmm3 => R::XMM3,
-        XmmReg::Xmm4 => R::XMM4,
-        XmmReg::Xmm5 => R::XMM5,
-        XmmReg::Xmm6 => R::XMM6,
-        XmmReg::Xmm7 => R::XMM7,
-        XmmReg::Xmm8 => R::XMM8,
-        XmmReg::Xmm9 => R::XMM9,
-        XmmReg::Xmm10 => R::XMM10,
-        XmmReg::Xmm11 => R::XMM11,
-        XmmReg::Xmm12 => R::XMM12,
-        XmmReg::Xmm13 => R::XMM13,
-        XmmReg::Xmm14 => R::XMM14,
-        XmmReg::Xmm15 => R::XMM15,
+    fn push_args(self, worklist: &mut Vec<ValueId>) {
+        match self {
+            Self::Inst(inst) => worklist.extend(inst.args.iter().copied()),
+            Self::Phi(phi) => worklist.extend(phi.args.iter().map(|(_, value)| *value)),
+        }
     }
 }
 
-fn is_callee_saved_gpr(g: Gpr) -> bool {
-    CALLEE_SAVED_GPRS
-        .iter()
-        .any(|p| matches!(p, PhysReg::Gpr(x) if *x == g))
+struct ValueModel<'a> {
+    definitions: HashMap<ValueId, Definition<'a>>,
+    constants: HashMap<ValueId, u64>,
+    used: HashSet<ValueId>,
 }
 
-fn register_mask(phys: PhysReg) -> u64 {
-    let index = match phys {
-        PhysReg::Gpr(g) => g.index(),
-        PhysReg::Xmm(x) => 16 + x.index(),
-        PhysReg::Flag(f) => 32 + f.index(),
+fn is_flag_op(op: &IrOp) -> bool {
+    matches!(
+        op,
+        IrOp::IsZero
+            | IrOp::IsNeg
+            | IrOp::Parity
+            | IrOp::CarryAdd
+            | IrOp::OverflowAdd
+            | IrOp::BorrowSub
+            | IrOp::OverflowSub
+            | IrOp::AuxCarryAdd
+            | IrOp::AuxBorrowSub
+            | IrOp::CarryShl
+            | IrOp::CarryShr
+            | IrOp::CarrySar
+            | IrOp::SetIf
+            | IrOp::BoolNot
+    )
+}
+
+fn valid_arity(inst: &Inst) -> bool {
+    match inst.op {
+        IrOp::Const(_)
+        | IrOp::Address(_)
+        | IrOp::FrameAddress(_)
+        | IrOp::Undef
+        | IrOp::CallResult { .. } => inst.args.is_empty(),
+        IrOp::Copy
+        | IrOp::FrameOffset(_)
+        | IrOp::FrameLogical
+        | IrOp::Zext
+        | IrOp::Sext
+        | IrOp::Trunc
+        | IrOp::Neg
+        | IrOp::Not
+        | IrOp::Bswap
+        | IrOp::Bsf
+        | IrOp::Bsr
+        | IrOp::Popcnt
+        | IrOp::Lzcnt
+        | IrOp::Tzcnt
+        | IrOp::IsZero
+        | IrOp::IsNeg
+        | IrOp::Parity
+        | IrOp::SetIf
+        | IrOp::BoolNot
+        | IrOp::Load
+        | IrOp::Mov128
+        | IrOp::URem
+        | IrOp::SRem => inst.args.len() == 1,
+        IrOp::Add
+        | IrOp::FrameIndex { .. }
+        | IrOp::Sub
+        | IrOp::UMulHi
+        | IrOp::SMulHi
+        | IrOp::And
+        | IrOp::Or
+        | IrOp::Xor
+        | IrOp::Shl
+        | IrOp::Shr
+        | IrOp::Sar
+        | IrOp::Rol
+        | IrOp::Ror
+        | IrOp::CarryAdd
+        | IrOp::OverflowAdd
+        | IrOp::BorrowSub
+        | IrOp::OverflowSub
+        | IrOp::AuxCarryAdd
+        | IrOp::AuxBorrowSub
+        | IrOp::CarryShl
+        | IrOp::CarryShr
+        | IrOp::CarrySar
+        | IrOp::StackProbe
+        | IrOp::Store => inst.args.len() == 2,
+        IrOp::Mul => matches!(inst.args.len(), 1 | 2),
+        IrOp::UDiv | IrOp::SDiv | IrOp::Select => inst.args.len() == 3,
+        IrOp::CallIndirect { .. } => !inst.args.is_empty(),
+        IrOp::NativeInline(ref native) => inst.args.len() == native.reads.len(),
+        IrOp::Use | IrOp::Call { .. } => true,
+    }
+}
+
+fn analyze_values(func: &IrFunction) -> Result<ValueModel<'_>, RejectionReason> {
+    if func.entry.0 as usize >= func.blocks.len() {
+        return Err(RejectionReason::UnsupportedInstruction);
+    }
+    let mut model = ValueModel {
+        definitions: HashMap::new(),
+        constants: HashMap::new(),
+        used: HashSet::new(),
     };
-    1u64 << index
-}
-
-fn block_order(func: &IrFunction) -> Vec<BlockId> {
-    let mut order = Vec::with_capacity(func.blocks.len());
-    let mut visited = vec![false; func.blocks.len()];
-    let mut stack = vec![func.entry];
-    while let Some(bid) = stack.pop() {
-        let idx = bid.0 as usize;
-        if idx >= visited.len() || visited[idx] {
-            continue;
+    let mut worklist = Vec::new();
+    for (index, block) in func.blocks.iter().enumerate() {
+        if block.id.0 as usize != index {
+            return Err(RejectionReason::UnsupportedInstruction);
         }
-        visited[idx] = true;
-        order.push(bid);
-        let block = func.block(bid);
-        match &block.term {
-            IrTerminator::Jump(t) => stack.push(*t),
-            IrTerminator::Branch {
-                taken, not_taken, ..
-            } => {
-                stack.push(*not_taken);
-                stack.push(*taken);
-            }
-            IrTerminator::Ret
-            | IrTerminator::NoReturn
-            | IrTerminator::Tail { .. }
-            | IrTerminator::Unreachable => {}
-        }
-    }
-    order
-}
-
-fn linear_point(block_index: usize, inst_index: usize) -> usize {
-    block_index * 1024 + inst_index
-}
-
-fn interval_bump(
-    lo: &mut HashMap<ValueId, usize>,
-    hi: &mut HashMap<ValueId, usize>,
-    v: ValueId,
-    pt: usize,
-) {
-    lo.entry(v).and_modify(|e| *e = (*e).min(pt)).or_insert(pt);
-    hi.entry(v).and_modify(|e| *e = (*e).max(pt)).or_insert(pt);
-}
-
-/// Live intervals over the linearized `order`. Liveness is a real backward
-/// SSA dataflow (to a fixpoint, so back edges are honored): a value live across
-/// a loop — a loop-carried phi value or a loop-invariant value defined before
-/// the loop and used inside it — stays live from the loop header through the
-/// latch's back-edge terminator. Each interval is the convex hull (min start,
-/// max end) of every linear point where the value is defined, used, or live,
-/// which is sound for single-interval linear scan regardless of block order:
-/// collapsing holes only over-reserves a register, never under-reserves it.
-/// The earlier syntactic last-use heuristic truncated loop-crossing values at
-/// their textually-last use, so a later-ordered in-loop block could reuse the
-/// register mid-loop and clobber the live value (issue #24).
-fn compute_live_intervals(
-    func: &IrFunction,
-    order: &[BlockId],
-) -> (Vec<LiveInterval>, Vec<(PhysReg, usize, usize)>) {
-    let n = order.len();
-    let mut pos: HashMap<BlockId, usize> = HashMap::new();
-    for (i, &b) in order.iter().enumerate() {
-        pos.insert(b, i);
-    }
-
-    let mut def_pt: HashMap<ValueId, usize> = HashMap::new();
-    let mut ty_of: HashMap<ValueId, IrType> = HashMap::new();
-    let mut clobber_points: Vec<(usize, u64)> = Vec::new();
-    // Reserve physical writes even when their separately modeled outputs die.
-    let mut write_pins: Vec<(PhysReg, usize, usize)> = Vec::new();
-
-    for (bi, &bid) in order.iter().enumerate() {
-        let block = func.block(bid);
-        for (pi, phi) in block.phis.iter().enumerate() {
-            def_pt.entry(phi.dest).or_insert(linear_point(bi, pi));
-            ty_of.entry(phi.dest).or_insert(phi.ty);
-        }
-        let phi_off = block.phis.len();
-        for (ii, inst) in block.insts.iter().enumerate() {
-            let pt = linear_point(bi, phi_off + ii);
-            if let IrOp::Call { clobbers, .. } | IrOp::CallIndirect { clobbers } = &inst.op {
-                let mask = clobbers
+        for phi in &block.phis {
+            if phi.args.is_empty()
+                || phi
+                    .args
                     .iter()
-                    .fold(0, |mask, &phys| mask | register_mask(phys));
-                clobber_points.push((pt, mask));
+                    .any(|(pred, _)| pred.0 as usize >= func.blocks.len())
+                || model
+                    .definitions
+                    .insert(phi.dest, Definition::Phi(phi))
+                    .is_some()
+            {
+                return Err(RejectionReason::UnsupportedInstruction);
             }
-            if let IrOp::NativeInline(native) = &inst.op {
-                let mask = native
-                    .writes
-                    .iter()
-                    .fold(0, |mask, &phys| mask | register_mask(phys));
-                clobber_points.push((pt, mask));
-                for w in &native.writes {
-                    write_pins.push((*w, pt, pt));
-                }
+        }
+        for inst in &block.insts {
+            if !valid_arity(inst) || (is_flag_op(&inst.op) && inst.ty != IrType::I8) {
+                return Err(RejectionReason::UnsupportedInstruction);
             }
             if matches!(
                 inst.op,
-                IrOp::UDiv | IrOp::SDiv | IrOp::UMulHi | IrOp::SMulHi
-            ) {
-                let rax = PhysReg::Gpr(Gpr::Rax);
-                let rdx = PhysReg::Gpr(Gpr::Rdx);
-                clobber_points.push((pt, register_mask(rax) | register_mask(rdx)));
-                write_pins.push((rax, pt, pt));
-                write_pins.push((rdx, pt, pt));
+                IrOp::FrameAddress(_)
+                    | IrOp::FrameOffset(_)
+                    | IrOp::FrameLogical
+                    | IrOp::FrameIndex { .. }
+            ) && inst.ty != IrType::I64
+            {
+                return Err(RejectionReason::UnsupportedInstruction);
             }
-            let projection = match inst.op {
-                IrOp::URem | IrOp::SRem if inst.args.len() == 1 => Some(Gpr::Rdx),
-                IrOp::Mul if inst.args.len() == 1 => Some(Gpr::Rax),
-                _ => None,
-            };
-            if let Some(register) = projection {
-                if let Some(&producer) = def_pt.get(&inst.args[0]) {
-                    // The secondary hardware result exists before its projection.
-                    write_pins.push((PhysReg::Gpr(register), producer, pt));
-                }
-            }
-            if let Some(dest) = inst.dest {
-                def_pt.entry(dest).or_insert(pt);
-                ty_of.entry(dest).or_insert(inst.ty);
-            }
-        }
-    }
-
-    // Per-block use/def for liveness. `use_set` holds upward-exposed uses (read
-    // before any in-block def); phi destinations are defined at block entry and
-    // phi arguments are consumed on the predecessor edge, not read in the block.
-    let mut use_set: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
-    let mut def_set: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
-    let mut edge_use: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
-    let succ_idx: Vec<Vec<usize>> = order
-        .iter()
-        .map(|&bid| {
-            successors(&func.block(bid).term)
-                .iter()
-                .filter_map(|s| pos.get(s).copied())
-                .collect()
-        })
-        .collect();
-
-    for (bi, &bid) in order.iter().enumerate() {
-        let block = func.block(bid);
-        let mut defined: HashSet<ValueId> = HashSet::new();
-        for phi in &block.phis {
-            def_set[bi].insert(phi.dest);
-            defined.insert(phi.dest);
-        }
-        for inst in &block.insts {
-            for &v in &inst.args {
-                if !defined.contains(&v) {
-                    use_set[bi].insert(v);
-                }
-            }
-            if let Some(d) = inst.dest {
-                def_set[bi].insert(d);
-                defined.insert(d);
-            }
-        }
-        if let IrTerminator::Branch { cond, .. } = &block.term {
-            if !defined.contains(cond) {
-                use_set[bi].insert(*cond);
-            }
-        }
-        for s in successors(&block.term) {
-            for phi in &func.block(s).phis {
-                for (pred, val) in &phi.args {
-                    if *pred == bid {
-                        edge_use[bi].insert(*val);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut live_in: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
-    let mut live_out: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for bi in (0..n).rev() {
-            let mut new_out = edge_use[bi].clone();
-            for &s in &succ_idx[bi] {
-                new_out.extend(live_in[s].iter().copied());
-            }
-            let mut new_in = use_set[bi].clone();
-            for &v in &new_out {
-                if !def_set[bi].contains(&v) {
-                    new_in.insert(v);
-                }
-            }
-            if new_out != live_out[bi] {
-                live_out[bi] = new_out;
-                changed = true;
-            }
-            if new_in != live_in[bi] {
-                live_in[bi] = new_in;
-                changed = true;
-            }
-        }
-    }
-
-    let mut lo: HashMap<ValueId, usize> = HashMap::new();
-    let mut hi: HashMap<ValueId, usize> = HashMap::new();
-    for (&v, &p) in &def_pt {
-        interval_bump(&mut lo, &mut hi, v, p);
-    }
-    for (bi, &bid) in order.iter().enumerate() {
-        let block = func.block(bid);
-        let phi_off = block.phis.len();
-        for (ii, inst) in block.insts.iter().enumerate() {
-            let pt = linear_point(bi, phi_off + ii);
-            for &v in &inst.args {
-                interval_bump(&mut lo, &mut hi, v, pt);
-            }
-        }
-        let term_pt = linear_point(bi, phi_off + block.insts.len());
-        if let IrTerminator::Branch { cond, .. } = &block.term {
-            interval_bump(&mut lo, &mut hi, *cond, term_pt);
-        }
-        for s in successors(&block.term) {
-            for phi in &func.block(s).phis {
-                for (pred, val) in &phi.args {
-                    if *pred == bid {
-                        interval_bump(&mut lo, &mut hi, *val, term_pt);
-                    }
-                }
-            }
-        }
-        let start_pt = linear_point(bi, 0);
-        for &v in &live_in[bi] {
-            interval_bump(&mut lo, &mut hi, v, start_pt);
-        }
-        for &v in &live_out[bi] {
-            interval_bump(&mut lo, &mut hi, v, term_pt);
-        }
-    }
-
-    let mut intervals: Vec<LiveInterval> = def_pt
-        .keys()
-        .map(|&vid| {
-            let start = lo[&vid];
-            let end = hi[&vid];
-            let clobbers = clobber_points
-                .iter()
-                .filter(|(point, _)| start < *point && *point < end)
-                .fold(0, |mask, (_, effects)| mask | effects);
-            LiveInterval {
-                value: vid,
-                ty: ty_of[&vid],
-                start,
-                end,
-                pinned: None,
-                clobbers,
-            }
-        })
-        .collect();
-
-    intervals.sort_by_key(|iv| (iv.start, iv.value.0));
-    (intervals, write_pins)
-}
-
-/// True iff a *used* flag op can be re-established at its consumer by
-/// re-executing the producing op into a scratch register: add flags
-/// (`CarryAdd/OverflowAdd/AuxCarryAdd`), or shift flags
-/// (`CarryShl/CarryShr/CarrySar`) whose count is a constant. Variable-count
-/// shift flags are excluded (reproducing them needs CL, which is not modeled).
-fn consumes_recomputable_flag(func: &IrFunction) -> bool {
-    let mut used = HashSet::new();
-    for b in &func.blocks {
-        for i in &b.insts {
-            used.extend(i.args.iter().copied());
-        }
-        for p in &b.phis {
-            used.extend(p.args.iter().map(|(_, v)| *v));
-        }
-        if let IrTerminator::Branch { cond, .. } = &b.term {
-            used.insert(*cond);
-        }
-    }
-    let is_const = |vid: ValueId| -> bool {
-        func.blocks.iter().any(|b| {
-            b.insts
-                .iter()
-                .any(|i| i.dest == Some(vid) && matches!(i.op, IrOp::Const(_)))
-        })
-    };
-    func.blocks.iter().any(|b| {
-        b.insts.iter().any(|i| {
-            i.dest.is_some_and(|d| used.contains(&d))
-                && match i.op {
-                    IrOp::CarryAdd | IrOp::OverflowAdd | IrOp::AuxCarryAdd => true,
-                    IrOp::CarryShl | IrOp::CarryShr | IrOp::CarrySar => is_const(i.args[1]),
-                    _ => false,
-                }
-        })
-    })
-}
-
-fn validate_implicit_arithmetic(
-    func: &IrFunction,
-    reg_pins: &HashMap<ValueId, PhysReg>,
-) -> Result<(), RejectionReason> {
-    let rax = PhysReg::Gpr(Gpr::Rax);
-    let rdx = PhysReg::Gpr(Gpr::Rdx);
-    let pinned = |value: Option<ValueId>, phys| {
-        value.is_some_and(|value| reg_pins.get(&value) == Some(&phys))
-    };
-    for block in &func.blocks {
-        let mut division = None;
-        let mut product = None;
-        for inst in &block.insts {
-            if (matches!(
-                inst.op,
-                IrOp::UDiv | IrOp::SDiv | IrOp::URem | IrOp::SRem | IrOp::UMulHi | IrOp::SMulHi
-            ) || (matches!(inst.op, IrOp::Mul) && inst.args.len() == 1))
+            if inst.ty == IrType::I128
                 && !matches!(
-                    inst.ty,
-                    IrType::I8 | IrType::I16 | IrType::I32 | IrType::I64
+                    inst.op,
+                    IrOp::Const(_)
+                        | IrOp::Undef
+                        | IrOp::Copy
+                        | IrOp::Xor
+                        | IrOp::Load
+                        | IrOp::Store
+                        | IrOp::Mov128
+                        | IrOp::Select
+                        | IrOp::Use
+                        | IrOp::NativeInline(_)
+                        | IrOp::CallResult { .. }
                 )
             {
                 return Err(RejectionReason::UnsupportedInstruction);
             }
-            match &inst.op {
+            if let Some(dest) = inst.dest {
+                if model
+                    .definitions
+                    .insert(dest, Definition::Inst(inst))
+                    .is_some()
+                {
+                    return Err(RejectionReason::UnsupportedInstruction);
+                }
+                if let IrOp::Const(value) = inst.op {
+                    model.constants.insert(dest, value);
+                }
+            }
+            if inst.dest.is_none()
+                || matches!(
+                    inst.op,
+                    IrOp::Store
+                        | IrOp::Use
+                        | IrOp::StackProbe
+                        | IrOp::Call { .. }
+                        | IrOp::CallIndirect { .. }
+                        | IrOp::NativeInline(_)
+                        | IrOp::UDiv
+                        | IrOp::SDiv
+                )
+            {
+                worklist.extend(inst.args.iter().copied());
+            }
+        }
+        match block.term {
+            IrTerminator::Jump(target) if target.0 as usize >= func.blocks.len() => {
+                return Err(RejectionReason::UnsupportedInstruction);
+            }
+            IrTerminator::Branch {
+                cond,
+                taken,
+                not_taken,
+            } => {
+                if taken.0 as usize >= func.blocks.len()
+                    || not_taken.0 as usize >= func.blocks.len()
+                {
+                    return Err(RejectionReason::UnsupportedInstruction);
+                }
+                worklist.push(cond);
+            }
+            _ => {}
+        }
+    }
+    for block in &func.blocks {
+        if block.phis.iter().any(|phi| {
+            phi.args
+                .iter()
+                .any(|(_, value)| !model.definitions.contains_key(value))
+        }) || block.insts.iter().any(|inst| {
+            inst.args
+                .iter()
+                .any(|value| !model.definitions.contains_key(value))
+        }) {
+            return Err(RejectionReason::UnsupportedInstruction);
+        }
+        if block.insts.iter().any(|inst| {
+            matches!(inst.op, IrOp::FrameLogical | IrOp::FrameIndex { .. })
+                && inst.args.iter().any(|value| {
+                    model
+                        .definitions
+                        .get(value)
+                        .is_none_or(|definition| definition.ty() != IrType::I64)
+                })
+        }) {
+            return Err(RejectionReason::UnsupportedInstruction);
+        }
+    }
+    while let Some(value) = worklist.pop() {
+        if model.used.insert(value) {
+            model
+                .definitions
+                .get(&value)
+                .ok_or(RejectionReason::UnsupportedInstruction)?
+                .push_args(&mut worklist);
+        }
+    }
+    if model.used.iter().any(|value| {
+        matches!(model.definitions[value], Definition::Inst(inst) if matches!(inst.op,
+            IrOp::NativeInline(_) | IrOp::Call { .. } | IrOp::CallIndirect { .. }))
+    }) {
+        return Err(RejectionReason::UnsupportedInstruction);
+    }
+    Ok(model)
+}
+
+fn validate_implicit_arithmetic(func: &IrFunction) -> Result<(), RejectionReason> {
+    for block in &func.blocks {
+        let mut divisions = HashMap::new();
+        let mut products = HashMap::new();
+        for inst in &block.insts {
+            if matches!(
+                inst.op,
+                IrOp::UDiv
+                    | IrOp::SDiv
+                    | IrOp::URem
+                    | IrOp::SRem
+                    | IrOp::UMulHi
+                    | IrOp::SMulHi
+                    | IrOp::Mul
+            ) && inst.ty == IrType::I128
+            {
+                return Err(RejectionReason::UnsupportedInstruction);
+            }
+            match inst.op {
                 IrOp::UDiv | IrOp::SDiv => {
-                    if inst.args.len() != 3
-                        || !pinned(inst.dest, rax)
-                        || !pinned(inst.args.first().copied(), rdx)
-                        || !pinned(inst.args.get(1).copied(), rax)
-                        || inst.args.get(2).is_some_and(|value| {
-                            matches!(reg_pins.get(value), Some(phys) if *phys == rax || *phys == rdx)
-                        })
-                    {
-                        return Err(RejectionReason::UnsupportedInstruction);
+                    if let Some(dest) = inst.dest {
+                        divisions.insert(dest, (inst.ty, matches!(inst.op, IrOp::SDiv)));
                     }
-                    division = Some((inst.dest.unwrap(), inst.ty, matches!(inst.op, IrOp::SDiv)));
-                    product = None;
                 }
                 IrOp::UMulHi | IrOp::SMulHi => {
-                    if inst.args.len() != 2
-                        || !pinned(inst.dest, rdx)
-                        || !pinned(inst.args.first().copied(), rax)
-                    {
-                        return Err(RejectionReason::UnsupportedInstruction);
-                    }
-                    division = None;
-                    product = Some((inst.dest.unwrap(), inst.ty));
-                }
-                IrOp::URem | IrOp::SRem => {
-                    if inst.args.len() != 1
-                        || !pinned(inst.dest, rdx)
-                        || division
-                            != inst
-                                .args
-                                .first()
-                                .map(|&quotient| (quotient, inst.ty, matches!(inst.op, IrOp::SRem)))
-                    {
-                        return Err(RejectionReason::UnsupportedInstruction);
+                    if let Some(dest) = inst.dest {
+                        products.insert(dest, inst.ty);
                     }
                 }
-                IrOp::Mul if inst.args.len() != 2 => {
-                    if inst.args.len() != 1
-                        || !pinned(inst.dest, rax)
-                        || product != inst.args.first().map(|&high| (high, inst.ty))
-                    {
-                        return Err(RejectionReason::UnsupportedInstruction);
-                    }
+                IrOp::URem | IrOp::SRem
+                    if divisions.get(&inst.args[0])
+                        != Some(&(inst.ty, matches!(inst.op, IrOp::SRem))) =>
+                {
+                    return Err(RejectionReason::UnsupportedInstruction);
                 }
-                _ => {
-                    let writes = |phys| match &inst.op {
-                        IrOp::Call { clobbers, .. } | IrOp::CallIndirect { clobbers } => {
-                            clobbers.contains(&phys)
-                        }
-                        IrOp::NativeInline(native) => native.writes.contains(&phys),
-                        _ => false,
-                    };
-                    if writes(rdx) || pinned(inst.dest, rdx) {
-                        division = None;
-                    }
-                    if writes(rax) || pinned(inst.dest, rax) {
-                        product = None;
-                    }
+                IrOp::Mul
+                    if inst.args.len() == 1 && products.get(&inst.args[0]) != Some(&inst.ty) =>
+                {
+                    return Err(RejectionReason::UnsupportedInstruction);
                 }
+                _ => {}
             }
         }
     }
     Ok(())
 }
 
-pub fn allocate_registers(
-    func: &IrFunction,
-    saved_regs: &[PhysReg],
-    rsp_pinned: &HashSet<ValueId>,
-    reg_pins: &HashMap<ValueId, PhysReg>,
-) -> Result<RegAllocation, RejectionReason> {
-    validate_implicit_arithmetic(func, reg_pins)?;
-    let order = block_order(func);
-    let (mut intervals, write_pins) = compute_live_intervals(func, &order);
-    for iv in &mut intervals {
-        if rsp_pinned.contains(&iv.value) {
-            iv.pinned = Some(PhysReg::Gpr(Gpr::Rsp));
-        } else if let Some(p) = reg_pins.get(&iv.value) {
-            iv.pinned = Some(*p);
-        }
+fn register_class(register: PhysReg) -> ValueClass {
+    match register {
+        PhysReg::Gpr(_) => ValueClass::Gpr,
+        PhysReg::Xmm(_) => ValueClass::Xmm,
+        PhysReg::Flag(_) => ValueClass::Flag,
     }
+}
 
-    // Physical registers reserved by pinned intervals, with their ranges. A
-    // non-pinned value must not occupy one while its own range overlaps: a later
-    // pin would otherwise have to move it mid-life, which the single-assignment
-    // lowering cannot express. Physical native/implicit-arithmetic writes add
-    // reservations even when their output values do not survive DCE.
-    let mut pins: Vec<(PhysReg, usize, usize)> = intervals
-        .iter()
-        .filter_map(|iv| iv.pinned.map(|p| (p, iv.start, iv.end)))
-        .collect();
-    pins.extend(write_pins);
-
-    let mut avail_gprs: Vec<Gpr> = VOLATILE_GPRS.to_vec();
-    let mut avail_xmms: Vec<XmmReg> = VOLATILE_XMMS
-        .iter()
-        .chain(CALLEE_SAVED_XMMS.iter())
-        .copied()
-        .collect();
-
-    for reg in saved_regs {
-        match reg {
-            PhysReg::Gpr(g) => {
-                if !avail_gprs.contains(g) {
-                    avail_gprs.push(*g);
-                }
-            }
-            PhysReg::Xmm(x) => {
-                if !avail_xmms.contains(x) {
-                    avail_xmms.push(*x);
-                }
-            }
-            PhysReg::Flag(_) => {}
-        }
+fn class_rank(class: ValueClass) -> u8 {
+    match class {
+        ValueClass::Gpr => 0,
+        ValueClass::Flag => 1,
+        ValueClass::Xmm => 2,
     }
+}
 
-    let mut assignments: HashMap<ValueId, PhysReg> = HashMap::new();
-    let copies: Vec<RegCopy> = Vec::new();
-    let mut active: Vec<(LiveInterval, PhysReg)> = Vec::new();
-    let mut free_gprs: Vec<Gpr> = avail_gprs.clone();
-    let mut free_xmms: Vec<XmmReg> = avail_xmms.clone();
-
-    // If a branch/setcc consumes an add- or constant-count-shift flag, the x86
-    // flags are re-established at the consumer by re-executing the op into a
-    // reserved scratch (R11). Reserve it here so no value is ever placed there.
-    let flag_scratch: Option<PhysReg> = if consumes_recomputable_flag(func) {
-        if intervals
-            .iter()
-            .any(|iv| iv.pinned == Some(PhysReg::Gpr(Gpr::R11)))
+fn value_classes(
+    model: &ValueModel<'_>,
+    pins: &HashMap<ValueId, PhysReg>,
+) -> Result<HashMap<ValueId, ValueClass>, RejectionReason> {
+    let mut classes = HashMap::with_capacity(model.used.len());
+    let mut fixed = HashSet::new();
+    let mut edges: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    let mut worklist = Vec::new();
+    for &value in &model.used {
+        let definition = model.definitions[&value];
+        let ty = definition.ty();
+        let mut class = (ty == IrType::I128).then_some(ValueClass::Xmm);
+        if let Some(&register) = pins.get(&value) {
+            class = Some(register_class(register));
+        }
+        if let Definition::Inst(inst) = definition {
+            if let IrOp::CallResult { register } = inst.op {
+                class = Some(register_class(register));
+            }
+            if is_flag_op(&inst.op) {
+                class = Some(ValueClass::Flag);
+            }
+        }
+        if (ty == IrType::I128 && class != Some(ValueClass::Xmm))
+            || (class == Some(ValueClass::Flag) && ty != IrType::I8)
         {
-            // R11 genuinely live; cannot reserve it as scratch. Reject soundly.
-            return Err(RejectionReason::RegisterPressure);
+            return Err(RejectionReason::UnsupportedInstruction);
         }
-        avail_gprs.retain(|g| *g != Gpr::R11);
-        free_gprs.retain(|g| *g != Gpr::R11);
-        Some(PhysReg::Gpr(Gpr::R11))
+        if let Some(class) = class {
+            fixed.insert(value);
+            worklist.push((value, class));
+        }
+        classes.insert(value, class.unwrap_or(ValueClass::Gpr));
+        let mut connect = |source| {
+            edges.entry(value).or_default().push(source);
+            edges.entry(source).or_default().push(value);
+        };
+        match definition {
+            Definition::Inst(inst) if matches!(inst.op, IrOp::Copy) => connect(inst.args[0]),
+            Definition::Phi(phi) => {
+                for &(_, source) in &phi.args {
+                    connect(source);
+                }
+            }
+            _ => {}
+        }
+    }
+    while let Some((value, class)) = worklist.pop() {
+        if let Some(neighbors) = edges.get(&value) {
+            for &neighbor in neighbors {
+                if fixed.contains(&neighbor)
+                    || (class == ValueClass::Flag
+                        && model.definitions[&neighbor].ty() != IrType::I8)
+                    || class_rank(classes[&neighbor]) >= class_rank(class)
+                {
+                    continue;
+                }
+                classes.insert(neighbor, class);
+                worklist.push((neighbor, class));
+            }
+        }
+    }
+    if classes.iter().any(|(value, class)| {
+        *class == ValueClass::Xmm
+            && matches!(model.definitions[value].ty(), IrType::I8 | IrType::I16)
+    }) {
+        return Err(RejectionReason::UnsupportedInstruction);
+    }
+    Ok(classes)
+}
+
+fn check_frame_size(size: u32) -> Result<(), RejectionReason> {
+    if size > MAX_FRAME_SIZE {
+        return Err(RejectionReason::FrameResourceLimit);
+    }
+    Ok(())
+}
+
+fn reserve_slot(cursor: &mut u32, width: u32, alignment: u32) -> Result<u32, RejectionReason> {
+    let offset = cursor
+        .checked_add(alignment - 1)
+        .ok_or(RejectionReason::FrameOverflow)?
+        & !(alignment - 1);
+    let end = offset
+        .checked_add(width)
+        .ok_or(RejectionReason::FrameOverflow)?;
+    check_frame_size(end)?;
+    *cursor = end;
+    Ok(offset)
+}
+
+pub(crate) struct NativeFrameAddress {
+    pub value: ValueId,
+    pub adjustment: i64,
+    pub ranges: [Option<(i64, i64)>; 2],
+    pub bit_index: Option<(Code, u8)>,
+}
+
+impl NativeFrameAddress {
+    pub(crate) fn crosses_zone(&self) -> bool {
+        self.ranges.iter().flatten().any(|&(low, high)| {
+            low.checked_add(self.adjustment)
+                .is_some_and(|start| (low < 0) != (start < 0))
+                || high
+                    .checked_add(self.adjustment)
+                    .is_some_and(|end| (high < 0) != (end < 0))
+        })
+    }
+}
+
+pub(crate) fn native_frame_address(
+    inst: &Inst,
+    instruction: &iced_x86::Instruction,
+    constants: &HashMap<ValueId, u64>,
+    analysis: &FrameAnalysis,
+) -> Result<Option<NativeFrameAddress>, RejectionReason> {
+    let IrOp::NativeInline(native) = &inst.op else {
+        return Ok(None);
+    };
+    let argument = |register: Register| {
+        native.reads.iter().zip(&inst.args).find_map(|(&physical, &value)| {
+            matches!(physical, PhysReg::Gpr(gpr) if gpr_to_iced(gpr) == register.full_register())
+                .then_some(value)
+        })
+    };
+    let components = [
+        (instruction.memory_base(), 1),
+        (instruction.memory_index(), instruction.memory_index_scale()),
+    ];
+    let mut pointer = None;
+    for &(register, scale) in &components {
+        let value = argument(register);
+        let ranges = value.and_then(|value| {
+            analysis.offsets.get(&value).map_or_else(
+                || {
+                    analysis
+                        .pointer_bounds
+                        .get(&value)
+                        .map(|bounds| [bounds.negative, bounds.incoming])
+                },
+                |&delta| Some([Some((delta, delta)), None]),
+            )
+        });
+        if let Some(ranges) = ranges {
+            // A frame-relative address has exactly one entry-RSP term with coefficient one.
+            if pointer.is_some() || scale != 1 || register.size() != 8 {
+                return Err(RejectionReason::FrameDynamic);
+            }
+            pointer = Some((value.unwrap(), ranges));
+        }
+    }
+    let Some((value, ranges)) = pointer else {
+        return Ok(None);
+    };
+    if matches!(instruction.segment_prefix(), Register::FS | Register::GS) {
+        return Err(RejectionReason::FrameDynamic);
+    }
+    let mut adjustment = instruction.memory_displacement64() as i64;
+    let mut skipped_pointer = false;
+    for (register, scale) in components {
+        if register == Register::None {
+            continue;
+        }
+        let component = argument(register).ok_or(RejectionReason::FrameDynamic)?;
+        if component == value && !skipped_pointer {
+            skipped_pointer = true;
+            continue;
+        }
+        let constant = constants
+            .get(&component)
+            .or_else(|| analysis.constants.get(&component))
+            .ok_or(RejectionReason::FrameDynamic)?;
+        let scaled = (*constant as i64)
+            .checked_mul(i64::from(scale))
+            .ok_or(RejectionReason::FrameOverflow)?;
+        adjustment = adjustment
+            .checked_add(scaled)
+            .ok_or(RejectionReason::FrameOverflow)?;
+    }
+    let immediate_code = match instruction.code() {
+        Code::Bt_rm16_r16 => Some(Code::Bt_rm16_imm8),
+        Code::Bt_rm32_r32 => Some(Code::Bt_rm32_imm8),
+        Code::Bt_rm64_r64 => Some(Code::Bt_rm64_imm8),
+        Code::Bts_rm16_r16 => Some(Code::Bts_rm16_imm8),
+        Code::Bts_rm32_r32 => Some(Code::Bts_rm32_imm8),
+        Code::Bts_rm64_r64 => Some(Code::Bts_rm64_imm8),
+        Code::Btr_rm16_r16 => Some(Code::Btr_rm16_imm8),
+        Code::Btr_rm32_r32 => Some(Code::Btr_rm32_imm8),
+        Code::Btr_rm64_r64 => Some(Code::Btr_rm64_imm8),
+        Code::Btc_rm16_r16 => Some(Code::Btc_rm16_imm8),
+        Code::Btc_rm32_r32 => Some(Code::Btc_rm32_imm8),
+        Code::Btc_rm64_r64 => Some(Code::Btc_rm64_imm8),
+        _ => None,
+    };
+    let bit_index = if let Some(code) = immediate_code {
+        let value = argument(instruction.op1_register())
+            .and_then(|value| {
+                constants
+                    .get(&value)
+                    .or_else(|| analysis.constants.get(&value))
+            })
+            .ok_or(RejectionReason::FrameDynamic)?;
+        let width = instruction.op1_register().size();
+        let signed = match width {
+            2 => i64::from(*value as i16),
+            4 => i64::from(*value as i32),
+            8 => *value as i64,
+            _ => return Err(RejectionReason::UnsupportedInstruction),
+        };
+        // Register bit strings select a signed word before selecting a bit within that word.
+        let bits = width as i64 * 8;
+        let word_offset = signed.div_euclid(bits) * width as i64;
+        adjustment = adjustment
+            .checked_add(word_offset)
+            .ok_or(RejectionReason::FrameOverflow)?;
+        Some((code, (*value & (bits as u64 - 1)) as u8))
     } else {
         None
     };
-
-    for iv in &intervals {
-        active.retain(|(a, reg)| {
-            if a.end < iv.start {
-                match reg {
-                    PhysReg::Gpr(g) => {
-                        if avail_gprs.contains(g) && !free_gprs.contains(g) {
-                            free_gprs.push(*g);
-                        }
-                    }
-                    PhysReg::Xmm(x) => {
-                        if avail_xmms.contains(x) && !free_xmms.contains(x) {
-                            free_xmms.push(*x);
-                        }
-                    }
-                    PhysReg::Flag(_) => {}
-                }
-                false
-            } else {
-                true
-            }
-        });
-
-        let needs_xmm = iv.ty == IrType::I128;
-
-        if let Some(pinned) = iv.pinned {
-            if pinned == PhysReg::Gpr(Gpr::Rsp) {
-                // RSP is one physical register threaded as a sequence of in-place
-                // updates (sub/add rsp); a chain value's input dies exactly as the
-                // result is defined, so it is never a real conflict. Evicting it to
-                // a GPR would compute rsp arithmetic in a scratch register and leave
-                // the real stack pointer unchanged.
-                assignments.insert(iv.value, pinned);
-                active.push((iv.clone(), pinned));
-                continue;
-            }
-            if iv.clobbers & register_mask(pinned) != 0 {
-                // Values consumed at the write or defined after it do not cross
-                // the clobber; a pinned value live through it cannot move.
-                return Err(RejectionReason::RegisterPressure);
-            }
-            let occupied = active.iter().any(|(_, r)| *r == pinned);
-            if occupied {
-                let conf = active
-                    .iter()
-                    .find(|(_, r)| *r == pinned)
-                    .map(|(a, _)| a.clone())
-                    .unwrap();
-                if conf.end <= iv.start {
-                    // conf's last use coincides with iv's definition (in-place
-                    // reuse, e.g. `mov rcx,[rcx]`); iv takes the register, conf dies.
-                    active.retain(|(a, _)| a.value != conf.value);
-                } else if conf.pinned.is_some() {
-                    // Two overlapping pins cannot be split by this allocator.
-                    return Err(RejectionReason::RegisterPressure);
-                } else {
-                    // A non-pinned value never sits in a register pinned by an
-                    // overlapping interval (enforced by the forbidden-set filter in
-                    // the unpinned path), so moving it here would be unsound under
-                    // the single-assignment lowering: reject instead.
-                    return Err(RejectionReason::RegisterPressure);
-                }
-            } else {
-                match pinned {
-                    PhysReg::Gpr(g) => free_gprs.retain(|x| *x != g),
-                    PhysReg::Xmm(x) => free_xmms.retain(|v| *v != x),
-                    PhysReg::Flag(_) => {}
-                }
-            }
-
-            assignments.insert(iv.value, pinned);
-            active.push((iv.clone(), pinned));
-        } else {
-            let forbidden: HashSet<PhysReg> = pins
-                .iter()
-                .filter(|(_, s, e)| *s < iv.end && iv.start < *e)
-                .map(|(r, _, _)| *r)
-                .collect();
-            let reg = if needs_xmm {
-                let pos = if iv.clobbers != 0 {
-                    free_xmms.iter().position(|x| {
-                        iv.clobbers & register_mask(PhysReg::Xmm(*x)) == 0
-                            && !forbidden.contains(&PhysReg::Xmm(*x))
-                    })
-                } else {
-                    // Prefer a volatile so callee-saved stay free for crossers; fall
-                    // back to any free register the pins leave available.
-                    free_xmms
-                        .iter()
-                        .position(|x| {
-                            !is_callee_saved_xmm(*x) && !forbidden.contains(&PhysReg::Xmm(*x))
-                        })
-                        .or_else(|| {
-                            free_xmms
-                                .iter()
-                                .position(|x| !forbidden.contains(&PhysReg::Xmm(*x)))
-                        })
-                };
-                match pos {
-                    Some(p) => PhysReg::Xmm(free_xmms.remove(p)),
-                    None => return Err(RejectionReason::RegisterPressure),
-                }
-            } else {
-                let pos = if iv.clobbers != 0 {
-                    free_gprs.iter().position(|g| {
-                        iv.clobbers & register_mask(PhysReg::Gpr(*g)) == 0
-                            && !forbidden.contains(&PhysReg::Gpr(*g))
-                    })
-                } else {
-                    // Prefer a volatile so callee-saved stay free for crossers;
-                    // fall back to any free register the pins leave available.
-                    free_gprs
-                        .iter()
-                        .position(|g| {
-                            !is_callee_saved_gpr(*g) && !forbidden.contains(&PhysReg::Gpr(*g))
-                        })
-                        .or_else(|| {
-                            free_gprs
-                                .iter()
-                                .position(|g| !forbidden.contains(&PhysReg::Gpr(*g)))
-                        })
-                };
-                match pos {
-                    Some(p) => PhysReg::Gpr(free_gprs.remove(p)),
-                    None => return Err(RejectionReason::RegisterPressure),
-                }
-            };
-
-            assignments.insert(iv.value, reg);
-            active.push((iv.clone(), reg));
-        }
-    }
-    let edge_copies = compute_edge_copies(func, &order, &intervals, &assignments)?;
-
-    Ok(RegAllocation {
-        assignments,
-        copies,
-        edge_copies,
-        flag_scratch,
-    })
+    Ok(Some(NativeFrameAddress {
+        value,
+        adjustment,
+        ranges,
+        bit_index,
+    }))
 }
 
-fn successors(term: &IrTerminator) -> Vec<BlockId> {
-    match term {
-        IrTerminator::Jump(t) => vec![*t],
-        IrTerminator::Branch {
-            taken, not_taken, ..
-        } => vec![*taken, *not_taken],
-        IrTerminator::Ret
-        | IrTerminator::NoReturn
-        | IrTerminator::Tail { .. }
-        | IrTerminator::Unreachable => vec![],
-    }
-}
-
-/// SSA destruction: for every edge `pred -> succ` whose successor carries phis,
-/// build the parallel register copy (succ phi dest <- that pred's phi arg) and
-/// sequentialize it. A residual copy cycle is broken with a volatile register
-/// free at the predecessor's terminator; if none is free the function is
-/// rejected (D5: never spill to the stack).
-fn compute_edge_copies(
+fn refine_native_frame(
     func: &IrFunction,
-    order: &[BlockId],
-    intervals: &[LiveInterval],
-    assignments: &HashMap<ValueId, PhysReg>,
-) -> Result<HashMap<(BlockId, BlockId), Vec<RegCopy>>, RejectionReason> {
-    let mut order_index: HashMap<BlockId, usize> = HashMap::new();
-    for (i, &b) in order.iter().enumerate() {
-        order_index.insert(b, i);
-    }
-    let mut result: HashMap<(BlockId, BlockId), Vec<RegCopy>> = HashMap::new();
-    for &pb in order {
-        let pred = func.block(pb);
-        let pidx = order_index[&pb];
-        let pterm = linear_point(pidx, pred.phis.len() + pred.insts.len());
-        for sb in successors(&pred.term) {
-            let succ = func.block(sb);
-            if succ.phis.is_empty() {
+    constants: &HashMap<ValueId, u64>,
+    analysis: &mut FrameAnalysis,
+) -> Result<i64, RejectionReason> {
+    let mut lowest = -i64::from(analysis.original_size);
+    let mut instruction_info = None;
+    let mut highest = 0;
+    for block in &func.blocks {
+        for inst in &block.insts {
+            let IrOp::NativeInline(native) = &inst.op else {
                 continue;
+            };
+            let mut decoder = Decoder::new(64, &native.bytes, DecoderOptions::NONE);
+            let instruction = decoder.decode();
+            if instruction.is_invalid() || decoder.can_decode() {
+                return Err(RejectionReason::UnsupportedInstruction);
             }
-            let mut pairs: Vec<(PhysReg, PhysReg, IrType)> = Vec::new();
-            for phi in &succ.phis {
-                let Some((_, src_val)) = phi.args.iter().find(|(pr, _)| *pr == pb) else {
-                    continue;
-                };
-                let (Some(&dst), Some(&src)) =
-                    (assignments.get(&phi.dest), assignments.get(src_val))
-                else {
-                    return Err(RejectionReason::RegisterPressure);
-                };
-                pairs.push((dst, src, phi.ty));
+            if !matches!(
+                instruction.flow_control(),
+                FlowControl::Next | FlowControl::Exception
+            ) {
+                return Err(RejectionReason::UnsupportedInstruction);
             }
-            let busy: HashSet<PhysReg> = intervals
-                .iter()
-                .filter(|iv| iv.start <= pterm && pterm <= iv.end)
-                .filter_map(|iv| assignments.get(&iv.value).copied())
-                .collect();
-            let edge_regs: HashSet<PhysReg> = pairs.iter().flat_map(|(d, s, _)| [*d, *s]).collect();
-            let mut free_gpr: Vec<PhysReg> = VOLATILE_GPRS
-                .iter()
-                .map(|g| PhysReg::Gpr(*g))
-                .filter(|r| !busy.contains(r) && !edge_regs.contains(r))
-                .collect();
-            let mut free_xmm: Vec<PhysReg> = VOLATILE_XMMS
-                .iter()
-                .map(|x| PhysReg::Xmm(*x))
-                .filter(|r| !busy.contains(r) && !edge_regs.contains(r))
-                .collect();
-            let seq = sequence_copies(&pairs, &mut free_gpr, &mut free_xmm)
-                .ok_or(RejectionReason::RegisterPressure)?;
-            if !seq.is_empty() {
-                result.insert((pb, sb), seq);
+            if instruction.memory_base() == Register::None
+                && instruction.memory_index() == Register::None
+                && inst.args.iter().any(|value| {
+                    analysis.offsets.contains_key(value)
+                        || analysis.pointer_bounds.contains_key(value)
+                })
+                && !instruction_info
+                    .get_or_insert_with(InstructionInfoFactory::new)
+                    .info(&instruction)
+                    .used_memory()
+                    .is_empty()
+            {
+                return Err(RejectionReason::FrameDynamic);
+            }
+            if instruction.rflags_read() != 0
+                || native
+                    .reads
+                    .iter()
+                    .chain(&native.writes)
+                    .any(|register| matches!(register, PhysReg::Flag(_)))
+            {
+                return Err(RejectionReason::UnsupportedFlags);
+            }
+            let direct_rsp = (0..instruction.op_count()).any(|operand| {
+                instruction.op_kind(operand) == OpKind::Register
+                    && instruction.op_register(operand).full_register() == Register::RSP
+            });
+            if direct_rsp
+                && crate::MEMORY_SCRATCH_GPRS.iter().all(|register| {
+                    native.reads.contains(register) || native.writes.contains(register)
+                })
+            {
+                return Err(RejectionReason::UnsupportedInstruction);
+            }
+            let Some(address) = native_frame_address(inst, &instruction, constants, analysis)?
+            else {
+                continue;
+            };
+            if !analysis.offsets.contains_key(&address.value)
+                && (address.crosses_zone()
+                    || (address.bit_index.is_some() && i32::try_from(address.adjustment).is_err()))
+                && crate::MEMORY_SCRATCH_GPRS
+                    .iter()
+                    .filter(|register| {
+                        !native.reads.contains(register) && !native.writes.contains(register)
+                    })
+                    .count()
+                    <= usize::from(direct_rsp)
+            {
+                return Err(RejectionReason::UnsupportedInstruction);
+            }
+            let adjustment = address.adjustment;
+            let width = i64::try_from(instruction.memory_size().size())
+                .map_err(|_| RejectionReason::FrameOverflow)?;
+            if width == 0 {
+                return Err(RejectionReason::FrameDynamic);
+            }
+            for (low, high) in address.ranges.into_iter().flatten() {
+                let start = low
+                    .checked_add(adjustment)
+                    .ok_or(RejectionReason::FrameOverflow)?;
+                let last = high
+                    .checked_add(adjustment)
+                    .ok_or(RejectionReason::FrameOverflow)?;
+                let end = last
+                    .checked_add(width - 1)
+                    .ok_or(RejectionReason::FrameOverflow)?;
+                i32::try_from(start).map_err(|_| RejectionReason::FrameOverflow)?;
+                i32::try_from(end).map_err(|_| RejectionReason::FrameOverflow)?;
+                if start < 0 && end >= 0 {
+                    return Err(RejectionReason::FrameConflict);
+                }
+                lowest = lowest.min(start);
+                highest = highest.max(end);
             }
         }
     }
-    Ok(result)
+    if lowest < 0 {
+        let required = u32::try_from(lowest.checked_neg().ok_or(RejectionReason::FrameOverflow)?)
+            .map_err(|_| RejectionReason::FrameOverflow)?;
+        analysis.original_size = (required
+            .checked_add(7)
+            .ok_or(RejectionReason::FrameOverflow)?
+            & !15)
+            .checked_add(8)
+            .ok_or(RejectionReason::FrameOverflow)?;
+        check_frame_size(analysis.original_size)?;
+    }
+    Ok(highest)
 }
 
-/// Sequentialize a parallel register copy. Each destination is written once, so
-/// the move graph is chains and simple cycles: emit a move whose destination no
-/// pending move still reads, and break a residual cycle by parking one register
-/// in a free scratch. Returns `None` when a cycle needs a scratch and none is
-/// free.
-fn sequence_copies(
-    pairs: &[(PhysReg, PhysReg, IrType)],
-    free_gpr: &mut Vec<PhysReg>,
-    free_xmm: &mut Vec<PhysReg>,
-) -> Option<Vec<RegCopy>> {
-    let mut moves: Vec<(PhysReg, PhysReg, IrType)> =
-        pairs.iter().copied().filter(|(d, s, _)| d != s).collect();
-    let mut out: Vec<RegCopy> = Vec::new();
-    while !moves.is_empty() {
-        if let Some(i) = moves
-            .iter()
-            .position(|(d, _, _)| !moves.iter().any(|(_, s, _)| s == d))
-        {
-            let (to, from, ty) = moves.remove(i);
-            out.push(RegCopy {
-                point: 0,
-                from,
-                to,
-                ty,
-            });
-        } else {
-            let d = moves[0].0;
-            let ty = moves[0].2;
-            let scratch = match d {
-                PhysReg::Xmm(_) => free_xmm.pop(),
-                _ => free_gpr.pop(),
-            }?;
-            out.push(RegCopy {
-                point: 0,
-                from: d,
-                to: scratch,
-                ty,
-            });
-            for m in moves.iter_mut() {
-                if m.1 == d {
-                    m.1 = scratch;
-                }
+fn materialized_values(func: &IrFunction, used: &HashSet<ValueId>) -> HashSet<ValueId> {
+    let mut values = HashSet::new();
+    for block in &func.blocks {
+        for phi in &block.phis {
+            if used.contains(&phi.dest) {
+                values.extend(phi.args.iter().map(|(_, value)| *value));
+            }
+        }
+        for inst in &block.insts {
+            if inst.dest.is_some_and(|dest| !used.contains(&dest))
+                && !matches!(
+                    inst.op,
+                    IrOp::Store
+                        | IrOp::Use
+                        | IrOp::StackProbe
+                        | IrOp::Call { .. }
+                        | IrOp::CallIndirect { .. }
+                        | IrOp::NativeInline(_)
+                        | IrOp::UDiv
+                        | IrOp::SDiv
+                )
+            {
+                continue;
+            }
+            // Projections depend on the producer, not on its primary result bits.
+            if !(matches!(inst.op, IrOp::URem | IrOp::SRem)
+                || matches!(inst.op, IrOp::Mul) && inst.args.len() == 1)
+            {
+                values.extend(inst.args.iter().copied());
+            }
+        }
+        if let IrTerminator::Branch { cond, .. } = block.term {
+            values.insert(cond);
+        }
+    }
+    values
+}
+
+pub fn allocate_registers(
+    func: &IrFunction,
+    rsp_pinned: &HashSet<ValueId>,
+    reg_pins: &HashMap<ValueId, PhysReg>,
+) -> Result<RegAllocation, RejectionReason> {
+    let model = analyze_values(func)?;
+    let materialized = materialized_values(func, &model.used);
+    validate_implicit_arithmetic(func)?;
+    let mut analysis = FrameAnalysis::analyze(func, rsp_pinned, reg_pins)?;
+    let native_highest = refine_native_frame(func, &model.constants, &mut analysis)?;
+    check_frame_size(analysis.original_size)?;
+    let mut pins: HashMap<_, _> = reg_pins
+        .iter()
+        .filter_map(|(&value, &register)| model.used.contains(&value).then_some((value, register)))
+        .collect();
+    for &value in rsp_pinned.intersection(&model.used) {
+        pins.insert(value, PhysReg::Gpr(Gpr::Rsp));
+    }
+    for &value in &model.used {
+        let Definition::Inst(inst) = model.definitions[&value] else {
+            continue;
+        };
+        if let IrOp::CallResult { register } = inst.op {
+            pins.insert(value, register);
+        }
+        if matches!(inst.op, IrOp::CarryShl | IrOp::CarryShr | IrOp::CarrySar) {
+            let count = model
+                .constants
+                .get(&inst.args[1])
+                .ok_or(RejectionReason::UnsupportedFlags)?;
+            let width = model.definitions[&inst.args[0]].ty().bits();
+            let mask = if width == 64 { 63 } else { 31 };
+            if count & mask == 0 {
+                return Err(RejectionReason::UnsupportedFlags);
             }
         }
     }
-    Some(out)
+    if pins
+        .values()
+        .any(|register| matches!(register, PhysReg::Flag(_)))
+    {
+        return Err(RejectionReason::UnsupportedFlags);
+    }
+    let classes = value_classes(&model, &pins)?;
+    let mut cursor = analysis.original_size;
+    let mut homes = HashMap::new();
+    let mut values: Vec<_> = materialized
+        .iter()
+        .copied()
+        .filter(|value| {
+            !model.constants.contains_key(value) && !analysis.offsets.contains_key(value)
+        })
+        .collect();
+    values.sort_unstable();
+    for value in values {
+        let ty = model.definitions[&value].ty();
+        let offset = reserve_slot(&mut cursor, ty.bytes(), ty.bytes())?;
+        homes.insert(
+            value,
+            FrameHome {
+                offset,
+                ty,
+                class: classes[&value],
+            },
+        );
+    }
+    let copy_scratch = reserve_slot(&mut cursor, 16, 16)?;
+    let mut written: HashSet<_> = pins.values().copied().collect();
+    for block in &func.blocks {
+        for inst in &block.insts {
+            match &inst.op {
+                IrOp::NativeInline(native) => {
+                    written.extend(native.reads.iter().chain(&native.writes).copied());
+                }
+                IrOp::Call { clobbers, .. } | IrOp::CallIndirect { clobbers } => {
+                    written.extend(clobbers.iter().copied());
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut saves = Vec::new();
+    for register in CALLEE_SAVED_GPRS
+        .into_iter()
+        .chain(CALLEE_SAVED_XMMS.map(PhysReg::Xmm))
+        .filter(|register| written.contains(register))
+    {
+        let width = if matches!(register, PhysReg::Xmm(_)) {
+            16
+        } else {
+            8
+        };
+        let offset = reserve_slot(&mut cursor, width, width)?;
+        saves.push(FrameSave { register, offset });
+    }
+    // Uniform relocation must preserve original entry-RSP alignment, even for empty frames.
+    let overhead = cursor
+        .checked_sub(analysis.original_size)
+        .and_then(|size| size.checked_add(15))
+        .map(|size| size & !15)
+        .ok_or(RejectionReason::FrameOverflow)?;
+    let stack_size = analysis
+        .original_size
+        .checked_add(overhead)
+        .ok_or(RejectionReason::FrameOverflow)?;
+    check_frame_size(stack_size)?;
+    let frame = ConcreteFrame {
+        stack_size,
+        original_size: analysis.original_size,
+        outgoing_size: analysis.outgoing_size,
+        copy_scratch,
+        saves,
+    };
+    for &delta in analysis.offsets.values() {
+        i32::try_from(frame.address_offset(delta)).map_err(|_| RejectionReason::FrameOverflow)?;
+    }
+    i32::try_from(frame.address_offset(native_highest))
+        .map_err(|_| RejectionReason::FrameOverflow)?;
+    Ok(RegAllocation {
+        assignments: pins.clone(),
+        homes,
+        frame,
+        analysis,
+        pins,
+        constants: model.constants,
+        value_types: model
+            .used
+            .iter()
+            .map(|&value| (value, model.definitions[&value].ty()))
+            .collect(),
+        used: model.used,
+        ..RegAllocation::default()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kamy_core::ir::*;
+    use kamy_core::ir::{BlockId, IrBlock, NativeInst};
 
-    fn make_test_function() -> IrFunction {
-        let mut func = IrFunction {
-            entry: BlockId(0),
-            blocks: vec![],
-            next_value: 0,
-        };
-
-        let v0 = func.alloc_value(); // arg1
-        let v1 = func.alloc_value(); // arg2
-        let v2 = func.alloc_value(); // add result
-        let v3 = func.alloc_value(); // arg3
-        let v4 = func.alloc_value(); // add result 2
-        let v5 = func.alloc_value(); // store addr (unused dest but needed as arg)
-
-        let block = IrBlock {
-            id: BlockId(0),
-            phis: vec![],
-            insts: vec![
-                Inst {
-                    dest: Some(v0),
-                    op: IrOp::Const(10),
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(v1),
-                    op: IrOp::Const(20),
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(v2),
-                    op: IrOp::Add,
-                    args: vec![v0, v1],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(v3),
-                    op: IrOp::Const(30),
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(v4),
-                    op: IrOp::Add,
-                    args: vec![v2, v3],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(v5),
-                    op: IrOp::Const(0x1000),
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: None,
-                    op: IrOp::Store,
-                    args: vec![v5, v4],
-                    ty: IrType::I64,
-                },
-            ],
-            term: IrTerminator::Ret,
-        };
-
-        func.blocks.push(block);
-        func
-    }
-
-    #[test]
-    fn branch_on_add_flag_reserves_r11_scratch() {
-        // b0: a=Undef, b=Undef, r=Add(a,b), cf=CarryAdd(a,b); branch cf -> b1:b2
-        let mut func = IrFunction {
-            entry: BlockId(0),
-            blocks: vec![],
-            next_value: 0,
-        };
-        let a = func.alloc_value();
-        let b = func.alloc_value();
-        let r = func.alloc_value();
-        let cf = func.alloc_value();
-        func.blocks.push(IrBlock {
-            id: BlockId(0),
-            phis: vec![],
-            insts: vec![
-                Inst {
-                    dest: Some(a),
-                    op: IrOp::Undef,
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(b),
-                    op: IrOp::Undef,
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(r),
-                    op: IrOp::Add,
-                    args: vec![a, b],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(cf),
-                    op: IrOp::CarryAdd,
-                    args: vec![a, b],
-                    ty: IrType::I8,
-                },
-            ],
-            term: IrTerminator::Branch {
-                cond: cf,
-                taken: BlockId(1),
-                not_taken: BlockId(2),
-            },
-        });
-        for id in [BlockId(1), BlockId(2)] {
-            func.blocks.push(IrBlock {
-                id,
-                phis: vec![],
-                insts: vec![],
-                term: IrTerminator::Ret,
-            });
+    fn inst(dest: u32, op: IrOp, args: &[u32], ty: IrType) -> Inst {
+        Inst {
+            dest: Some(ValueId(dest)),
+            op,
+            args: args.iter().copied().map(ValueId).collect(),
+            ty,
         }
-        let mut reg_pins = HashMap::new();
-        reg_pins.insert(a, PhysReg::Gpr(Gpr::Rcx));
-        reg_pins.insert(b, PhysReg::Gpr(Gpr::Rdx));
-        let alloc =
-            allocate_registers(&func, &CALLEE_SAVED_GPRS, &HashSet::new(), &reg_pins).unwrap();
-        assert_eq!(alloc.flag_scratch, Some(PhysReg::Gpr(Gpr::R11)));
-        assert!(
-            !alloc
-                .assignments
-                .values()
-                .any(|p| *p == PhysReg::Gpr(Gpr::R11)),
-            "R11 is reserved as flag scratch and must not be assigned to any value"
-        );
     }
 
-    #[test]
-    fn allocate_simple_no_copies() {
-        let func = make_test_function();
-        let result = allocate_registers(&func, &[], &HashSet::new(), &HashMap::new()).unwrap();
-
-        assert!(result.assignments.contains_key(&ValueId(0)));
-        assert!(result.assignments.contains_key(&ValueId(1)));
-        assert!(result.assignments.contains_key(&ValueId(2)));
-        assert!(result.assignments.contains_key(&ValueId(3)));
-        assert!(result.assignments.contains_key(&ValueId(4)));
-        assert!(result.assignments.contains_key(&ValueId(5)));
-
-        let r0 = result.assignments[&ValueId(2)];
-        let r1 = result.assignments[&ValueId(4)];
-        assert!(matches!(r0, PhysReg::Gpr(_)), "v2 should be in a GPR");
-        assert!(matches!(r1, PhysReg::Gpr(_)), "v4 should be in a GPR");
+    fn used(values: &[u32]) -> Inst {
+        Inst {
+            dest: None,
+            op: IrOp::Use,
+            args: values.iter().copied().map(ValueId).collect(),
+            ty: IrType::I64,
+        }
     }
 
-    #[test]
-    fn callee_saved_used_canonical_order() {
-        let mut assignments = HashMap::new();
-        assignments.insert(ValueId(0), PhysReg::Gpr(Gpr::R13));
-        assignments.insert(ValueId(1), PhysReg::Gpr(Gpr::Rbx));
-        assignments.insert(ValueId(2), PhysReg::Gpr(Gpr::Rax));
-        let alloc = RegAllocation {
-            assignments,
-            copies: vec![],
-            edge_copies: HashMap::new(),
-            flag_scratch: None,
-        };
-        assert_eq!(
-            callee_saved_used(&alloc),
-            vec![iced_x86::Register::RBX, iced_x86::Register::R13]
-        );
-    }
-
-    #[test]
-    fn xmm_value_across_call_uses_callee_saved() {
-        // An XMM value live across a call previously rejected (no callee-saved XMM
-        // pool); with XMM6..XMM15 it must allocate and be reported as used.
-        let mut func = IrFunction {
+    fn function(insts: Vec<Inst>) -> IrFunction {
+        IrFunction {
             entry: BlockId(0),
-            blocks: vec![],
-            next_value: 0,
-        };
-        let addr = func.alloc_value();
-        let xv = func.alloc_value();
-        let callret = func.alloc_value();
-        func.blocks.push(IrBlock {
-            id: BlockId(0),
-            phis: vec![],
-            insts: vec![
-                Inst {
-                    dest: Some(addr),
-                    op: IrOp::Const(0x1000),
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(xv),
-                    op: IrOp::Load,
-                    args: vec![addr],
-                    ty: IrType::I128,
-                },
-                Inst {
-                    dest: Some(callret),
-                    op: IrOp::Call {
-                        target: kamy_core::Reference {
-                            source: kamy_core::SymbolId::Host {
-                                rva: kamy_core::Rva::ZERO,
-                            },
-                            offset: 0,
-                            expression: kamy_core::SymbolicExpression::symbol(
-                                kamy_core::SymbolId::Host {
-                                    rva: kamy_core::Rva::new(0x2000),
-                                },
-                            ),
-                            field: kamy_core::LinkField::Relative32 { bias: 0 },
-                            origin: kamy_core::ReferenceOrigin::HostAnalysis,
-                        },
-                        clobbers: kamy_core::ir::win64_volatiles(),
-                    },
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: None,
-                    op: IrOp::Store,
-                    args: vec![addr, xv],
-                    ty: IrType::I128,
-                },
-            ],
-            term: IrTerminator::Ret,
-        });
-
-        let alloc = allocate_registers(&func, &CALLEE_SAVED_GPRS, &HashSet::new(), &HashMap::new())
-            .expect("xmm-across-call must allocate with the callee-saved pool");
-        let phys = alloc.assignments[&xv];
-        assert!(
-            matches!(phys, PhysReg::Xmm(x) if is_callee_saved_xmm(x)),
-            "xmm value crossing a call must land in a callee-saved XMM, got {phys:?}"
-        );
-        assert_eq!(
-            callee_saved_xmms_used(&alloc),
-            vec![iced_x86::Register::XMM6]
-        );
-    }
-
-    #[test]
-    fn volatile_pinned_value_across_call_rejects() {
-        // A value pinned to a volatile register (an incoming arg) that outlives a
-        // call would be clobbered by it, and the single-assignment lowering cannot
-        // relocate a pinned value mid-life, so the allocator rejects rather than
-        // miscompile. Recovering these needs live-range splitting (see STATUS).
-        let mut func = IrFunction {
-            entry: BlockId(0),
-            blocks: vec![],
-            next_value: 0,
-        };
-        let arg = func.alloc_value();
-        let callret = func.alloc_value();
-        let data = func.alloc_value();
-        func.blocks.push(IrBlock {
-            id: BlockId(0),
-            phis: vec![],
-            insts: vec![
-                Inst {
-                    dest: Some(arg),
-                    op: IrOp::Undef,
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(callret),
-                    op: IrOp::Call {
-                        target: kamy_core::Reference {
-                            source: kamy_core::SymbolId::Host {
-                                rva: kamy_core::Rva::ZERO,
-                            },
-                            offset: 0,
-                            expression: kamy_core::SymbolicExpression::symbol(
-                                kamy_core::SymbolId::Host {
-                                    rva: kamy_core::Rva::new(0x2000),
-                                },
-                            ),
-                            field: kamy_core::LinkField::Relative32 { bias: 0 },
-                            origin: kamy_core::ReferenceOrigin::HostAnalysis,
-                        },
-                        clobbers: kamy_core::ir::win64_volatiles(),
-                    },
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(data),
-                    op: IrOp::Const(7),
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: None,
-                    op: IrOp::Store,
-                    args: vec![arg, data],
-                    ty: IrType::I64,
-                },
-            ],
-            term: IrTerminator::Ret,
-        });
-        let mut pins = HashMap::new();
-        pins.insert(arg, PhysReg::Gpr(Gpr::Rcx));
-        let r = allocate_registers(&func, &CALLEE_SAVED_GPRS, &HashSet::new(), &pins);
-        assert!(
-            matches!(r, Err(RejectionReason::RegisterPressure)),
-            "a volatile-pinned value crossing a call must reject, got {r:?}"
-        );
-    }
-
-    #[test]
-    fn nonpinned_value_avoids_overlapping_pinned_register() {
-        // v0 is live across the point where v1 is pinned to R9 (both feed v2).
-        // v0 must not also take R9 — otherwise the later pin would force an
-        // unsound mid-life register move.
-        let mut func = IrFunction {
-            entry: BlockId(0),
-            blocks: vec![],
-            next_value: 0,
-        };
-        let v0 = func.alloc_value();
-        let v1 = func.alloc_value();
-        let v2 = func.alloc_value();
-        func.blocks.push(IrBlock {
-            id: BlockId(0),
-            phis: vec![],
-            insts: vec![
-                Inst {
-                    dest: Some(v0),
-                    op: IrOp::Const(1),
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(v1),
-                    op: IrOp::Const(2),
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(v2),
-                    op: IrOp::Add,
-                    args: vec![v0, v1],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: None,
-                    op: IrOp::Use,
-                    args: vec![v2],
-                    ty: IrType::I64,
-                },
-            ],
-            term: IrTerminator::Ret,
-        });
-        let mut pins = HashMap::new();
-        pins.insert(v1, PhysReg::Gpr(Gpr::R9));
-        let alloc = allocate_registers(&func, &CALLEE_SAVED_GPRS, &HashSet::new(), &pins).unwrap();
-        assert_eq!(alloc.assignments[&v1], PhysReg::Gpr(Gpr::R9));
-        assert_ne!(alloc.assignments[&v0], PhysReg::Gpr(Gpr::R9));
-        assert!(
-            alloc.copies.is_empty(),
-            "no mid-life register move should be emitted"
-        );
-    }
-
-    // A `NativeInline` re-emits raw bytes that read/write fixed physical
-    // registers. The lifter pins the read values to the read regs and the
-    // write-Undef to the write reg; regalloc must honor those pins and must not
-    // park a value live across the native in the native's write register.
-    #[test]
-    fn native_inline_pins_reads_writes_and_spares_live_across() {
-        let mut func = IrFunction {
-            entry: BlockId(0),
-            blocks: vec![],
-            next_value: 0,
-        };
-        let across = func.alloc_value(); // defined before, used after the native
-        let rcx_v = func.alloc_value(); // read value pinned to RCX
-        let rdx_v = func.alloc_value(); // read value pinned to RDX
-        let nv = func.alloc_value(); // dead NativeInline dest
-        let rax_v = func.alloc_value(); // write-Undef pinned to RAX
-        func.blocks.push(IrBlock {
-            id: BlockId(0),
-            phis: vec![],
-            insts: vec![
-                Inst {
-                    dest: Some(across),
-                    op: IrOp::Const(10),
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(rcx_v),
-                    op: IrOp::Undef,
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(rdx_v),
-                    op: IrOp::Undef,
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(nv),
-                    op: IrOp::NativeInline(NativeInst {
-                        bytes: vec![0x90],
-                        references: vec![],
-                        reads: vec![PhysReg::Gpr(Gpr::Rcx), PhysReg::Gpr(Gpr::Rdx)],
-                        writes: vec![PhysReg::Gpr(Gpr::Rax)],
-                    }),
-                    args: vec![rcx_v, rdx_v],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(rax_v),
-                    op: IrOp::Undef,
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: None,
-                    op: IrOp::Use,
-                    args: vec![across],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: None,
-                    op: IrOp::Use,
-                    args: vec![rax_v],
-                    ty: IrType::I64,
-                },
-            ],
-            term: IrTerminator::Ret,
-        });
-        let mut pins = HashMap::new();
-        pins.insert(rcx_v, PhysReg::Gpr(Gpr::Rcx));
-        pins.insert(rdx_v, PhysReg::Gpr(Gpr::Rdx));
-        pins.insert(rax_v, PhysReg::Gpr(Gpr::Rax));
-        let alloc = allocate_registers(&func, &CALLEE_SAVED_GPRS, &HashSet::new(), &pins).unwrap();
-        assert_eq!(alloc.assignments[&rcx_v], PhysReg::Gpr(Gpr::Rcx));
-        assert_eq!(alloc.assignments[&rdx_v], PhysReg::Gpr(Gpr::Rdx));
-        assert_eq!(alloc.assignments[&rax_v], PhysReg::Gpr(Gpr::Rax));
-        // `across` is live over the native, so it must not land in the write reg
-        // (RAX) the raw bytes clobber, nor in either read reg.
-        assert_ne!(alloc.assignments[&across], PhysReg::Gpr(Gpr::Rax));
-        assert_ne!(alloc.assignments[&across], PhysReg::Gpr(Gpr::Rcx));
-        assert_ne!(alloc.assignments[&across], PhysReg::Gpr(Gpr::Rdx));
-    }
-
-    fn implicit_division_function(
-        ty: IrType,
-        signed: bool,
-    ) -> (IrFunction, HashMap<ValueId, PhysReg>) {
-        let insts = [
-            (Some(ValueId(0)), IrOp::Const(0), vec![]),
-            (Some(ValueId(1)), IrOp::Const(41), vec![]),
-            (Some(ValueId(2)), IrOp::Const(3), vec![]),
-            (
-                Some(ValueId(3)),
-                if signed { IrOp::SDiv } else { IrOp::UDiv },
-                vec![ValueId(0), ValueId(1), ValueId(2)],
-            ),
-            (
-                Some(ValueId(4)),
-                if signed { IrOp::SRem } else { IrOp::URem },
-                vec![ValueId(3)],
-            ),
-            (Some(ValueId(5)), IrOp::Copy, vec![ValueId(3)]),
-            (Some(ValueId(6)), IrOp::Copy, vec![ValueId(4)]),
-            (None, IrOp::Use, vec![ValueId(5), ValueId(6)]),
-        ]
-        .into_iter()
-        .map(|(dest, op, args)| Inst { dest, op, args, ty })
-        .collect();
-        let func = IrFunction {
-            entry: BlockId(0),
-            next_value: 7,
+            next_value: insts
+                .iter()
+                .filter_map(|inst| inst.dest)
+                .map(|v| v.0 + 1)
+                .max()
+                .unwrap_or(0),
             blocks: vec![IrBlock {
                 id: BlockId(0),
                 phis: vec![],
                 insts,
                 term: IrTerminator::Ret,
             }],
-        };
-        let pins = HashMap::from([
-            (ValueId(0), PhysReg::Gpr(Gpr::Rdx)),
-            (ValueId(1), PhysReg::Gpr(Gpr::Rax)),
-            (ValueId(3), PhysReg::Gpr(Gpr::Rax)),
-            (ValueId(4), PhysReg::Gpr(Gpr::Rdx)),
+        }
+    }
+
+    fn allocate(func: &IrFunction, pins: &HashMap<ValueId, PhysReg>) -> RegAllocation {
+        allocate_registers(func, &HashSet::new(), pins).unwrap()
+    }
+
+    fn call() -> Inst {
+        Inst {
+            dest: None,
+            op: IrOp::Call {
+                target: kamy_core::Reference {
+                    source: kamy_core::SymbolId::Host {
+                        rva: kamy_core::Rva::new(0x1000),
+                    },
+                    offset: 0,
+                    expression: kamy_core::SymbolicExpression::symbol(kamy_core::SymbolId::Host {
+                        rva: kamy_core::Rva::new(0x2000),
+                    }),
+                    field: kamy_core::LinkField::Relative32 { bias: 0 },
+                    origin: kamy_core::ReferenceOrigin::HostAnalysis,
+                },
+                clobbers: kamy_core::ir::win64_volatiles(),
+            },
+            args: vec![],
+            ty: IrType::I64,
+        }
+    }
+
+    fn native(reads: Vec<PhysReg>, writes: Vec<PhysReg>, args: &[u32]) -> Inst {
+        native_bytes(&[0x90], reads, writes, args)
+    }
+
+    fn native_bytes(bytes: &[u8], reads: Vec<PhysReg>, writes: Vec<PhysReg>, args: &[u32]) -> Inst {
+        Inst {
+            dest: None,
+            op: IrOp::NativeInline(NativeInst {
+                bytes: bytes.to_vec(),
+                references: vec![],
+                reads,
+                writes,
+            }),
+            args: args.iter().copied().map(ValueId).collect(),
+            ty: IrType::I64,
+        }
+    }
+
+    #[test]
+    fn only_live_nonliteral_values_receive_homes() {
+        let func = function(vec![
+            inst(0, IrOp::Const(10), &[], IrType::I64),
+            inst(1, IrOp::Const(20), &[], IrType::I64),
+            inst(2, IrOp::Add, &[0, 1], IrType::I64),
+            inst(3, IrOp::Undef, &[], IrType::I64),
+            inst(4, IrOp::Add, &[2, 3], IrType::I64),
+            inst(5, IrOp::Undef, &[], IrType::I64),
+            inst(6, IrOp::Copy, &[5], IrType::I64),
+            used(&[4]),
         ]);
-        (func, pins)
-    }
-
-    #[test]
-    fn implicit_arithmetic_allows_input_output_boundaries_and_spares_live_values() {
-        for ty in [IrType::I8, IrType::I16, IrType::I32, IrType::I64] {
-            for signed in [false, true] {
-                let (mut func, pins) = implicit_division_function(ty, signed);
-                let alloc = allocate_registers(&func, &[], &HashSet::new(), &pins).unwrap();
-                assert_eq!(alloc.assignments[&ValueId(0)], PhysReg::Gpr(Gpr::Rdx));
-                assert_eq!(alloc.assignments[&ValueId(1)], PhysReg::Gpr(Gpr::Rax));
-                assert_eq!(alloc.assignments[&ValueId(3)], PhysReg::Gpr(Gpr::Rax));
-                assert_eq!(alloc.assignments[&ValueId(4)], PhysReg::Gpr(Gpr::Rdx));
-                assert_ne!(alloc.assignments[&ValueId(2)], PhysReg::Gpr(Gpr::Rax));
-                assert_ne!(alloc.assignments[&ValueId(2)], PhysReg::Gpr(Gpr::Rdx));
-                func.blocks[0].insts.push(Inst {
-                    dest: None,
-                    op: IrOp::Use,
-                    args: vec![ValueId(1)],
-                    ty,
-                });
-                assert!(matches!(
-                    allocate_registers(&func, &[], &HashSet::new(), &pins),
-                    Err(RejectionReason::RegisterPressure)
-                ));
-
-                let (mut func, mut pins) = implicit_division_function(ty, signed);
-                func.blocks[0].insts[3].op = if signed { IrOp::SMulHi } else { IrOp::UMulHi };
-                func.blocks[0].insts[3].args = vec![ValueId(1), ValueId(2)];
-                func.blocks[0]
-                    .insts
-                    .retain(|inst| inst.dest != Some(ValueId(4)) && inst.dest != Some(ValueId(6)));
-                func.blocks[0].insts.last_mut().unwrap().args = vec![ValueId(5)];
-                pins.insert(ValueId(3), PhysReg::Gpr(Gpr::Rdx));
-                pins.remove(&ValueId(4));
-                let alloc = allocate_registers(&func, &[], &HashSet::new(), &pins).unwrap();
-                assert_eq!(alloc.assignments[&ValueId(3)], PhysReg::Gpr(Gpr::Rdx));
-                assert_ne!(alloc.assignments[&ValueId(2)], PhysReg::Gpr(Gpr::Rax));
-                func.blocks[0].insts.push(Inst {
-                    dest: None,
-                    op: IrOp::Use,
-                    args: vec![ValueId(1)],
-                    ty,
-                });
-                assert!(matches!(
-                    allocate_registers(&func, &[], &HashSet::new(), &pins),
-                    Err(RejectionReason::RegisterPressure)
-                ));
-            }
+        let allocation = allocate(&func, &HashMap::new());
+        assert_eq!(allocation.homes.len(), 3);
+        for value in [2, 3, 4] {
+            assert!(allocation.homes.contains_key(&ValueId(value)));
         }
+        assert_eq!(allocation.constants[&ValueId(0)], 10);
+        assert_eq!(allocation.constants[&ValueId(1)], 20);
+        assert!(!allocation.used.contains(&ValueId(5)));
+        assert!(!allocation.used.contains(&ValueId(6)));
+        assert!(allocation.assignments.is_empty());
     }
 
     #[test]
-    fn division_holds_rdx_until_the_remainder_projection() {
-        let (mut func, pins) = implicit_division_function(IrType::I64, false);
-        func.next_value = 8;
-        func.blocks[0].insts.insert(
-            4,
-            Inst {
-                dest: Some(ValueId(7)),
-                op: IrOp::Const(99),
-                args: vec![],
-                ty: IrType::I64,
-            },
+    fn homes_preserve_width_alignment_and_disjointness() {
+        let types = [
+            IrType::I8,
+            IrType::I16,
+            IrType::I32,
+            IrType::I64,
+            IrType::I128,
+        ];
+        let mut insts: Vec<_> = types
+            .iter()
+            .enumerate()
+            .map(|(value, &ty)| inst(value as u32, IrOp::Undef, &[], ty))
+            .collect();
+        insts.push(used(&[0, 1, 2, 3, 4]));
+        let allocation = allocate(&function(insts), &HashMap::new());
+        let mut end = allocation.analysis.original_size;
+        for (value, &ty) in types.iter().enumerate() {
+            let home = allocation.homes[&ValueId(value as u32)];
+            assert_eq!(home.ty, ty);
+            assert_eq!(home.offset % ty.bytes(), 0);
+            assert!(home.offset >= end);
+            end = home.offset + ty.bytes();
+        }
+        assert!(allocation.frame.copy_scratch >= end);
+        assert_eq!(allocation.frame.copy_scratch % 16, 0);
+        assert_eq!(
+            (allocation.frame.stack_size - allocation.frame.original_size) % 16,
+            0
         );
-        func.blocks[0].insts.insert(
-            5,
-            Inst {
-                dest: None,
-                op: IrOp::Use,
-                args: vec![ValueId(7)],
-                ty: IrType::I64,
-            },
+        assert_eq!(allocation.homes[&ValueId(4)].class, ValueClass::Xmm);
+    }
+
+    #[test]
+    fn volatile_boundary_values_survive_later_definitions_and_calls() {
+        let rax = PhysReg::Gpr(Gpr::Rax);
+        let func = function(vec![
+            inst(0, IrOp::Undef, &[], IrType::I64),
+            call(),
+            inst(1, IrOp::CallResult { register: rax }, &[], IrType::I64),
+            call(),
+            inst(2, IrOp::CallResult { register: rax }, &[], IrType::I64),
+            used(&[0, 1, 2]),
+        ]);
+        let pins = HashMap::from([(ValueId(0), rax)]);
+        let allocation = allocate(&func, &pins);
+        assert_eq!(allocation.homes.len(), 3);
+        assert_eq!(
+            allocation.pins,
+            HashMap::from([(ValueId(0), rax), (ValueId(1), rax), (ValueId(2), rax)])
         );
-        let alloc = allocate_registers(&func, &[], &HashSet::new(), &pins).unwrap();
-        assert_ne!(alloc.assignments[&ValueId(7)], PhysReg::Gpr(Gpr::Rdx));
-        let (_, reservations) = compute_live_intervals(&func, &block_order(&func));
-        assert!(reservations.contains(&(PhysReg::Gpr(Gpr::Rdx), 3, 6)));
-    }
-
-    fn implicit_multiplication_function(
-        ty: IrType,
-        signed: bool,
-    ) -> (IrFunction, HashMap<ValueId, PhysReg>) {
-        let (mut func, mut pins) = implicit_division_function(ty, signed);
-        func.blocks[0].insts[3].op = if signed { IrOp::SMulHi } else { IrOp::UMulHi };
-        func.blocks[0].insts[3].args = vec![ValueId(1), ValueId(2)];
-        func.blocks[0].insts[4].op = IrOp::Mul;
-        pins.insert(ValueId(3), PhysReg::Gpr(Gpr::Rdx));
-        pins.insert(ValueId(4), PhysReg::Gpr(Gpr::Rax));
-        (func, pins)
+        assert_eq!(allocation.analysis.call_deltas.len(), 2);
+        assert!(allocation.frame.saves.is_empty());
+        assert!(
+            allocation
+                .homes
+                .values()
+                .all(|home| home.offset >= allocation.frame.original_size)
+        );
     }
 
     #[test]
-    fn multiplication_projects_the_low_result_without_losing_rax() {
-        for ty in [IrType::I8, IrType::I16, IrType::I32, IrType::I64] {
-            for signed in [false, true] {
-                let (mut func, pins) = implicit_multiplication_function(ty, signed);
-                func.next_value = 8;
-                func.blocks[0].insts.insert(
-                    4,
-                    Inst {
-                        dest: Some(ValueId(7)),
-                        op: IrOp::Const(99),
-                        args: vec![],
-                        ty,
-                    },
-                );
-                func.blocks[0].insts.insert(
-                    5,
-                    Inst {
-                        dest: None,
-                        op: IrOp::Use,
-                        args: vec![ValueId(7)],
-                        ty,
-                    },
-                );
-                let alloc = allocate_registers(&func, &[], &HashSet::new(), &pins).unwrap();
-                assert_eq!(alloc.assignments[&ValueId(3)], PhysReg::Gpr(Gpr::Rdx));
-                assert_eq!(alloc.assignments[&ValueId(4)], PhysReg::Gpr(Gpr::Rax));
-                assert_ne!(alloc.assignments[&ValueId(2)], PhysReg::Gpr(Gpr::Rax));
-                assert_ne!(alloc.assignments[&ValueId(7)], PhysReg::Gpr(Gpr::Rax));
-                let (_, reservations) = compute_live_intervals(&func, &block_order(&func));
-                assert!(reservations.contains(&(PhysReg::Gpr(Gpr::Rax), 3, 6)));
-            }
-        }
-    }
-
-    #[test]
-    fn malformed_low_product_projections_fail_closed() {
-        for invalid in 0..8 {
-            let (mut func, mut pins) = implicit_multiplication_function(IrType::I64, false);
-            match invalid {
-                0 => {
-                    pins.remove(&ValueId(4));
-                }
-                1 => {
-                    func.blocks[0].insts[4].args = vec![ValueId(1)];
-                }
-                2 => {
-                    func.blocks[0].insts[4].ty = IrType::I128;
-                }
-                3 => {
-                    func.blocks[0].insts[3].ty = IrType::I32;
-                }
-                4 => {
-                    func.blocks[0].insts.insert(
-                        4,
-                        Inst {
-                            dest: None,
-                            op: IrOp::NativeInline(NativeInst {
-                                bytes: vec![0x0f, 0x31],
-                                references: vec![],
-                                reads: vec![],
-                                writes: vec![PhysReg::Gpr(Gpr::Rax), PhysReg::Gpr(Gpr::Rdx)],
-                            }),
-                            args: vec![],
-                            ty: IrType::I64,
-                        },
-                    );
-                }
-                5 => {
-                    func.next_value = 8;
-                    func.blocks[0].insts.insert(
-                        4,
-                        Inst {
-                            dest: Some(ValueId(7)),
-                            op: IrOp::Const(99),
-                            args: vec![],
-                            ty: IrType::I64,
-                        },
-                    );
-                    pins.insert(ValueId(7), PhysReg::Gpr(Gpr::Rax));
-                }
-                6 => {
-                    func.blocks[0].insts[4].args.clear();
-                }
-                _ => {
-                    pins.remove(&ValueId(3));
-                }
-            }
-            assert!(matches!(
-                allocate_registers(&func, &[], &HashSet::new(), &pins),
-                Err(RejectionReason::UnsupportedInstruction)
-            ));
-        }
-    }
-
-    #[test]
-    fn malformed_implicit_arithmetic_contracts_fail_closed() {
-        for invalid in 0..8 {
-            let (mut func, mut pins) = implicit_division_function(IrType::I64, false);
-            match invalid {
-                0 => {
-                    pins.remove(&ValueId(3));
-                }
-                1 => {
-                    pins.insert(ValueId(0), PhysReg::Gpr(Gpr::Rcx));
-                }
-                2 => {
-                    func.blocks[0].insts[4].op = IrOp::SRem;
-                }
-                3 => {
-                    func.blocks[0].insts[3].ty = IrType::I128;
-                }
-                4 => {
-                    func.blocks[0].insts[4].args = vec![ValueId(0)];
-                }
-                5 => {
-                    func.blocks[0].insts.insert(
-                        4,
-                        Inst {
-                            dest: None,
-                            op: IrOp::NativeInline(NativeInst {
-                                bytes: vec![0x0f, 0x31],
-                                references: vec![],
-                                reads: vec![],
-                                writes: vec![PhysReg::Gpr(Gpr::Rax), PhysReg::Gpr(Gpr::Rdx)],
-                            }),
-                            args: vec![],
-                            ty: IrType::I64,
-                        },
-                    );
-                }
-                6 => {
-                    pins.insert(ValueId(2), PhysReg::Gpr(Gpr::Rdx));
-                }
-                _ => {
-                    func.blocks[0].insts[3].args.pop();
-                }
-            }
-            assert!(matches!(
-                allocate_registers(&func, &[], &HashSet::new(), &pins),
-                Err(RejectionReason::UnsupportedInstruction)
-            ));
-        }
-    }
-
-    #[test]
-    fn native_writes_reject_crossing_pins_but_allow_read_modify_write_boundaries() {
-        for (phys, ty, bytes) in [
-            (PhysReg::Gpr(Gpr::Rax), IrType::I64, vec![0x48, 0x0f, 0xc8]),
-            (
-                PhysReg::Xmm(XmmReg::Xmm0),
-                IrType::I128,
-                vec![0x66, 0x0f, 0x70, 0xc0, 0],
-            ),
+    fn native_inputs_and_outputs_have_independent_homes() {
+        for (register, ty) in [
+            (PhysReg::Gpr(Gpr::Rax), IrType::I64),
+            (PhysReg::Xmm(XmmReg::Xmm0), IrType::I128),
         ] {
-            let input = ValueId(0);
-            let output = ValueId(1);
-            let mut func = IrFunction {
-                entry: BlockId(0),
-                next_value: 2,
-                blocks: vec![IrBlock {
-                    id: BlockId(0),
-                    phis: vec![],
-                    insts: vec![
-                        Inst {
-                            dest: Some(input),
-                            op: IrOp::Undef,
-                            args: vec![],
-                            ty,
-                        },
-                        Inst {
-                            dest: None,
-                            op: IrOp::NativeInline(NativeInst {
-                                bytes,
-                                references: vec![],
-                                reads: vec![phys],
-                                writes: vec![phys],
-                            }),
-                            args: vec![input],
-                            ty,
-                        },
-                        Inst {
-                            dest: Some(output),
-                            op: IrOp::Undef,
-                            args: vec![],
-                            ty,
-                        },
-                        Inst {
-                            dest: None,
-                            op: IrOp::Use,
-                            args: vec![output],
-                            ty,
-                        },
-                    ],
-                    term: IrTerminator::Ret,
-                }],
-            };
-            let pins = HashMap::from([(input, phys), (output, phys)]);
-            let alloc =
-                allocate_registers(&func, &CALLEE_SAVED_GPRS, &HashSet::new(), &pins).unwrap();
-            assert_eq!(alloc.assignments[&input], phys);
-            assert_eq!(alloc.assignments[&output], phys);
-            func.blocks[0].insts.push(Inst {
-                dest: None,
-                op: IrOp::Use,
-                args: vec![input],
-                ty,
-            });
-            assert!(matches!(
-                allocate_registers(&func, &CALLEE_SAVED_GPRS, &HashSet::new(), &pins),
-                Err(RejectionReason::RegisterPressure)
-            ));
+            let func = function(vec![
+                inst(0, IrOp::Undef, &[], ty),
+                native(vec![register], vec![register], &[0]),
+                inst(1, IrOp::Undef, &[], ty),
+                used(&[0, 1]),
+            ]);
+            let pins = HashMap::from([(ValueId(0), register), (ValueId(1), register)]);
+            let allocation = allocate(&func, &pins);
+            assert_eq!(allocation.homes.len(), 2);
+            assert_ne!(
+                allocation.homes[&ValueId(0)].offset,
+                allocation.homes[&ValueId(1)].offset
+            );
         }
     }
 
-    // Issue #24: a value defined before a loop and used inside it is live across
-    // the back-edge, so its interval must reach the latch's terminator. The old
-    // syntactic last-use heuristic ended it at the in-body use, letting a later
-    // block reuse the register mid-loop and clobber the live value.
     #[test]
-    fn loop_invariant_value_lives_across_back_edge() {
-        // b0: inv=Undef, seed=Undef -> b1
-        // b1 header: cur=phi(seed, cur2); c=IsZero(cur); branch -> b3(exit):b2(body)
-        // b2 body: t=Add(cur,inv); one=Const(1); cur2=Sub(cur,one); Use(t) -> b1
-        // b3: ret
-        let mut func = IrFunction {
-            entry: BlockId(0),
-            blocks: vec![],
-            next_value: 0,
-        };
-        let inv = func.alloc_value();
-        let seed = func.alloc_value();
-        let cur = func.alloc_value();
-        let c = func.alloc_value();
-        let t = func.alloc_value();
-        let one = func.alloc_value();
-        let cur2 = func.alloc_value();
-
-        func.blocks.push(IrBlock {
-            id: BlockId(0),
-            phis: vec![],
-            insts: vec![
-                Inst {
-                    dest: Some(inv),
-                    op: IrOp::Undef,
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(seed),
-                    op: IrOp::Undef,
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-            ],
-            term: IrTerminator::Jump(BlockId(1)),
-        });
+    fn scalar_xmm_class_propagates_through_copies_and_loop_phis() {
+        let mut func = function(vec![inst(0, IrOp::Undef, &[], IrType::I64)]);
+        func.blocks[0].term = IrTerminator::Jump(BlockId(1));
         func.blocks.push(IrBlock {
             id: BlockId(1),
             phis: vec![Phi {
-                dest: cur,
+                dest: ValueId(1),
                 ty: IrType::I64,
-                args: vec![(BlockId(0), seed), (BlockId(2), cur2)],
+                args: vec![(BlockId(0), ValueId(0)), (BlockId(1), ValueId(2))],
             }],
-            insts: vec![Inst {
-                dest: Some(c),
-                op: IrOp::IsZero,
-                args: vec![cur],
-                ty: IrType::I8,
-            }],
-            term: IrTerminator::Branch {
-                cond: c,
-                taken: BlockId(3),
-                not_taken: BlockId(2),
-            },
-        });
-        func.blocks.push(IrBlock {
-            id: BlockId(2),
-            phis: vec![],
-            insts: vec![
-                Inst {
-                    dest: Some(t),
-                    op: IrOp::Add,
-                    args: vec![cur, inv],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(one),
-                    op: IrOp::Const(1),
-                    args: vec![],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: Some(cur2),
-                    op: IrOp::Sub,
-                    args: vec![cur, one],
-                    ty: IrType::I64,
-                },
-                Inst {
-                    dest: None,
-                    op: IrOp::Use,
-                    args: vec![t],
-                    ty: IrType::I64,
-                },
-            ],
+            insts: vec![inst(2, IrOp::Copy, &[1], IrType::I64), used(&[2])],
             term: IrTerminator::Jump(BlockId(1)),
         });
-        func.blocks.push(IrBlock {
-            id: BlockId(3),
-            phis: vec![],
-            insts: vec![],
-            term: IrTerminator::Ret,
-        });
-
-        let order = block_order(&func);
-        let (intervals, _) = compute_live_intervals(&func, &order);
-        let inv_iv = intervals
-            .iter()
-            .find(|iv| iv.value == inv)
-            .expect("inv has an interval");
-        let b2 = func.block(BlockId(2));
-        let b2_idx = order.iter().position(|&b| b == BlockId(2)).unwrap();
-        let latch_term = linear_point(b2_idx, b2.phis.len() + b2.insts.len());
-        assert!(
-            inv_iv.end >= latch_term,
-            "loop-invariant value must stay live through the back-edge: end={} latch_term={}",
-            inv_iv.end,
-            latch_term
+        func.next_value = 3;
+        let allocation = allocate(
+            &func,
+            &HashMap::from([(ValueId(2), PhysReg::Xmm(XmmReg::Xmm0))]),
         );
+        for value in 0..3 {
+            let home = allocation.homes[&ValueId(value)];
+            assert_eq!(home.class, ValueClass::Xmm);
+            assert_eq!(home.ty, IrType::I64);
+        }
     }
-}
-
-#[cfg(test)]
-mod symbolic_abi_tests {
-    use super::*;
-    use kamy_core::ir::{Inst, IrBlock};
 
     #[test]
-    fn call_liveness_uses_contract_clobbers_not_win64_register_names() {
-        let value = ValueId(0);
-        let target = kamy_core::Reference {
-            source: kamy_core::SymbolId::Host {
-                rva: kamy_core::Rva::new(0x1000),
-            },
-            offset: 1,
-            expression: kamy_core::SymbolicExpression::symbol(kamy_core::SymbolId::Generated {
-                name: "helper".into(),
-            }),
-            field: kamy_core::LinkField::Relative32 { bias: 0 },
-            origin: kamy_core::ReferenceOrigin::Generated,
-        };
-        let mut func = IrFunction {
-            entry: BlockId(0),
-            next_value: 1,
-            blocks: vec![IrBlock {
-                id: BlockId(0),
-                phis: vec![],
-                insts: vec![
-                    Inst {
-                        dest: Some(value),
-                        op: IrOp::Const(7),
-                        args: vec![],
-                        ty: IrType::I64,
-                    },
-                    Inst {
-                        dest: None,
-                        op: IrOp::Call {
-                            target,
-                            clobbers: vec![PhysReg::Gpr(Gpr::Rax)],
-                        },
-                        args: vec![],
-                        ty: IrType::I64,
-                    },
-                    Inst {
-                        dest: None,
-                        op: IrOp::Use,
-                        args: vec![value],
-                        ty: IrType::I64,
-                    },
-                ],
-                term: IrTerminator::Ret,
-            }],
-        };
-        let pins = HashMap::from([(value, PhysReg::Gpr(Gpr::Rcx))]);
-        assert!(allocate_registers(&func, &CALLEE_SAVED_GPRS, &HashSet::new(), &pins).is_ok());
-        if let IrOp::Call { clobbers, .. } = &mut func.blocks[0].insts[1].op {
-            *clobbers = vec![PhysReg::Gpr(Gpr::Rcx)];
+    fn explicit_gpr_xmm_copy_boundaries_keep_their_classes() {
+        let func = function(vec![
+            inst(0, IrOp::Undef, &[], IrType::I64),
+            inst(1, IrOp::Copy, &[0], IrType::I64),
+            used(&[1]),
+        ]);
+        let allocation = allocate(
+            &func,
+            &HashMap::from([
+                (ValueId(0), PhysReg::Gpr(Gpr::Rcx)),
+                (ValueId(1), PhysReg::Xmm(XmmReg::Xmm0)),
+            ]),
+        );
+        assert_eq!(allocation.homes[&ValueId(0)].class, ValueClass::Gpr);
+        assert_eq!(allocation.homes[&ValueId(1)].class, ValueClass::Xmm);
+    }
+
+    fn implicit_arithmetic(ty: IrType, signed: bool, multiply: bool) -> IrFunction {
+        function(vec![
+            inst(0, IrOp::Undef, &[], ty),
+            inst(1, IrOp::Undef, &[], ty),
+            inst(2, IrOp::Undef, &[], ty),
+            inst(
+                3,
+                match (multiply, signed) {
+                    (true, true) => IrOp::SMulHi,
+                    (true, false) => IrOp::UMulHi,
+                    (false, true) => IrOp::SDiv,
+                    (false, false) => IrOp::UDiv,
+                },
+                if multiply { &[1, 2] } else { &[0, 1, 2] },
+                ty,
+            ),
+            native(
+                vec![],
+                vec![PhysReg::Gpr(Gpr::Rax), PhysReg::Gpr(Gpr::Rdx)],
+                &[],
+            ),
+            inst(
+                4,
+                if multiply {
+                    IrOp::Mul
+                } else if signed {
+                    IrOp::SRem
+                } else {
+                    IrOp::URem
+                },
+                &[3],
+                ty,
+            ),
+            used(&[0, 1, 2, 3, 4]),
+        ])
+    }
+
+    #[test]
+    fn implicit_arithmetic_outputs_have_homes_without_pin_lifetimes() {
+        for ty in [IrType::I8, IrType::I16, IrType::I32, IrType::I64] {
+            for signed in [false, true] {
+                for multiply in [false, true] {
+                    let func = implicit_arithmetic(ty, signed, multiply);
+                    let allocation = allocate(&func, &HashMap::new());
+                    assert!(allocation.homes.contains_key(&ValueId(3)));
+                    assert!(allocation.homes.contains_key(&ValueId(4)));
+                    assert_eq!(allocation.homes.len(), 5);
+                }
+            }
         }
-        assert!(allocate_registers(&func, &CALLEE_SAVED_GPRS, &HashSet::new(), &pins).is_err());
+    }
+
+    #[test]
+    fn projection_dependencies_do_not_store_dead_primary_bits() {
+        for multiply in [false, true] {
+            let mut func = implicit_arithmetic(IrType::I64, false, multiply);
+            func.blocks[0].insts.last_mut().unwrap().args = vec![ValueId(4)];
+            let allocation = allocate(&func, &HashMap::new());
+            assert!(allocation.used.contains(&ValueId(3)));
+            assert!(!allocation.homes.contains_key(&ValueId(3)));
+            assert!(allocation.homes.contains_key(&ValueId(4)));
+        }
+    }
+
+    #[test]
+    fn malformed_implicit_arithmetic_fails_with_semantic_rejection() {
+        for multiply in [false, true] {
+            for invalid in 0..5 {
+                let mut func = implicit_arithmetic(IrType::I64, false, multiply);
+                match invalid {
+                    0 => func.blocks[0].insts[3].args.clear(),
+                    1 => func.blocks[0].insts[5].args = vec![ValueId(0)],
+                    2 => func.blocks[0].insts[5].ty = IrType::I32,
+                    3 => func.blocks[0].insts[3].ty = IrType::I128,
+                    _ => {
+                        func.blocks[0].insts[5].op = if multiply { IrOp::SRem } else { IrOp::Mul };
+                    }
+                }
+                assert!(matches!(
+                    allocate_registers(&func, &HashSet::new(), &HashMap::new()),
+                    Err(RejectionReason::UnsupportedInstruction)
+                ));
+            }
+        }
+        let mut func = implicit_arithmetic(IrType::I64, false, false);
+        func.blocks[0].insts[5].op = IrOp::SRem;
+        assert!(matches!(
+            allocate_registers(&func, &HashSet::new(), &HashMap::new()),
+            Err(RejectionReason::UnsupportedInstruction)
+        ));
+    }
+
+    #[test]
+    fn nonvolatile_saves_follow_effects_and_live_boundary_pins() {
+        let rbx = PhysReg::Gpr(Gpr::Rbx);
+        let r13 = PhysReg::Gpr(Gpr::R13);
+        let xmm8 = PhysReg::Xmm(XmmReg::Xmm8);
+        let mut custom_call = call();
+        if let IrOp::Call { clobbers, .. } = &mut custom_call.op {
+            clobbers.push(PhysReg::Xmm(XmmReg::Xmm7));
+        }
+        let func = function(vec![
+            inst(0, IrOp::Undef, &[], IrType::I64),
+            inst(1, IrOp::Undef, &[], IrType::I64),
+            native(vec![], vec![r13, xmm8], &[]),
+            custom_call,
+            used(&[0]),
+        ]);
+        let allocation = allocate(
+            &func,
+            &HashMap::from([(ValueId(0), rbx), (ValueId(1), PhysReg::Gpr(Gpr::R15))]),
+        );
+        let mut end = allocation.frame.copy_scratch + 16;
+        for save in &allocation.frame.saves {
+            let width = if matches!(save.register, PhysReg::Xmm(_)) {
+                16
+            } else {
+                8
+            };
+            assert_eq!(save.offset % width, 0);
+            assert!(save.offset >= end);
+            end = save.offset + width;
+        }
+        assert!(allocation.frame.stack_size >= end);
+    }
+
+    #[test]
+    fn original_stack_aliases_rematerialize_below_generated_homes() {
+        let func = function(vec![
+            inst(0, IrOp::Undef, &[], IrType::I64),
+            inst(1, IrOp::Const(40), &[], IrType::I64),
+            inst(2, IrOp::Sub, &[0, 1], IrType::I64),
+            inst(3, IrOp::Copy, &[2], IrType::I64),
+            inst(4, IrOp::Load, &[3], IrType::I64),
+            inst(5, IrOp::Add, &[2, 1], IrType::I64),
+            used(&[3, 4, 5]),
+        ]);
+        let allocation = allocate_registers(
+            &func,
+            &HashSet::from([ValueId(0), ValueId(2), ValueId(5)]),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(allocation.homes.len(), 1);
+        assert_eq!(allocation.analysis.offsets[&ValueId(3)], -40);
+        assert!(allocation.homes[&ValueId(4)].offset >= allocation.frame.original_size);
+        assert_eq!(allocation.frame.address_offset(-40), 0);
+        assert_eq!(
+            allocation.frame.address_offset(8),
+            i64::from(allocation.frame.stack_size) + 8
+        );
+    }
+
+    #[test]
+    fn slots_reject_resource_limits_and_numeric_overflow_distinctly() {
+        let mut cursor = MAX_FRAME_SIZE;
+        assert!(matches!(
+            reserve_slot(&mut cursor, 1, 1),
+            Err(RejectionReason::FrameResourceLimit)
+        ));
+        assert_eq!(cursor, MAX_FRAME_SIZE);
+        cursor = u32::MAX;
+        assert!(matches!(
+            reserve_slot(&mut cursor, 16, 16),
+            Err(RejectionReason::FrameOverflow)
+        ));
+        assert_eq!(cursor, u32::MAX);
+    }
+
+    #[test]
+    fn oversized_reconstructed_frames_reject_with_resource_reason() {
+        let func = function(vec![
+            inst(0, IrOp::Undef, &[], IrType::I64),
+            inst(1, IrOp::Const(u64::from(MAX_FRAME_SIZE)), &[], IrType::I64),
+            inst(2, IrOp::Sub, &[0, 1], IrType::I64),
+            inst(3, IrOp::Add, &[2, 1], IrType::I64),
+            used(&[3]),
+        ]);
+        assert!(matches!(
+            allocate_registers(
+                &func,
+                &HashSet::from([ValueId(0), ValueId(2), ValueId(3)]),
+                &HashMap::new(),
+            ),
+            Err(RejectionReason::FrameResourceLimit)
+        ));
+    }
+
+    #[test]
+    fn native_frame_displacements_extend_the_original_zone() {
+        for (base, bytes) in [
+            (Gpr::Rsp, &[0x48, 0x8B, 0x44, 0x24, 0xB0][..]),
+            (Gpr::Rbp, &[0x48, 0x8B, 0x45, 0xB0][..]),
+        ] {
+            let func = function(vec![
+                inst(0, IrOp::Undef, &[], IrType::I64),
+                native_bytes(
+                    bytes,
+                    vec![PhysReg::Gpr(base)],
+                    vec![PhysReg::Gpr(Gpr::Rax)],
+                    &[0],
+                ),
+                inst(1, IrOp::Undef, &[], IrType::I64),
+                used(&[0, 1]),
+            ]);
+            let allocation = allocate_registers(
+                &func,
+                &HashSet::from([ValueId(0)]),
+                &HashMap::from([(ValueId(1), PhysReg::Gpr(Gpr::Rax))]),
+            )
+            .unwrap();
+            assert_eq!(allocation.analysis.original_size, 88);
+            assert_eq!(allocation.frame.original_size, 88);
+            assert!(allocation.homes[&ValueId(1)].offset >= 88);
+            assert_eq!(allocation.frame.address_offset(-80), 8);
+        }
+    }
+
+    #[test]
+    fn native_frame_access_cannot_straddle_the_relocated_split() {
+        let func = function(vec![
+            inst(0, IrOp::Undef, &[], IrType::I64),
+            inst(1, IrOp::Const(52), &[], IrType::I64),
+            inst(2, IrOp::Sub, &[0, 1], IrType::I64),
+            native_bytes(
+                &[0x48, 0x8B, 0x45, 0x30],
+                vec![PhysReg::Gpr(Gpr::Rbp)],
+                vec![],
+                &[2],
+            ),
+            used(&[0]),
+        ]);
+        assert!(matches!(
+            allocate_registers(&func, &HashSet::from([ValueId(0)]), &HashMap::new()),
+            Err(RejectionReason::FrameConflict)
+        ));
+    }
+
+    #[test]
+    fn native_frame_indices_require_checked_literal_offsets() {
+        for (index, expected) in [
+            (IrOp::Const(2), Ok(72)),
+            (IrOp::Const(u64::MAX), Ok(88)),
+            (IrOp::Undef, Err(RejectionReason::FrameDynamic)),
+            (
+                IrOp::Const(i64::MAX as u64),
+                Err(RejectionReason::FrameOverflow),
+            ),
+        ] {
+            let func = function(vec![
+                inst(0, IrOp::Undef, &[], IrType::I64),
+                inst(1, index, &[], IrType::I64),
+                native_bytes(
+                    &[0x48, 0x8B, 0x44, 0xCC, 0xB0],
+                    vec![PhysReg::Gpr(Gpr::Rsp), PhysReg::Gpr(Gpr::Rcx)],
+                    vec![],
+                    &[0, 1],
+                ),
+                used(&[0]),
+            ]);
+            let result = allocate_registers(&func, &HashSet::from([ValueId(0)]), &HashMap::new());
+            match expected {
+                Ok(size) => assert_eq!(result.unwrap().frame.original_size, size),
+                Err(reason) => assert!(matches!(result, Err(actual) if actual == reason)),
+            }
+        }
+    }
+
+    #[test]
+    fn native_frame_extents_preserve_resource_and_overflow_causes() {
+        for (bytes, reason) in [
+            (
+                &[0x48, 0x8B, 0x84, 0x24, 0xFF, 0xFF, 0xFF, 0x7F][..],
+                RejectionReason::FrameOverflow,
+            ),
+            (
+                &[0x48, 0x8B, 0x84, 0x24, 0x00, 0x00, 0x00, 0xFF][..],
+                RejectionReason::FrameResourceLimit,
+            ),
+        ] {
+            let func = function(vec![
+                inst(0, IrOp::Undef, &[], IrType::I64),
+                native_bytes(bytes, vec![PhysReg::Gpr(Gpr::Rsp)], vec![], &[0]),
+                used(&[0]),
+            ]);
+            assert!(matches!(
+                allocate_registers(&func, &HashSet::from([ValueId(0)]), &HashMap::new()),
+                Err(actual) if actual == reason
+            ));
+        }
+    }
+
+    #[test]
+    fn only_native_direct_rsp_operands_need_a_free_physical_scratch() {
+        for (bytes, occupied, rejects) in [
+            (&[0x48, 0x89, 0xE0][..], 7, true),
+            (&[0x48, 0x89, 0xE0][..], 6, false),
+            (&[0x48, 0x8B, 0x04, 0x24][..], 7, false),
+        ] {
+            let mut reads = vec![PhysReg::Gpr(Gpr::Rsp)];
+            reads.extend_from_slice(&crate::MEMORY_SCRATCH_GPRS[..occupied]);
+            let mut insts: Vec<_> = (0..=occupied as u32)
+                .map(|value| inst(value, IrOp::Undef, &[], IrType::I64))
+                .collect();
+            insts.push(native_bytes(
+                bytes,
+                reads,
+                vec![],
+                &(0..=occupied as u32).collect::<Vec<_>>(),
+            ));
+            insts.push(used(&[0]));
+            let result = allocate_registers(
+                &function(insts),
+                &HashSet::from([ValueId(0)]),
+                &HashMap::new(),
+            );
+            if rejects {
+                assert!(matches!(
+                    result,
+                    Err(RejectionReason::UnsupportedInstruction)
+                ));
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn native_frame_proof_rejects_truncated_or_multiple_instructions() {
+        for bytes in [&[][..], &[0x48, 0x8B][..], &[0x90, 0x90][..]] {
+            let func = function(vec![native_bytes(bytes, vec![], vec![], &[])]);
+            assert!(matches!(
+                allocate_registers(&func, &HashSet::new(), &HashMap::new()),
+                Err(RejectionReason::UnsupportedInstruction)
+            ));
+        }
+    }
+
+    #[test]
+    fn stack_probe_keeps_its_proven_inputs_without_memory_homes() {
+        let func = function(vec![
+            inst(0, IrOp::Const(4096), &[], IrType::I64),
+            inst(1, IrOp::FrameAddress(0), &[], IrType::I64),
+            Inst {
+                dest: None,
+                op: IrOp::StackProbe,
+                args: vec![ValueId(0), ValueId(1)],
+                ty: IrType::I64,
+            },
+        ]);
+        let allocation = allocate_registers(
+            &func,
+            &HashSet::from([ValueId(1)]),
+            &HashMap::from([(ValueId(0), PhysReg::Gpr(Gpr::Rax))]),
+        )
+        .unwrap();
+        assert_eq!(allocation.used, HashSet::from([ValueId(0), ValueId(1)]));
+        assert!(allocation.homes.is_empty());
+        assert!(allocation.analysis.original_size >= 4096);
+        assert_eq!(allocation.analysis.original_size % 16, 8);
+        assert_eq!(allocation.analysis.outgoing_size, 0);
+        assert!(allocation.analysis.call_deltas.is_empty());
+    }
+
+    #[test]
+    fn malformed_dependencies_and_flag_widths_fail_closed() {
+        for func in [
+            function(vec![inst(0, IrOp::Copy, &[9], IrType::I64), used(&[0])]),
+            function(vec![
+                inst(0, IrOp::Undef, &[], IrType::I64),
+                inst(1, IrOp::BoolNot, &[0], IrType::I64),
+                used(&[1]),
+            ]),
+            function(vec![
+                inst(0, IrOp::Undef, &[], IrType::I64),
+                inst(0, IrOp::Undef, &[], IrType::I64),
+                used(&[0]),
+            ]),
+        ] {
+            assert!(matches!(
+                allocate_registers(&func, &HashSet::new(), &HashMap::new()),
+                Err(RejectionReason::UnsupportedInstruction)
+            ));
+        }
     }
 }

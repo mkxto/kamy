@@ -159,7 +159,7 @@ fn with_profile(args: &Args, profile_path: &Path) -> anyhow::Result<()> {
             .is_some_and(|&index| apply_passes(&passes[index], function, intensity));
         Ok(kamy_link::TransformOutcome { transformed })
     };
-    let cc = kamy_link::build_callconv(&module);
+    let cc = kamy_link::build_callconv(&pe, &module)?;
     let mode = match injection.mode {
         kamy_config::InjectionMode::Inline => kamy_link::module::EntryMode::Inline,
         kamy_config::InjectionMode::InitTable => kamy_link::module::EntryMode::InitTable,
@@ -255,6 +255,24 @@ fn log_report(report: &kamy_link::Report) {
             .iter()
             .filter(|function| function.transformed)
             .count(),
+        memory_backed = report
+            .functions
+            .iter()
+            .filter(|function| function.allocation.is_some())
+            .count(),
+        memory_homes = report
+            .functions
+            .iter()
+            .filter_map(|function| function.allocation)
+            .map(|allocation| allocation.memory_homes)
+            .sum::<usize>(),
+        largest_frame = report
+            .functions
+            .iter()
+            .filter_map(|function| function.allocation)
+            .map(|allocation| allocation.frame_size)
+            .max()
+            .unwrap_or(0),
         rejected = cov.rejected,
         relocated = cov.relocated,
         "protection complete"
@@ -263,6 +281,23 @@ fn log_report(report: &kamy_link::Report) {
     for function in &report.functions {
         if function.lowered {
             *intensities.entry(function.intensity.to_bits()).or_default() += 1;
+        }
+        if let Some(allocation) = function.allocation {
+            tracing::debug!(
+                symbol = ?function.symbol,
+                memory_homes = allocation.memory_homes,
+                gpr_homes = allocation.gpr_homes,
+                xmm_homes = allocation.xmm_homes,
+                flag_homes = allocation.flag_homes,
+                frame_size = allocation.frame_size,
+                original_frame_size = allocation.original_frame_size,
+                outgoing_frame_size = allocation.outgoing_frame_size,
+                nonvolatile_saves = allocation.nonvolatile_saves,
+                scratch_gprs = allocation.scratch_gprs,
+                scratch_xmms = allocation.scratch_xmms,
+                max_frame_size = allocation.max_frame_size,
+                "memory-backed allocation"
+            );
         }
     }
     for (bits, functions) in intensities {
@@ -341,6 +376,21 @@ fn link_report_json(report: &kamy_link::Report) -> serde_json::Value {
         .functions
         .iter()
         .map(|function| {
+            let allocation = function.allocation.map(|allocation| {
+                serde_json::json!({
+                    "memory_homes": allocation.memory_homes,
+                    "gpr_homes": allocation.gpr_homes,
+                    "xmm_homes": allocation.xmm_homes,
+                    "flag_homes": allocation.flag_homes,
+                    "frame_size": allocation.frame_size,
+                    "original_frame_size": allocation.original_frame_size,
+                    "outgoing_frame_size": allocation.outgoing_frame_size,
+                    "nonvolatile_saves": allocation.nonvolatile_saves,
+                    "scratch_gprs": allocation.scratch_gprs,
+                    "scratch_xmms": allocation.scratch_xmms,
+                    "max_frame_size": allocation.max_frame_size,
+                })
+            });
             serde_json::json!({
                 "symbol": symbol_json(&function.symbol),
                 "selected": function.selected,
@@ -348,6 +398,7 @@ fn link_report_json(report: &kamy_link::Report) -> serde_json::Value {
                 "lowered": function.lowered,
                 "transformed": function.transformed,
                 "intensity": function.intensity,
+                "allocation": allocation,
             })
         })
         .collect();
@@ -661,7 +712,20 @@ mod tests {
                 eligible: true,
                 lowered: true,
                 transformed: true,
-                intensity: 0.5,
+                intensity: 1.0,
+                allocation: Some(kamy_link::AllocationMetrics {
+                    memory_homes: 12,
+                    gpr_homes: 8,
+                    xmm_homes: 2,
+                    flag_homes: 2,
+                    frame_size: 0x208,
+                    original_frame_size: 0x80,
+                    outgoing_frame_size: 0x20,
+                    nonvolatile_saves: 2,
+                    scratch_gprs: 7,
+                    scratch_xmms: 4,
+                    max_frame_size: kamy_core::MAX_FRAME_SIZE,
+                }),
             }],
             placements: vec![placement.clone()],
             directories: vec![
@@ -685,8 +749,20 @@ mod tests {
         let value = link_report_json(&report);
         assert_eq!(value["schema"], "kamy-link-report");
         assert_eq!(value["version"], 1);
-        assert_eq!(value["functions"][0]["intensity"], 0.5);
+        assert_eq!(value["functions"][0]["intensity"], 1.0);
         assert_eq!(value["functions"][0]["transformed"], true);
+        let allocation = &value["functions"][0]["allocation"];
+        assert_eq!(allocation["memory_homes"], 12);
+        assert_eq!(allocation["gpr_homes"], 8);
+        assert_eq!(allocation["xmm_homes"], 2);
+        assert_eq!(allocation["flag_homes"], 2);
+        assert_eq!(allocation["frame_size"], 0x208);
+        assert_eq!(allocation["original_frame_size"], 0x80);
+        assert_eq!(allocation["outgoing_frame_size"], 0x20);
+        assert_eq!(allocation["nonvolatile_saves"], 2);
+        assert_eq!(allocation["scratch_gprs"], 7);
+        assert_eq!(allocation["scratch_xmms"], 4);
+        assert_eq!(allocation["max_frame_size"], kamy_core::MAX_FRAME_SIZE);
         assert_eq!(
             value["functions"][0]["symbol"]["source_symbol"],
             "compiler_symbol"

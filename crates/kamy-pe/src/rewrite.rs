@@ -5,9 +5,10 @@ use kamy_core::{ReferenceKind, RelocKind, Relocation, Rva};
 
 use crate::{BytePatch, DirectoryUpdate, PeFile, read_u16, read_u32, read_u64};
 
+const GUARD_CF_DISPATCH_OFFSET: u32 = 120;
 const CFG_SLOTS: [(u32, bool); 5] = [
     (112, false),
-    (120, true),
+    (GUARD_CF_DISPATCH_OFFSET, true),
     (280, false),
     (288, true),
     (296, true),
@@ -33,7 +34,7 @@ impl PeFile {
         &self,
         addresses: &BTreeMap<Rva, Rva>,
     ) -> anyhow::Result<ReferenceEdits> {
-        let references = self.metadata_references()?;
+        let references = self.metadata_references()?.references;
         let mut edits = PatchSet::new(self);
         let mut relocations = BTreeMap::new();
         let mut reserved = BTreeSet::new();
@@ -171,6 +172,26 @@ impl PeFile {
                     .u64_at_rva(base + offset)
                     .is_some_and(|value| value != 0)
         })
+    }
+
+    /// Storage named by `GuardCFDispatchFunctionPointer`, whose x64 target input is RAX.
+    /// Check and XFG fields have separate contracts and are not classified here.
+    pub fn guard_cf_dispatch_slot(&self) -> anyhow::Result<Option<Rva>> {
+        let Some((base, size)) = self.rewrite_load_config()? else {
+            return Ok(None);
+        };
+        if size < GUARD_CF_DISPATCH_OFFSET + 8 {
+            return Ok(None);
+        }
+        let pointer = read_u64(self.rewrite_bytes(base + GUARD_CF_DISPATCH_OFFSET, 8)?, 0)?;
+        if pointer == 0 {
+            return Ok(None);
+        }
+        let slot = self
+            .image_rva(pointer)
+            .context("external GuardCF dispatch pointer slot")?;
+        self.rewrite_bytes(slot, 8)?;
+        Ok(Some(Rva::new(slot)))
     }
 
     pub fn has_cfg_check(&self) -> bool {
@@ -1037,7 +1058,7 @@ mod tests {
             .unwrap();
         let rebuilt = PeFile::parse(&output).unwrap();
         assert_eq!(
-            rebuilt.metadata_references().unwrap(),
+            rebuilt.metadata_references().unwrap().references,
             vec![
                 kamy_core::HostReference {
                     source: Rva::new(0),

@@ -1,4 +1,6 @@
-use kamy_core::{HostReference, ReferenceKind, Rva};
+use std::collections::BTreeMap;
+
+use kamy_core::{HostReference, ReferenceKind, RelocKind, Relocation, Rva};
 use kamy_pe::PeFile;
 
 const IMAGE_BASE: u64 = 0x140000000;
@@ -159,6 +161,17 @@ impl Fixture {
         self.file32(header + 36, flags);
     }
 
+    fn base_relocations(&mut self, entries: &[u16]) {
+        let base = 0x5400;
+        let size = 8 + entries.len() as u32 * 2;
+        self.directory(5, base, size);
+        self.put32(base, 0x3000);
+        self.put32(base + 4, size);
+        for (index, entry) in entries.iter().enumerate() {
+            self.put16(base + 8 + index as u32 * 2, *entry);
+        }
+    }
+
     fn header_size(&self) -> u32 {
         match self.version {
             1 => 12,
@@ -185,6 +198,7 @@ impl Fixture {
         PeFile::parse(&self.bytes)
             .expect("synthetic PE32+ headers must parse")
             .metadata_references()
+            .map(|metadata| metadata.references)
     }
 }
 
@@ -388,5 +402,140 @@ fn partial_bdd_nodes_are_rejected() {
         let mut fixture = Fixture::new(version, Locator::Va);
         fixture.put32(fixture.payload() + 4 + OVERRIDE_SIZE + 4, 23);
         assert!(fixture.references().is_err(), "table version {version}");
+    }
+}
+
+#[test]
+fn terminal_word_aligned_base_relocation_block_preserves_fixup_rewrites() {
+    let mut fixture = Fixture::new(1, Locator::Va);
+    fixture.directory(10, 0, 0);
+    fixture.base_relocations(&[0xa400, 0x3408, 0]);
+    fixture.put64(0x3400, IMAGE_BASE + u64::from(ORIGINAL));
+    fixture.put32(0x3408, 0x12345678);
+    let pe = PeFile::parse(&fixture.bytes).unwrap();
+    pe.metadata_references().unwrap();
+    let fixup = |rva, kind| Relocation {
+        rva: Rva::new(rva),
+        kind,
+    };
+    assert_eq!(
+        pe.to_module().relocations,
+        vec![
+            fixup(0x3400, RelocKind::Dir64),
+            fixup(0x3408, RelocKind::HighLow),
+            fixup(0x3000, RelocKind::Absolute),
+        ]
+    );
+    let replacement = Rva::new(0x1600);
+    let edits = pe
+        .rebase_references(&BTreeMap::from([(Rva::new(ORIGINAL), replacement)]))
+        .unwrap();
+    assert!(edits.patches.iter().any(|patch| {
+        patch.rva == Rva::new(0x3400)
+            && patch.bytes == (IMAGE_BASE + u64::from(replacement.get())).to_le_bytes()
+    }));
+    assert_eq!(
+        edits.relocations,
+        vec![
+            fixup(0x3400, RelocKind::Dir64),
+            fixup(0x3408, RelocKind::HighLow),
+        ]
+    );
+}
+
+#[test]
+fn malformed_base_relocation_blocks_fail_at_the_pe_producer() {
+    for size in [0, 1, 6, 7, 9, 11, 13, 16, u32::MAX] {
+        let mut fixture = Fixture::new(1, Locator::Va);
+        fixture.base_relocations(&[0xa400, 0]);
+        fixture.put32(0x5404, size);
+        let error = PeFile::parse(&fixture.bytes)
+            .err()
+            .expect("invalid block size");
+        assert!(
+            format!("{error:#}").contains("base relocation"),
+            "size {size}"
+        );
+    }
+    for size in [1, 7, 10, 13] {
+        let mut fixture = Fixture::new(1, Locator::Va);
+        fixture.base_relocations(&[0xa400, 0]);
+        fixture.directory(5, 0x5400, size);
+        assert!(
+            PeFile::parse(&fixture.bytes).is_err(),
+            "directory size {size}"
+        );
+    }
+}
+
+#[test]
+fn invalid_base_relocation_directory_extents_are_rejected() {
+    for (rva, size) in [
+        (0, 12),
+        (0x5400, 0),
+        (0x5402, 12),
+        (0x6000, 12),
+        (0xffff_fffc, 8),
+        (0x5ff8, 12),
+    ] {
+        let mut fixture = Fixture::new(1, Locator::Va);
+        fixture.base_relocations(&[0xa400, 0]);
+        fixture.put32(0x5ff8, 0x3000);
+        fixture.put32(0x5ffc, 12);
+        fixture.directory(5, rva, size);
+        assert!(
+            PeFile::parse(&fixture.bytes).is_err(),
+            "directory {rva:#x}+{size:#x}"
+        );
+    }
+    let mut fixture = Fixture::new(1, Locator::Va);
+    fixture.base_relocations(&[0xa400, 0]);
+    fixture.bytes.truncate(Fixture::offset(0x540a));
+    assert!(PeFile::parse(&fixture.bytes).is_err());
+}
+
+#[test]
+fn unknown_base_relocation_entry_contracts_are_rejected() {
+    for kind in [1, 2, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15] {
+        let mut fixture = Fixture::new(1, Locator::Va);
+        fixture.base_relocations(&[(kind << 12) | 0x400, 0]);
+        let error = PeFile::parse(&fixture.bytes)
+            .err()
+            .expect("unsupported relocation type");
+        assert!(
+            format!("{error:#}").contains("unsupported base relocation type"),
+            "type {kind}"
+        );
+    }
+}
+
+#[test]
+fn base_relocation_pages_and_subsequent_headers_require_alignment() {
+    let mut fixture = Fixture::new(1, Locator::Va);
+    fixture.base_relocations(&[0xa400, 0]);
+    fixture.put32(0x5400, 0x3001);
+    assert!(PeFile::parse(&fixture.bytes).is_err());
+
+    let mut fixture = Fixture::new(1, Locator::Va);
+    fixture.base_relocations(&[0]);
+    fixture.put32(0x540a, 0x3000);
+    fixture.put32(0x540e, 8);
+    fixture.directory(5, 0x5400, 18);
+    let error = PeFile::parse(&fixture.bytes)
+        .err()
+        .expect("unaligned second block");
+    assert!(format!("{error:#}").contains("unaligned base relocation block header"));
+}
+
+#[test]
+fn overflowing_base_relocation_fields_are_rejected() {
+    for entry in [0x3ffd, 0xaff9] {
+        let mut fixture = Fixture::new(1, Locator::Va);
+        fixture.base_relocations(&[entry, 0]);
+        fixture.put32(0x5400, 0xffff_f000);
+        let error = PeFile::parse(&fixture.bytes)
+            .err()
+            .expect("overflowing fixup field");
+        assert!(format!("{error:#}").contains("base relocation field overflows RVA space"));
     }
 }

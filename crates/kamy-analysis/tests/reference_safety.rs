@@ -1,7 +1,7 @@
 use kamy_analysis::{ReferenceModel, build_reference_model};
 use kamy_core::{
-    BasicBlock, Function, Machine, Module, ReferenceKind, RelocKind, Relocation, Rva, Section,
-    SectionFlags, Terminator,
+    BasicBlock, Function, Machine, MetadataReferences, Module, ReferenceKind, RelocKind,
+    Relocation, Rva, Section, SectionFlags, Terminator,
 };
 
 const IMAGE_BASE: u64 = 0x1_4000_0000;
@@ -91,7 +91,7 @@ fn unsupported_highlow_does_not_hide_a_qword_pointer_to_code_interior() {
         kind: RelocKind::HighLow,
     });
 
-    let model = build_reference_model(&module, &[]).unwrap();
+    let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
 
     assert_target_pinned(&model, DATA, TARGET + 1);
 }
@@ -104,7 +104,7 @@ fn reading_entry_bytes_pins_code_but_materializing_the_entry_address_does_not() 
         Terminator::Return,
         Vec::new(),
     );
-    let address_model = build_reference_model(&address, &[]).unwrap();
+    let address_model = build_reference_model(&address, &MetadataReferences::default()).unwrap();
     assert!(address_model.is_resolved(Rva::new(TARGET)));
     assert!(address_model.is_resolved(Rva::new(CONTROL)));
     assert!(address_model.references.iter().any(|reference| {
@@ -119,7 +119,7 @@ fn reading_entry_bytes_pins_code_but_materializing_the_entry_address_does_not() 
         Terminator::Return,
         Vec::new(),
     );
-    let read_model = build_reference_model(&read, &[]).unwrap();
+    let read_model = build_reference_model(&read, &MetadataReferences::default()).unwrap();
 
     assert_target_pinned(&read_model, CALLER, TARGET);
 }
@@ -131,7 +131,7 @@ fn absolute_moffs64_read_of_code_interior_pins_its_target() {
     caller.push(0xc3);
     let module = module(&caller, Terminator::Return, Vec::new());
 
-    let model = build_reference_model(&module, &[]).unwrap();
+    let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
 
     assert_target_pinned(&model, CALLER, TARGET + 1);
 }
@@ -149,7 +149,7 @@ fn image_base_plus_rva_indirect_jump_pins_the_destination_function() {
         Vec::new(),
     );
 
-    let model = build_reference_model(&module, &[]).unwrap();
+    let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
 
     assert_target_pinned(&model, CALLER + 7, TARGET + 1);
 }

@@ -1,3 +1,4 @@
+mod frame;
 mod native;
 mod pe;
 mod probe;
@@ -196,6 +197,7 @@ fn build(options: &Options) -> Result<()> {
             host.image_base, exports["SDK_STATE"]
         );
     }
+    frame::build(options)?;
     Ok(())
 }
 
@@ -269,7 +271,7 @@ fn produce(options: &Options) -> Result<()> {
                         "      - name: {member}\n        path: {host}-{member}.dll\n"
                     ));
                 }
-                if variant == "ordered" {
+                if matches!(variant, "ordered" | "pressure") {
                     let ordered = include_str!(
                         "../../../crates/kamy-cli/tests/fixtures/profiles/ordered-mba.yml"
                     );
@@ -284,9 +286,14 @@ fn produce(options: &Options) -> Result<()> {
                     );
                     profile.push_str("profiles:\n");
                     profile.push_str(passes);
-                    profile.push_str(
-                        "  symbols:\n  - !Pattern 'first::*'\n  - !Pattern 'second::*'\n",
-                    );
+                    profile.push_str(&format!(
+                        "  symbols:\n  - !Pattern '{}::*'\n  - !Pattern 'second::*'\n",
+                        if variant == "pressure" {
+                            "pressure"
+                        } else {
+                            "first"
+                        }
+                    ));
                 } else {
                     profile.push_str("profiles:\n  - name: identity-contract\n    passes:\n      - type: MixedBooleanArithmetic\n        iterations: 1\n        probability: 100\n        semantics: {add: true, sub: true, xor: true}\n");
                 }
@@ -302,6 +309,7 @@ fn produce(options: &Options) -> Result<()> {
         "producer failures (mandatory cases are not skipped):\n{}",
         failures.join("\n")
     );
+    frame::produce(options)?;
     Ok(())
 }
 
@@ -311,6 +319,9 @@ fn run_target(
     environment: Vec<(String, String)>,
     fastfail: bool,
 ) -> Result<()> {
+    let pressure_witness = environment
+        .iter()
+        .any(|(name, value)| name == "SDK_VARIANT" && value == "pressure");
     let outcome = run_traced(&RunOptions {
         exe: executable.to_owned(),
         args: arguments,
@@ -353,6 +364,14 @@ fn run_target(
             !outcome.stdout.is_empty(),
             "runtime target produced no behavior oracle"
         );
+        if pressure_witness {
+            ensure!(
+                String::from_utf8_lossy(&outcome.stdout)
+                    .lines()
+                    .any(|line| line.starts_with("trace=12 ") && line.ends_with("aslr=1 host=exe")),
+                "combined bounds/counter witness did not execute its host-visible oracle under ASLR"
+            );
+        }
     }
     Ok(())
 }
@@ -385,21 +404,10 @@ fn execute(
     }
 }
 
-enum CaseOutcome {
-    Executed,
-    ExpectedPressureLimitation,
-}
-
-fn protect(
-    options: &Options,
-    host: &str,
-    variant: &str,
-    mode: &str,
-    identity: bool,
-) -> Result<CaseOutcome> {
+fn protect(options: &Options, host: &str, variant: &str, mode: &str, identity: bool) -> Result<()> {
     let original = options.out.join(format!("host-original.{host}"));
     let stem = format!("{host}-{variant}-{mode}");
-    let directory = if variant == "ordered" {
+    let directory = if matches!(variant, "ordered" | "pressure") {
         options.out.join(if identity { "identity" } else { "mba" })
     } else {
         options.out.clone()
@@ -435,21 +443,6 @@ fn protect(
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
-    if variant == "pressure" && !result.status.success() {
-        let known_pressure = diagnostic.lines().any(|line| {
-            line.contains("plugin pressure::")
-                && (line.contains("kamy_plugin_init") || line.contains("initialize"))
-                && line
-                    .trim_end()
-                    .ends_with(" cannot pass SSA/codegen: RegisterPressure")
-        });
-        if known_pressure {
-            println!(
-                "EXPECTED_LIMITATION combined-pressure-witness reason=RegisterPressure recovery=handoff-2"
-            );
-            return Ok(CaseOutcome::ExpectedPressureLimitation);
-        }
-    }
     ensure!(
         result.status.success(),
         "protecting {stem} failed ({}); mandatory authored functions MUST lower without a verbatim fallback:\n{diagnostic}",
@@ -465,8 +458,11 @@ fn protect(
         identity,
         abi_module.as_deref(),
     )?;
+    if variant == "pressure" {
+        inspect_transform_report(&link_report, identity, &["pressure", "second"])?;
+    }
     if variant == "ordered" {
-        inspect_ordered_report(&link_report, identity)?;
+        inspect_transform_report(&link_report, identity, &["first", "second"])?;
         let original_pe = pe::Pe::read(&original)?;
         let output_pe = pe::Pe::read(&output)?;
         ensure!(
@@ -492,10 +488,10 @@ fn protect(
             &inspection.unwind_ranges
         },
     )?;
-    Ok(CaseOutcome::Executed)
+    Ok(())
 }
 
-fn inspect_ordered_report(path: &Path, identity: bool) -> Result<()> {
+fn inspect_transform_report(path: &Path, identity: bool, modules: &[&str; 2]) -> Result<()> {
     let report: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let functions = report["functions"]
         .as_array()
@@ -520,18 +516,16 @@ fn inspect_ordered_report(path: &Path, identity: bool) -> Result<()> {
             "report falsely claims a semantic transform: {function}"
         );
         let module = function["symbol"]["source_module"].as_str();
-        if let Some(index) = ["first", "second"]
-            .iter()
-            .position(|name| Some(*name) == module)
-        {
+        if let Some(index) = modules.iter().position(|name| Some(*name) == module) {
             if is_selected && lowered {
+                report::inspect_allocation(function, module == Some("pressure"))?;
                 ensure!(
                     if identity {
                         intensity == 0.0
                     } else {
-                        intensity > 0.0
+                        intensity == 1.0
                     },
-                    "callback intensity disagrees with actual lowering mode"
+                    "callback lowering reduced or ignored the requested MBA intensity: {function}"
                 );
                 selected[index] += 1;
                 transformed[index] += usize::from(changed);
@@ -545,15 +539,17 @@ fn inspect_ordered_report(path: &Path, identity: bool) -> Result<()> {
     }
     ensure!(
         selected.iter().all(|count| *count > 0),
-        "both qualified callback modules MUST actually lower"
+        "both qualified callback modules MUST actually lower: {modules:?}"
     );
     if !identity {
         ensure!(
             transformed.iter().all(|count| *count > 0),
-            "configured MBA did not actually transform both callback modules"
+            "configured MBA did not actually transform both callback modules: {modules:?}"
         );
     }
-    println!("ordered-report identity={identity} lowered={selected:?} transformed={transformed:?}");
+    println!(
+        "transform-report modules={modules:?} identity={identity} lowered={selected:?} transformed={transformed:?}"
+    );
     Ok(())
 }
 
@@ -700,7 +696,7 @@ fn run(options: &Options) -> Result<()> {
         for variant in ["ordered", "abi", "bounds", "fastfail"] {
             for mode in ["inline", "init-table"] {
                 match protect(options, host, variant, mode, true) {
-                    Ok(_) => println!("PASS {host}-{variant}-{mode}"),
+                    Ok(()) => println!("PASS {host}-{variant}-{mode}"),
                     Err(error) => {
                         eprintln!("FAIL {host}-{variant}-{mode}: {error:#}");
                         failures.push(format!("{host}-{variant}-{mode}: {error:#}"));
@@ -720,16 +716,20 @@ fn run(options: &Options) -> Result<()> {
         if let Err(error) = configuration_acceptance(options) {
             failures.push(format!("configuration: {error:#}"));
         }
-        match protect(options, "exe", "pressure", "init-table", true) {
-            Ok(CaseOutcome::Executed) => {
-                println!("PASS combined-pressure-witness trace=12 bounds=24")
-            }
-            Ok(CaseOutcome::ExpectedPressureLimitation) => println!(
-                "combined-pressure-witness=EXPECTED_LIMITATION reason=RegisterPressure recovery=NOT_CLAIMED"
-            ),
-            Err(error) => {
-                eprintln!("STRICT FAIL combined-pressure-witness: {error:#}");
-                failures.push(format!("combined-pressure-witness (handoff 2 recovery; not accepted as passing): {error:#}"));
+        if let Err(error) = frame::run(options) {
+            failures.push(format!("memory-frame-runtime: {error:#}"));
+        }
+        for identity in [true, false] {
+            match protect(options, "exe", "pressure", "init-table", identity) {
+                Ok(()) => println!(
+                    "PASS combined-pressure-witness identity={identity} trace=12 bounds=24"
+                ),
+                Err(error) => {
+                    eprintln!("FAIL combined-pressure-witness identity={identity}: {error:#}");
+                    failures.push(format!(
+                        "combined-pressure-witness identity={identity}: {error:#}"
+                    ));
+                }
             }
         }
     } else {
@@ -749,6 +749,9 @@ fn main() -> Result<()> {
     let (phase, rest) = arguments.split_first().context("usage: sdk-rebuild <build|produce|run|all> --out PATH --kamy EXE --cargo CARGO --rustc RUSTC --linker LLD_LINK --llvm-tools DIRECTORY --lib-dirs SEMICOLON_PATHS [--scope full|preserved]")?;
     if phase == "probe-dll" {
         return probe::dispatch(rest);
+    }
+    if phase == "probe-frame" {
+        return frame::probe(rest);
     }
     ensure!(
         matches!(phase.as_str(), "build" | "produce" | "run" | "all"),

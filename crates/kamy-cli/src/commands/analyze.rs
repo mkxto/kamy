@@ -24,10 +24,10 @@ pub(crate) fn run(
     let mut module = pe.to_module();
     let seeds = pe.seeds();
     module.functions = discover_functions(&module, &seeds);
-    let metadata_references = pe
+    let metadata = pe
         .metadata_references()
         .with_context(|| format!("reading PE references from {}", input.display()))?;
-    let reference_model = kamy_analysis::build_reference_model(&module, &metadata_references)
+    let reference_model = kamy_analysis::build_reference_model(&module, &metadata)
         .with_context(|| format!("building reference model for {}", input.display()))?;
     let functions = &module.functions;
     let cg = kamy_analysis::build_call_graph(&module);

@@ -6,9 +6,12 @@ mod rewrite;
 mod translation;
 
 use anyhow::{Context, ensure};
-use iced_x86::Register;
+use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
 use kamy_codegen::{SelectedInstructions, relocate};
-use kamy_core::ir::{CallingConvLookup, IrFunction, MapCallConv, win64_import_signature};
+use kamy_core::ir::{
+    AbiValue, CallingConvLookup, Gpr, IrFunction, MapCallConv, PhysReg, Win64Default,
+    win64_import_signature,
+};
 use kamy_core::{
     Function, Module, OperandReference, RejectionReason, Rva, SectionFlags, SymbolId, SymbolKind,
     Terminator,
@@ -64,6 +67,46 @@ pub struct FunctionReport {
     pub lowered: bool,
     pub transformed: bool,
     pub intensity: f32,
+    pub allocation: Option<AllocationMetrics>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocationMetrics {
+    pub memory_homes: usize,
+    pub gpr_homes: usize,
+    pub xmm_homes: usize,
+    pub flag_homes: usize,
+    pub frame_size: u32,
+    pub original_frame_size: u32,
+    pub outgoing_frame_size: u32,
+    pub nonvolatile_saves: usize,
+    pub scratch_gprs: usize,
+    pub scratch_xmms: usize,
+    pub max_frame_size: u32,
+}
+
+impl AllocationMetrics {
+    fn from_allocation(alloc: &kamy_codegen::RegAllocation) -> Self {
+        let mut metrics = Self {
+            memory_homes: alloc.homes.len(),
+            frame_size: alloc.frame.stack_size,
+            original_frame_size: alloc.frame.original_size,
+            outgoing_frame_size: alloc.frame.outgoing_size,
+            nonvolatile_saves: alloc.frame.saves.len(),
+            scratch_gprs: kamy_codegen::MEMORY_SCRATCH_GPRS.len(),
+            scratch_xmms: kamy_codegen::MEMORY_SCRATCH_XMMS.len(),
+            max_frame_size: kamy_core::MAX_FRAME_SIZE,
+            ..Self::default()
+        };
+        for home in alloc.homes.values() {
+            match home.class {
+                kamy_core::ValueClass::Gpr => metrics.gpr_homes += 1,
+                kamy_core::ValueClass::Xmm => metrics.xmm_homes += 1,
+                kamy_core::ValueClass::Flag => metrics.flag_homes += 1,
+            }
+        }
+        metrics
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -96,6 +139,7 @@ struct Lowered {
     selected: SelectedInstructions,
     transformed: bool,
     intensity: f32,
+    allocation: AllocationMetrics,
     pinned_host: BTreeSet<Rva>,
 }
 
@@ -108,6 +152,7 @@ struct Prepared<'a> {
     unwind: Vec<kamy_seh::UnwindRange>,
     transformed: bool,
     intensity: f32,
+    allocation: AllocationMetrics,
 }
 
 struct EncodedHelper {
@@ -116,14 +161,11 @@ struct EncodedHelper {
     unwind: Vec<kamy_seh::UnwindRange>,
 }
 
-/// Resolve every call target we can narrow to a precise Win64 signature, keyed
-/// by target VA for [`MapCallConv`]. Three sources, lowest precedence first:
-/// callee-side argument inference on the target's own functions (keyed by entry
-/// VA), then import slots (`call [rip+slot]`, keyed by slot VA) and single-block
-/// import thunks (`jmp [rip+slot]`, keyed by thunk entry VA) — the named-import
-/// signatures are authoritative and overwrite an inferred entry at the same VA.
-/// Everything else falls back to the Win64 default at the call site.
-pub fn build_callconv(module: &Module) -> MapCallConv {
+/// Resolves inferred host signatures, named imports and single-block import thunks.
+/// Typed PE GuardCF dispatch storage and transparent dispatch thunks additionally
+/// consume RAX, forwarding all unclassified Win64 arguments and possible returns.
+/// Guard check and XFG contracts are not inferred from the CF dispatch ABI.
+pub fn build_callconv(pe: &PeFile, module: &Module) -> anyhow::Result<MapCallConv> {
     let base = module.image_base;
     let mut slot_name: HashMap<u32, &str> = HashMap::new();
     for s in &module.symbols {
@@ -135,17 +177,21 @@ pub fn build_callconv(module: &Module) -> MapCallConv {
     let mut by_va: HashMap<u64, kamy_core::ir::FnSignature> = HashMap::new();
     for func in &module.functions {
         if let Some(sig) = kamy_analysis::infer_signature(module, func) {
-            // A full four-argument result is the default already; only a genuine
-            // narrowing is worth an entry.
-            if sig.args.len() < 4 {
-                by_va.insert(base + u64::from(func.entry.get()), sig);
-            }
+            by_va.insert(base + u64::from(func.entry.get()), sig);
         }
     }
     for (&slot_rva, name) in &slot_name {
         if let Some(sig) = win64_import_signature(name) {
             by_va.insert(base + u64::from(slot_rva), sig);
         }
+    }
+    let dispatch_slot = pe.guard_cf_dispatch_slot()?;
+    if let Some(slot) = dispatch_slot {
+        let mut signature = Win64Default::default_signature();
+        signature
+            .args
+            .push(AbiValue::register(PhysReg::Gpr(Gpr::Rax)));
+        by_va.insert(base + u64::from(slot.get()), signature);
     }
     for func in &module.functions {
         if func.blocks.len() != 1 {
@@ -154,6 +200,11 @@ pub fn build_callconv(module: &Module) -> MapCallConv {
         let Terminator::Indirect { slot: Some(slot) } = func.blocks[0].terminator else {
             continue;
         };
+        if Some(slot) == dispatch_slot && is_dispatch_thunk(module, func, slot) {
+            let signature = by_va[&(base + u64::from(slot.get()))].clone();
+            by_va.insert(base + u64::from(func.entry.get()), signature);
+            continue;
+        }
         if let Some(name) = slot_name.get(&slot.get()) {
             if let Some(sig) = win64_import_signature(name) {
                 by_va.insert(base + u64::from(func.entry.get()), sig);
@@ -161,7 +212,37 @@ pub fn build_callconv(module: &Module) -> MapCallConv {
         }
     }
 
-    MapCallConv::new(by_va)
+    Ok(MapCallConv::new(by_va))
+}
+
+fn is_dispatch_thunk(module: &Module, function: &Function, slot: Rva) -> bool {
+    let block = &function.blocks[0];
+    let Some(bytes) = module
+        .bytes_at(block.start)
+        .and_then(|bytes| bytes.get(..(block.end.get() - block.start.get()) as usize))
+    else {
+        return false;
+    };
+    let mut decoder = Decoder::with_ip(
+        64,
+        bytes,
+        module.image_base + u64::from(block.start.get()),
+        DecoderOptions::NONE,
+    );
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        if !decoder.can_decode() {
+            return instruction.code() == iced_x86::Code::Jmp_rm64
+                && instruction.is_ip_rel_memory_operand()
+                && !matches!(instruction.segment_prefix(), Register::FS | Register::GS)
+                && instruction.ip_rel_memory_address()
+                    == module.image_base + u64::from(slot.get());
+        }
+        if !matches!(instruction.mnemonic(), Mnemonic::Nop | Mnemonic::Endbr64) {
+            return false;
+        }
+    }
+    false
 }
 
 /// Functions that cannot be transformed or safely referenced remain resident.
@@ -231,10 +312,8 @@ fn ssa_instructions(
     cc: &dyn CallingConvLookup,
     transform: &mut dyn FnMut(&SymbolId, &mut IrFunction, f32) -> anyhow::Result<TransformOutcome>,
 ) -> Result<Lowered, LoweringError> {
-    // Only pressure retries re-lift: each transform intensity needs clean SSA.
-    const INTENSITY_LADDER: [f32; 4] = [1.0, 0.5, 0.25, 0.0];
-    let base = module.image_base;
-    let entry_va = base
+    module
+        .image_base
         .checked_add(u64::from(func.entry.get()))
         .ok_or(RejectionReason::InvalidReference)?;
     for block in &func.blocks {
@@ -247,7 +326,8 @@ fn ssa_instructions(
             .bytes_at(block.start)
             .and_then(|bytes| bytes.get(..len))
             .ok_or(RejectionReason::LiftFailure)?;
-        let ip = base
+        let ip = module
+            .image_base
             .checked_add(u64::from(block.start.get()))
             .ok_or(RejectionReason::InvalidReference)?;
         let mut decoder = iced_x86::Decoder::with_ip(64, bytes, ip, iced_x86::DecoderOptions::NONE);
@@ -258,103 +338,43 @@ fn ssa_instructions(
             }
         }
     }
-    for (i, &intensity) in INTENSITY_LADDER.iter().enumerate() {
-        let mut result = kamy_lift::lift_function(module, func, cc, references);
-        if result.unsupported {
-            return Err(RejectionReason::UnsupportedInstruction.into());
-        }
-        kamy_lift::ssa::construct_ssa(&mut result);
-        let unresolved_base =
-            kamy_transforms::resolve_image_base_uses(&mut result.func, |offset| {
-                module::identify_host_object(
-                    kamy_core::SymbolicExpression::Symbol {
-                        symbol: SymbolId::HostImageBase,
-                        addend: offset,
-                    },
-                    host,
-                )
-                .ok()
-            });
-        let outcome = if intensity == 0.0 {
-            TransformOutcome::default()
-        } else {
-            transform(symbol, &mut result.func, intensity).map_err(LoweringError::Callback)?
-        };
-        kamy_transforms::optimize(&mut result.func);
-        if uses_unsupported_flags(&result.func) {
-            return Err(RejectionReason::UnsupportedFlags.into());
-        }
-        if result.func.blocks.iter().any(|b| {
-            b.insts.iter().any(|i| {
-                matches!(&i.op, kamy_core::ir::IrOp::Call { target, .. }
-                    if target.expression == kamy_core::SymbolicExpression::symbol(symbol.clone()))
-            })
-        }) {
-            return Err(RejectionReason::SelfRecursive.into());
-        }
-
-        match kamy_codegen::allocate_registers(
-            &result.func,
-            &kamy_codegen::CALLEE_SAVED_GPRS,
-            &result.rsp_chain,
-            &result.reg_pins,
-        ) {
-            Ok(alloc) => {
-                let used = kamy_codegen::callee_saved_used(&alloc);
-                let used_xmm = kamy_codegen::callee_saved_xmms_used(&alloc);
-                let align_pad = if used.len() % 2 == 1 { 8 } else { 0 };
-                let stack_alloc = align_pad + 16 * used_xmm.len() as u32;
-                // The generated push/align prologue shifts RSP; a function that
-                // reaches its caller's frame (shadow home / incoming stack arg)
-                // would then address the pushed registers. Reject, don't
-                // miscompile (D22) — only when a shift is actually emitted.
-                let prologue_delta = 8 * used.len() as u32 + stack_alloc;
-                if prologue_delta > 0 && accesses_caller_frame(&result.func, &result.rsp_chain) {
-                    return Err(RejectionReason::CallerFrameAccess.into());
-                }
-                let instrs = kamy_codegen::select_instructions(
-                    &result.func,
-                    &alloc,
-                    base,
-                    entry_va,
-                    &used,
-                    &used_xmm,
-                );
-                let mut pinned_host = BTreeSet::new();
-                if unresolved_base {
-                    pinned_host.extend(host.functions.iter().map(|function| function.entry));
-                }
-                for reference in &instrs.references {
-                    module::pin_interior_host(
-                        &reference.reference.expression,
-                        host,
-                        &mut pinned_host,
-                    );
-                }
-                return Ok(Lowered {
-                    selected: instrs,
-                    transformed: intensity > 0.0 && outcome.transformed,
-                    intensity: if outcome.transformed { intensity } else { 0.0 },
-                    pinned_host,
-                });
-            }
-            Err(RejectionReason::RegisterPressure) => {
-                let msg = "register pressure";
-                if let Some(&next) = INTENSITY_LADDER.get(i + 1) {
-                    tracing::warn!(
-                        func = %func.entry,
-                        next_intensity = next,
-                        reason = %msg,
-                        "register pressure: retrying at reduced intensity"
-                    );
-                }
-                continue;
-            }
-            Err(reason) => return Err(reason.into()),
-        }
+    let mut result = kamy_lift::lift_function(module, func, cc, references);
+    if result.unsupported {
+        return Err(RejectionReason::UnsupportedInstruction.into());
     }
-    tracing::debug!(func = %func.entry, "pressure ladder exhausted");
-    Err(RejectionReason::RegisterPressure.into())
+    kamy_lift::ssa::construct_ssa(&mut result)?;
+    let unresolved_base = kamy_transforms::resolve_image_base_uses(&mut result.func, |offset| {
+        module::identify_host_object(
+            kamy_core::SymbolicExpression::Symbol {
+                symbol: SymbolId::HostImageBase,
+                addend: offset,
+            },
+            host,
+        )
+        .ok()
+    });
+    let outcome = transform(symbol, &mut result.func, 1.0).map_err(LoweringError::Callback)?;
+    kamy_transforms::optimize(&mut result.func);
+    if uses_unsupported_flags(&result.func) {
+        return Err(RejectionReason::UnsupportedFlags.into());
+    }
+    let alloc =
+        kamy_codegen::allocate_registers(&result.func, &result.rsp_chain, &result.reg_pins)?;
+    let instrs = kamy_codegen::select_instructions(&result.func, &alloc);
+    let mut pinned_host = BTreeSet::new();
+    if unresolved_base {
+        pinned_host.extend(host.functions.iter().map(|function| function.entry));
+    }
+    for reference in &instrs.references {
+        module::pin_interior_host(&reference.reference.expression, host, &mut pinned_host);
+    }
+    Ok(Lowered {
+        selected: instrs,
+        transformed: outcome.transformed,
+        intensity: if outcome.transformed { 1.0 } else { 0.0 },
+        allocation: AllocationMetrics::from_allocation(&alloc),
+        pinned_host,
+    })
 }
 
 /// Variable-count shift flags cannot be reconstructed without the original CL.
@@ -384,109 +404,6 @@ fn uses_unsupported_flags(func: &IrFunction) -> bool {
             matches!(i.op, IrOp::CarryShl | IrOp::CarryShr | IrOp::CarrySar)
                 && !is_const(i.args[1])
                 && i.dest.is_some_and(|d| used.contains(&d))
-        })
-    })
-}
-
-/// True if the function reads or writes its caller's stack frame: a load/store
-/// at a non-negative offset from the entry RSP (the shadow-space home slots or
-/// an incoming stack argument). Stack offsets propagate from the entry RSP — an
-/// `Undef` in the lifter's RSP chain, offset 0 — through the `Copy`/`Add`/`Sub`
-/// (by a constant) chain and matching phis that thread the stack pointer and
-/// frame pointer. Used to reject such functions (D22) because the generated
-/// callee-saved prologue shifts RSP out from under those accesses.
-///
-/// Also true for a /GS stack-cookie function (#23): the cookie is framed by
-/// xoring the live stack pointer into it (`xor rax, rsp`), which no ordinary
-/// code does. The generated prologue shifts RSP, so the epilogue's
-/// `__security_check_cookie` fast-fails (0xC0000409); reject instead.
-fn accesses_caller_frame(func: &IrFunction, rsp_chain: &HashSet<kamy_core::ir::ValueId>) -> bool {
-    use kamy_core::ir::{IrOp, ValueId};
-    if func.blocks.iter().any(|b| {
-        b.insts
-            .iter()
-            .any(|i| matches!(i.op, IrOp::Xor) && i.args.iter().any(|a| rsp_chain.contains(a)))
-    }) {
-        return true;
-    }
-
-    let mut consts: HashMap<ValueId, i64> = HashMap::new();
-    for b in &func.blocks {
-        for i in &b.insts {
-            if let (Some(d), IrOp::Const(c)) = (i.dest, &i.op) {
-                consts.insert(d, *c as i64);
-            }
-        }
-    }
-
-    let mut off: HashMap<ValueId, i64> = HashMap::new();
-    for b in &func.blocks {
-        for i in &b.insts {
-            if let Some(d) = i.dest {
-                if matches!(i.op, IrOp::Undef) && rsp_chain.contains(&d) {
-                    off.insert(d, 0);
-                }
-            }
-        }
-    }
-    loop {
-        let mut changed = false;
-        for b in &func.blocks {
-            for p in &b.phis {
-                if off.contains_key(&p.dest) {
-                    continue;
-                }
-                let offs: Option<Vec<i64>> =
-                    p.args.iter().map(|(_, v)| off.get(v).copied()).collect();
-                if let Some(os) = offs {
-                    if let Some(&first) = os.first() {
-                        if os.iter().all(|&o| o == first) {
-                            off.insert(p.dest, first);
-                            changed = true;
-                        }
-                    }
-                }
-            }
-            for i in &b.insts {
-                let Some(d) = i.dest else { continue };
-                if off.contains_key(&d) {
-                    continue;
-                }
-                let new = match &i.op {
-                    IrOp::Copy => i.args.first().and_then(|a| off.get(a).copied()),
-                    IrOp::Add if i.args.len() == 2 => off
-                        .get(&i.args[0])
-                        .zip(consts.get(&i.args[1]))
-                        .map(|(o, c)| o + c)
-                        .or_else(|| {
-                            off.get(&i.args[1])
-                                .zip(consts.get(&i.args[0]))
-                                .map(|(o, c)| o + c)
-                        }),
-                    IrOp::Sub if i.args.len() == 2 => off
-                        .get(&i.args[0])
-                        .zip(consts.get(&i.args[1]))
-                        .map(|(o, c)| o - c),
-                    _ => None,
-                };
-                if let Some(v) = new {
-                    off.insert(d, v);
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    func.blocks.iter().any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(i.op, IrOp::Load | IrOp::Store)
-                && i.args
-                    .first()
-                    .and_then(|a| off.get(a))
-                    .is_some_and(|&o| o >= 0)
         })
     })
 }
@@ -595,6 +512,7 @@ fn plan_image(
             lowered: false,
             transformed: false,
             intensity: 0.0,
+            allocation: None,
         });
         match classify(module, function, &runtime_fns, &import_slots, &eh_runtime) {
             Ok(()) => {}
@@ -653,6 +571,7 @@ fn plan_image(
             unwind: Vec::new(),
             transformed: lowered.transformed,
             intensity: lowered.intensity,
+            allocation: lowered.allocation,
         });
     }
 
@@ -677,7 +596,12 @@ fn plan_image(
                 function.slot_len = len;
                 true
             }
-            Err(_) => {
+            Err(error) => {
+                tracing::debug!(
+                    func = %function.function.entry,
+                    error = %format_args!("{error:#}"),
+                    "initial selected-function encoding rejected function"
+                );
                 report
                     .rejected
                     .push((function.function.entry, RejectionReason::CodegenFailure));
@@ -809,7 +733,12 @@ fn plan_image(
                 let new_rva = addresses[&function.function.entry].get();
                 let body = match function.encode(&addresses, &helpers, base, new_rva) {
                     Ok(body) => body,
-                    Err(_) => {
+                    Err(error) => {
+                        tracing::debug!(
+                            func = %function.function.entry,
+                            error = %format_args!("{error:#}"),
+                            "placed selected-function encoding rejected function"
+                        );
                         rejected.insert(function.function.entry, RejectionReason::CodegenFailure);
                         continue;
                     }
@@ -842,7 +771,16 @@ fn plan_image(
                     .context("new VA overflow")?;
                 match kamy_seh::unwind_ranges(&function.body, new_va) {
                     Ok(ranges) if !ranges.is_empty() => function.unwind = ranges,
-                    _ => {
+                    Ok(_) => {
+                        rejected
+                            .insert(function.function.entry, RejectionReason::EhNoBucketCreation);
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            func = %function.function.entry,
+                            error = %format_args!("{error:#}"),
+                            "actual-body unwind reconstruction rejected function"
+                        );
                         rejected
                             .insert(function.function.entry, RejectionReason::EhNoBucketCreation);
                     }
@@ -1366,6 +1304,7 @@ fn finalize_report(
             function.lowered = true;
             function.transformed = lowered.transformed;
             function.intensity = lowered.intensity;
+            function.allocation = Some(lowered.allocation);
         }
     }
     report.functions = host.functions;
@@ -1913,6 +1852,7 @@ mod tests {
             unwind: vec![],
             transformed: false,
             intensity: 0.0,
+            allocation: AllocationMetrics::default(),
         };
         for (map, expected) in [
             (
@@ -1982,38 +1922,59 @@ mod tests {
     }
 
     #[test]
-    fn rejects_gs_cookie_xor_with_rsp() {
-        use kamy_core::ir::{
-            BlockId, Inst, IrBlock, IrFunction, IrOp, IrTerminator, IrType, ValueId,
-        };
-
-        let rsp = ValueId(0);
-        let other = ValueId(1);
-        let cookie = ValueId(2);
-        let dest = ValueId(3);
-
-        let make = |a: ValueId, b: ValueId| IrFunction {
-            entry: BlockId(0),
-            next_value: 4,
-            blocks: vec![IrBlock {
-                id: BlockId(0),
-                phis: vec![],
-                insts: vec![Inst {
-                    dest: Some(dest),
-                    op: IrOp::Xor,
-                    args: vec![a, b],
-                    ty: IrType::I64,
-                }],
-                term: IrTerminator::Ret,
+    fn shared_lowering_invokes_transform_once_at_full_intensity() {
+        use kamy_core::{BasicBlock, Machine, Section};
+        let function = Function {
+            entry: Rva::new(0x1000),
+            blocks: vec![BasicBlock {
+                start: Rva::new(0x1000),
+                end: Rva::new(0x1004),
+                successors: vec![],
+                terminator: Terminator::Return,
             }],
         };
-
-        let mut rsp_chain: HashSet<ValueId> = HashSet::new();
-        rsp_chain.insert(rsp);
-
-        // xor with the live stack pointer: the cookie framing → reject.
-        assert!(accesses_caller_frame(&make(cookie, rsp), &rsp_chain));
-        // ordinary xor (no rsp_chain arg) → not rejected.
-        assert!(!accesses_caller_frame(&make(cookie, other), &rsp_chain));
+        let module = Module {
+            image_base: 0x140000000,
+            machine: Machine::X64,
+            entry_point: None,
+            sections: vec![Section {
+                name: ".text".into(),
+                rva: function.entry,
+                virtual_size: 4,
+                data: vec![0x48, 0x01, 0xc8, 0xc3],
+                flags: SectionFlags {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+            }],
+            symbols: vec![],
+            relocations: vec![],
+            functions: vec![function.clone()],
+        };
+        let symbol = SymbolId::Host {
+            rva: function.entry,
+        };
+        let cc = Win64Default;
+        let mut attempts = Vec::new();
+        let mut identity = |_: &SymbolId, _: &mut IrFunction, intensity: f32| {
+            attempts.push(intensity);
+            Ok(TransformOutcome::default())
+        };
+        let lowered = match ssa_instructions(
+            &module,
+            &module,
+            &function,
+            &symbol,
+            &[],
+            &cc,
+            &mut identity,
+        ) {
+            Ok(lowered) => lowered,
+            Err(_) => panic!("supported identity function failed lowering"),
+        };
+        assert_eq!(attempts, [1.0]);
+        assert!(!lowered.transformed);
+        assert_eq!(lowered.intensity, 0.0);
     }
 }

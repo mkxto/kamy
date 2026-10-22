@@ -69,17 +69,27 @@ fn call_arguments(
     b: &mut IrBuilder,
     s: &mut LiftState,
 ) -> Vec<ValueId> {
-    let mut args = Vec::with_capacity(sig.args.len());
+    let mut args = Vec::with_capacity(sig.args.len() + 1);
     for arg in &sig.args {
         match arg.location {
             kamy_core::ir::AbiLocation::Register(phys) => args.push(pin_argument(phys, b, s)),
-            kamy_core::ir::AbiLocation::Stack { .. } => {
-                if !args.contains(&s.get_gpr(Gpr::Rsp)) {
-                    args.push(s.get_gpr(Gpr::Rsp));
-                }
+            kamy_core::ir::AbiLocation::Stack { offset } => {
+                let width = match arg.passing {
+                    kamy_core::ir::AbiPassing::Direct => u32::from(arg.bits).div_ceil(8).max(8),
+                    kamy_core::ir::AbiPassing::Indirect { .. }
+                    | kamy_core::ir::AbiPassing::Sret { .. } => 8,
+                };
+                let endpoint = i64::from(offset)
+                    .checked_sub(8)
+                    .and_then(|offset| offset.checked_add(i64::from(width) - 1))
+                    .expect("i32 ABI offset and u16 width fit i64");
+                let displacement = b.emit(IrOp::Const(endpoint as u64), &[], IrType::I64);
+                let address = b.emit(IrOp::Add, &[s.get_gpr(Gpr::Rsp), displacement], IrType::I64);
+                args.push(address);
             }
         }
     }
+    args.push(s.get_gpr(Gpr::Rsp));
     args
 }
 
@@ -155,6 +165,27 @@ pub(crate) fn lift_call(
         s.unsupported = true;
         return;
     };
+    if let kamy_core::SymbolicExpression::Symbol { symbol, addend: 0 } = &reference.expression {
+        if s.symbols
+            .iter()
+            .any(|candidate| candidate.id == *symbol && candidate.name == "__chkstk")
+        {
+            b.emit_void(
+                IrOp::StackProbe,
+                &[s.get_gpr(Gpr::Rax), s.get_gpr(Gpr::Rsp)],
+                IrType::I64,
+            );
+            for register in [Gpr::R10, Gpr::R11] {
+                let value = b.emit(IrOp::Undef, &[], IrType::I64);
+                s.set_gpr(register, value);
+            }
+            for flag in kamy_core::ir::X86Flag::ALL {
+                let value = b.emit(IrOp::Undef, &[], IrType::I8);
+                s.set_flag(flag, value);
+            }
+            return;
+        }
+    }
     let Some(sig) = call_signature(target, Some(&reference), cc, s) else {
         return;
     };
@@ -246,6 +277,9 @@ pub(crate) fn lift_ret(b: &mut IrBuilder, s: &mut LiftState) {
         };
         pin_live_out(phys, b, s);
     }
+    if s.signature.is_none() {
+        pin_live_out(PhysReg::Xmm(kamy_core::ir::XmmReg::Xmm0), b, s);
+    }
     preserve_authored_registers(b, s, true);
     b.emit_void(IrOp::Use, &[s.get_gpr(Gpr::Rsp)], IrType::I64);
 }
@@ -331,11 +365,7 @@ pub(crate) fn lift_movsd(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftStat
         let addr = compute_mem_addr(insn, b, s);
         b.emit_void(IrOp::Store, &[addr, val], IrType::I64);
     } else {
-        let (src, _) = read_operand(insn, 1, b, s);
-        let copy = b.emit(IrOp::Copy, &[src], IrType::I64);
-        if let Some(xmm) = iced_reg_to_xmm(insn.op_register(0)) {
-            s.set_xmm(xmm, copy);
-        }
+        s.unsupported = true;
     }
 }
 
@@ -357,11 +387,7 @@ pub(crate) fn lift_movss(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftStat
         let addr = compute_mem_addr(insn, b, s);
         b.emit_void(IrOp::Store, &[addr, val], IrType::I32);
     } else {
-        let (src, _) = read_operand(insn, 1, b, s);
-        let copy = b.emit(IrOp::Copy, &[src], IrType::I32);
-        if let Some(xmm) = iced_reg_to_xmm(insn.op_register(0)) {
-            s.set_xmm(xmm, copy);
-        }
+        s.unsupported = true;
     }
 }
 

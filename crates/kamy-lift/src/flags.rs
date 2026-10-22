@@ -90,3 +90,29 @@ pub(crate) fn emit_shift_flags(
     let af = b.emit(IrOp::Undef, &[], IrType::I8);
     s.set_flag(X86Flag::Af, af);
 }
+
+pub(crate) fn preserve_zero_count(
+    b: &mut IrBuilder,
+    s: &mut LiftState,
+    count: (ValueId, IrType),
+    ty: IrType,
+    prior: &[(X86Flag, ValueId)],
+) {
+    let count = if count.1 == IrType::I8 {
+        count.0
+    } else {
+        b.emit(IrOp::Trunc, &[count.0], IrType::I8)
+    };
+    let mask = b.emit(
+        IrOp::Const(if ty == IrType::I64 { 63 } else { 31 }),
+        &[],
+        IrType::I8,
+    );
+    let masked = b.emit(IrOp::And, &[count, mask], IrType::I8);
+    let zero = b.emit(IrOp::IsZero, &[masked], IrType::I8);
+    for &(flag, previous) in prior {
+        let current = s.get_flag(flag);
+        let selected = b.emit(IrOp::Select, &[zero, previous, current], IrType::I8);
+        s.set_flag(flag, selected);
+    }
+}

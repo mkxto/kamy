@@ -130,9 +130,31 @@ impl PeFile {
             imports: Vec::new(),
         };
 
-        pe.relocations = pe
-            .directory_slice(DIR_BASERELOC)
-            .map_or_else(Vec::new, reloc::parse_relocations);
+        let (reloc_rva, reloc_size) = pe
+            .data_directories
+            .get(DIR_BASERELOC)
+            .copied()
+            .unwrap_or_default();
+        if reloc_rva != 0 || reloc_size != 0 {
+            anyhow::ensure!(
+                reloc_rva != 0 && reloc_size != 0,
+                "inconsistent base relocation directory"
+            );
+            anyhow::ensure!(reloc_rva % 4 == 0, "unaligned base relocation directory");
+            reloc_rva
+                .checked_add(reloc_size)
+                .context("base relocation directory RVA range overflow")?;
+            let data = pe
+                .slice_at_rva(reloc_rva)
+                .and_then(|bytes| bytes.get(..reloc_size as usize))
+                .with_context(|| {
+                    format!(
+                        "base relocation directory {reloc_rva:#x}+{reloc_size:#x} is not file-backed"
+                    )
+                })?;
+            pe.relocations = reloc::parse_relocations(data)
+                .with_context(|| format!("base relocation directory at {reloc_rva:#x}"))?;
+        }
         pe.pdata_begins = pe
             .directory_slice(DIR_EXCEPTION)
             .map_or_else(Vec::new, pdata::parse_pdata);
@@ -479,7 +501,7 @@ mod tests {
         block.extend_from_slice(&((10u16 << 12) | 0x020).to_le_bytes());
         block.extend_from_slice(&0x000u16.to_le_bytes());
 
-        let relocs = reloc::parse_relocations(&block);
+        let relocs = reloc::parse_relocations(&block).unwrap();
         assert_eq!(
             relocs,
             vec![
@@ -501,12 +523,11 @@ mod tests {
 
     #[test]
     fn reloc_parser_rejects_truncated_block() {
-        // BlockSize claims more bytes than present: no panic, no entries.
         let mut block = Vec::new();
         block.extend_from_slice(&0x0000_2000u32.to_le_bytes());
-        block.extend_from_slice(&0x0000_FFFFu32.to_le_bytes());
+        block.extend_from_slice(&0x0000_FFFCu32.to_le_bytes());
         block.extend_from_slice(&((3u16 << 12) | 0x004).to_le_bytes());
-        assert!(reloc::parse_relocations(&block).is_empty());
+        assert!(reloc::parse_relocations(&block).is_err());
     }
 
     #[test]

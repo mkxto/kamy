@@ -540,6 +540,7 @@ impl<'a> Plan<'a> {
                         lowered: true,
                         transformed: lowered.transformed,
                         intensity: lowered.intensity,
+                        allocation: Some(lowered.allocation),
                     },
                 });
             }
@@ -985,7 +986,8 @@ impl<'a> Plan<'a> {
                 xdata_rva,
                 function.rva,
                 &function.body,
-            )?;
+            )
+            .with_context(|| format!("reconstructing unwind for {:?}", function.symbol))?;
         }
         crate::append_code(&mut code, code_rva, self.loader_rva, &self.loader)?;
         append_generated_unwind(
@@ -995,7 +997,8 @@ impl<'a> Plan<'a> {
             xdata_rva,
             self.loader_rva,
             &self.loader,
-        )?;
+        )
+        .context("reconstructing entry-loader unwind")?;
         if !self.startup.is_empty() {
             crate::append_code(&mut code, code_rva, self.startup_rva, &self.startup)?;
             append_generated_unwind(
@@ -1005,7 +1008,8 @@ impl<'a> Plan<'a> {
                 xdata_rva,
                 self.startup_rva,
                 &self.startup,
-            )?;
+            )
+            .context("reconstructing startup-thunk unwind")?;
         }
         sections.extend(self.data.drain(..).map(|placed| placed.section));
         sections.push(crate::section(self.code_name.clone(), code_rva, true, code));

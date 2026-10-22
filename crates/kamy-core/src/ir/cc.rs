@@ -120,13 +120,29 @@ fn win64_sig(int_args: usize, noreturn: bool) -> FnSignature {
     }
 }
 
-/// Conservative integer-call contract for unresolved host calls. Authored calls
-/// require a compiler-produced contract instead.
+/// Unclassified Win64 host calls retain both register classes in every argument
+/// slot and both possible return registers. Authored calls require an exact contract.
 pub struct Win64Default;
 
 impl Win64Default {
     pub fn default_signature() -> FnSignature {
-        win64_sig(WIN64_ARG_GPRS.len(), false)
+        FnSignature {
+            args: WIN64_ARG_GPRS
+                .iter()
+                .map(|g| AbiValue::register(PhysReg::Gpr(*g)))
+                .chain(
+                    WIN64_ARG_XMMS
+                        .iter()
+                        .map(|x| AbiValue::register(PhysReg::Xmm(*x))),
+                )
+                .collect(),
+            returns: vec![
+                AbiValue::register(PhysReg::Gpr(Gpr::Rax)),
+                AbiValue::register(PhysReg::Xmm(XmmReg::Xmm0)),
+            ],
+            clobbers: win64_volatiles(),
+            noreturn: false,
+        }
     }
 }
 
@@ -165,7 +181,7 @@ fn crt_signature(name: &str) -> Option<FnSignature> {
 
 /// Precise Win64 signature for a named import: the curated CRT table first (the
 /// C runtime is outside Win32 metadata), then the generated Win32 metadata DB
-/// (grilling D14). Unknown names fall back to the four-argument Win64 default
+/// (grilling D14). Unknown names keep the unclassified Win64 register contract
 /// at the call site.
 pub fn win64_import_signature(name: &str) -> Option<FnSignature> {
     if let Some(sig) = crt_signature(name) {
@@ -294,5 +310,74 @@ impl CallingConvLookup for MapCallConv {
                 .cloned()
                 .unwrap_or_else(|| self.default.clone()),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_calls_preserve_each_argument_class_and_possible_return() {
+        let signature = Win64Default::default_signature();
+        assert_eq!(
+            signature
+                .args
+                .iter()
+                .filter_map(AbiValue::register_location)
+                .collect::<Vec<_>>(),
+            vec![
+                PhysReg::Gpr(Gpr::Rcx),
+                PhysReg::Gpr(Gpr::Rdx),
+                PhysReg::Gpr(Gpr::R8),
+                PhysReg::Gpr(Gpr::R9),
+                PhysReg::Xmm(XmmReg::Xmm0),
+                PhysReg::Xmm(XmmReg::Xmm1),
+                PhysReg::Xmm(XmmReg::Xmm2),
+                PhysReg::Xmm(XmmReg::Xmm3),
+            ]
+        );
+        assert_eq!(
+            signature
+                .returns
+                .iter()
+                .filter_map(AbiValue::register_location)
+                .collect::<Vec<_>>(),
+            vec![PhysReg::Gpr(Gpr::Rax), PhysReg::Xmm(XmmReg::Xmm0)]
+        );
+        assert_eq!(signature.clobbers, win64_volatiles());
+        assert_eq!(MapCallConv::new(HashMap::new()).lookup(0), Some(signature));
+    }
+
+    #[test]
+    fn classified_imports_keep_their_exact_register_contracts() {
+        for (name, arguments, returns) in [("memcpy", 3, 1), ("SetLastError", 1, 0)] {
+            let signature = win64_import_signature(name).unwrap();
+            assert_eq!(signature.args.len(), arguments);
+            assert!(
+                signature
+                    .args
+                    .iter()
+                    .all(|arg| { matches!(arg.register_location(), Some(PhysReg::Gpr(_))) })
+            );
+            assert_eq!(signature.returns.len(), returns);
+            if returns != 0 {
+                assert_eq!(
+                    signature.returns[0].register_location(),
+                    Some(PhysReg::Gpr(Gpr::Rax))
+                );
+            }
+            assert_eq!(signature.clobbers, win64_volatiles());
+            let cc = MapCallConv::new(HashMap::from([(0x140001000, signature.clone())]));
+            assert_eq!(cc.lookup(0x140001000), Some(signature));
+            assert_eq!(cc.lookup(0), Some(Win64Default::default_signature()));
+        }
+    }
+
+    #[test]
+    fn unclassified_crt_names_never_acquire_an_integer_return_guess() {
+        for name in ["strtod", "atof", "printf", "unknown_import"] {
+            assert!(win64_import_signature(name).is_none());
+        }
     }
 }

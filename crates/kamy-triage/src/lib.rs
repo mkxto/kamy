@@ -37,7 +37,7 @@ pub fn protect_identity(
     let seeds = pe.seeds();
     module.functions = discover_functions(&module, &seeds);
 
-    let cc = kamy_link::build_callconv(&module);
+    let cc = kamy_link::build_callconv(&pe, &module)?;
     let mut identity =
         |_: &SymbolId, _: &mut IrFunction, _: f32| Ok(kamy_link::TransformOutcome::default());
     let opts = kamy_link::Options {
@@ -119,7 +119,7 @@ pub fn dump_function(input: &Path, rva: Rva, stage: Stage) -> anyhow::Result<Str
         .find(|f| f.entry == rva)
         .with_context(|| format!("no function with entry {rva}"))?;
 
-    let cc = kamy_link::build_callconv(&module);
+    let cc = kamy_link::build_callconv(&pe, &module)?;
     let result = kamy_lift::lift_function(&module, func, &cc, &[]);
     dump_result(result, rva, stage, String::new(), false)
 }
@@ -132,7 +132,12 @@ fn dump_result(
     authored: bool,
 ) -> anyhow::Result<String> {
     if matches!(stage, Stage::Ssa | Stage::Optimize | Stage::Regalloc) {
-        kamy_lift::ssa::construct_ssa(&mut result);
+        if let Err(reason) = kamy_lift::ssa::construct_ssa(&mut result) {
+            writeln!(out, "function {rva} @ {stage:?}")?;
+            write_header(&mut out, &result)?;
+            write_ir(&mut out, &result.func)?;
+            bail!("{out}concrete frame reconstruction failed: {reason}");
+        }
         if authored {
             kamy_transforms::resolve_image_base_uses(&mut result.func, |offset| {
                 Some(kamy_core::SymbolicExpression::Symbol {
@@ -157,12 +162,7 @@ fn dump_result(
     write_ir(&mut out, &result.func)?;
 
     if stage == Stage::Regalloc {
-        match kamy_codegen::allocate_registers(
-            &result.func,
-            &kamy_codegen::CALLEE_SAVED_GPRS,
-            &result.rsp_chain,
-            &result.reg_pins,
-        ) {
+        match kamy_codegen::allocate_registers(&result.func, &result.rsp_chain, &result.reg_pins) {
             Ok(alloc) => write_regalloc(&mut out, &alloc)?,
             Err(reason) if authored => bail!("{out}register allocation failed: {reason}"),
             Err(reason) => bail!("register allocation failed: {reason}"),
@@ -231,21 +231,40 @@ fn write_block(out: &mut String, b: &IrBlock) -> anyhow::Result<()> {
 }
 
 fn write_regalloc(out: &mut String, alloc: &kamy_codegen::RegAllocation) -> anyhow::Result<()> {
-    writeln!(out, "assignments:")?;
-    let mut a: Vec<_> = alloc.assignments.iter().collect();
+    writeln!(out, "allocation: memory-backed")?;
+    writeln!(out, "frame: {:?}", alloc.frame)?;
+    writeln!(out, "frame_size_limit: {}", kamy_core::MAX_FRAME_SIZE)?;
+    writeln!(out, "scratch_gprs: {:?}", kamy_codegen::MEMORY_SCRATCH_GPRS)?;
+    writeln!(out, "scratch_xmms: {:?}", kamy_codegen::MEMORY_SCRATCH_XMMS)?;
+    writeln!(out, "memory_homes: {}", alloc.homes.len())?;
+    let mut homes: Vec<_> = alloc.homes.iter().collect();
+    homes.sort_by_key(|(value, _)| value.0);
+    for (value, home) in homes {
+        writeln!(out, "  v{} -> {home:?}", value.0)?;
+    }
+    writeln!(out, "entry_stack_offsets:")?;
+    let mut offsets: Vec<_> = alloc.analysis.offsets.iter().collect();
+    offsets.sort_by_key(|(value, _)| value.0);
+    for (value, offset) in offsets {
+        writeln!(out, "  v{} -> {offset:?}", value.0)?;
+    }
+    writeln!(out, "derived_stack_offsets:")?;
+    let mut derived: Vec<_> = alloc.analysis.derived_offsets.iter().collect();
+    derived.sort_by_key(|(value, _)| value.0);
+    for (value, (base, offset)) in derived {
+        writeln!(out, "  v{} -> v{} {offset:+}", value.0, base.0)?;
+    }
+    writeln!(out, "call_stack_deltas:")?;
+    let mut calls: Vec<_> = alloc.analysis.call_deltas.iter().collect();
+    calls.sort_by_key(|((block, instruction), _)| (block.0, *instruction));
+    for ((block, instruction), delta) in calls {
+        writeln!(out, "  block{} @{instruction} -> {delta}", block.0)?;
+    }
+    writeln!(out, "boundary_pins:")?;
+    let mut a: Vec<_> = alloc.pins.iter().collect();
     a.sort_by_key(|(v, _)| v.0);
     for (v, p) in a {
         writeln!(out, "  v{} -> {:?}", v.0, p)?;
-    }
-    if !alloc.copies.is_empty() {
-        writeln!(out, "copies:")?;
-        for c in &alloc.copies {
-            writeln!(
-                out,
-                "  @{}: {:?} -> {:?} : {:?}",
-                c.point, c.from, c.to, c.ty
-            )?;
-        }
     }
     Ok(())
 }

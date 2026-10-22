@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, ensure};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
-use kamy_core::{HostReference, Module, ReferenceKind, RelocKind, Rva, Terminator};
+use kamy_core::{
+    HostReference, MetadataReferences, Module, ReferenceKind, RelocKind, Rva, Terminator,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct FunctionReferences {
@@ -136,17 +138,32 @@ impl Ownership {
 /// instruction boundaries or complete reference recovery (D22).
 pub fn build_reference_model(
     module: &Module,
-    metadata: &[HostReference],
+    metadata: &MetadataReferences,
 ) -> anyhow::Result<ReferenceModel> {
     let ownership = Ownership::build(module).context("validating recovered reference ownership")?;
-    let mut references = metadata.to_vec();
-    let mut classified = Vec::new();
+    let mut references = metadata.references.clone();
+    let mut classified = Vec::with_capacity(metadata.classified_ranges.len());
+    for range in &metadata.classified_ranges {
+        ensure!(
+            range.start < range.end
+                && module.bytes_at(range.start).is_some_and(|bytes| {
+                    bytes.len() >= (range.end.get() - range.start.get()) as usize
+                }),
+            "classified metadata range {}..{} is not file-backed",
+            range.start,
+            range.end
+        );
+        classified.push(Interval {
+            start: range.start.get(),
+            end: range.end.get(),
+        });
+    }
     let mut instruction_starts = BTreeSet::new();
     let mut cfg_edges = BTreeSet::new();
     let mut call_edges = BTreeSet::new();
     let mut uncertain = ownership.uncertain.clone();
 
-    for reference in metadata {
+    for reference in &metadata.references {
         let width = match reference.kind {
             ReferenceKind::Absolute => 8,
             ReferenceKind::ImageRelative | ReferenceKind::Unwind | ReferenceKind::Opaque => 4,
@@ -750,7 +767,7 @@ mod tests {
     #[test]
     fn one_byte_function_is_resolved() {
         let module = module(vec![0xc3], vec![function(0x1000, 0x1001)], Vec::new());
-        let model = build_reference_model(&module, &[]).unwrap();
+        let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
         assert!(model.is_resolved(Rva::new(0x1000)));
         assert!(!model.is_resolved(Rva::new(0x1001)));
         assert!(model.functions[&Rva::new(0x1000)].incoming.is_empty());
@@ -773,7 +790,7 @@ mod tests {
             rva: Rva::new(0x2000),
             kind: RelocKind::Dir64,
         });
-        let model = build_reference_model(&module, &[]).unwrap();
+        let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
         let caller = &model.functions[&Rva::new(0x1000)];
         let callee = &model.functions[&Rva::new(0x1010)];
         let outgoing: Vec<_> = caller
@@ -816,9 +833,69 @@ mod tests {
             0x1000_u32.to_le_bytes().to_vec(),
         );
         let field = reference(0x2000, 0x1000, ReferenceKind::ImageRelative);
-        let model = build_reference_model(&module, &[field, field]).unwrap();
+        let metadata = MetadataReferences {
+            references: vec![field, field],
+            ..MetadataReferences::default()
+        };
+        let model = build_reference_model(&module, &metadata).unwrap();
         assert_eq!(model.references, vec![field]);
         assert!(model.is_resolved(Rva::new(0x1000)));
+    }
+
+    #[test]
+    fn classified_unwind_scalars_do_not_hide_adjacent_unknown_pointers() {
+        let mut code = vec![0xcc; 0x206];
+        code[0x200..].copy_from_slice(&[0x90, 0x90, 0x90, 0x90, 0x90, 0xc3]);
+        let mut data = vec![0; 28];
+        data[..8].copy_from_slice(&[1, 4, 1, 0, 4, 0x12, 0, 0]);
+        for (offset, value) in [(16, 0x1200_u32), (20, 0x1206), (24, 0x2000)] {
+            data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut module = module(code, vec![function(0x1200, 0x1206)], data);
+        let metadata = MetadataReferences {
+            references: vec![
+                reference(0x2010, 0x1200, ReferenceKind::Unwind),
+                reference(0x2014, 0x1206, ReferenceKind::Unwind),
+                reference(0x2018, 0x2000, ReferenceKind::Unwind),
+            ],
+            classified_ranges: vec![Rva::new(0x2000)..Rva::new(0x2008)],
+        };
+        let unclassified = MetadataReferences {
+            references: metadata.references.clone(),
+            ..MetadataReferences::default()
+        };
+        let baseline = build_reference_model(&module, &unclassified).unwrap();
+        assert_eq!(
+            baseline.functions[&Rva::new(0x1200)].unresolved,
+            vec![reference(0x2004, 0x1204, ReferenceKind::Opaque)]
+        );
+        let resolved = build_reference_model(&module, &metadata).unwrap();
+        assert!(resolved.is_resolved(Rva::new(0x1200)));
+        assert_eq!(resolved.references, metadata.references);
+
+        module.sections[1].data[8..12].copy_from_slice(&0x1204_u32.to_le_bytes());
+        let pinned = build_reference_model(&module, &metadata).unwrap();
+        assert_eq!(
+            pinned.functions[&Rva::new(0x1200)].unresolved,
+            vec![reference(0x2008, 0x1204, ReferenceKind::Opaque)]
+        );
+    }
+
+    #[test]
+    fn classified_metadata_ranges_require_nonempty_file_backing() {
+        let module = module(vec![0xc3], vec![function(0x1000, 0x1001)], vec![0; 4]);
+        for (start, end) in [
+            (0x2000, 0x2000),
+            (0x2004, 0x2000),
+            (0x2000, 0x2005),
+            (0x3000, 0x3004),
+        ] {
+            let metadata = MetadataReferences {
+                classified_ranges: vec![Rva::new(start)..Rva::new(end)],
+                ..MetadataReferences::default()
+            };
+            assert!(build_reference_model(&module, &metadata).is_err());
+        }
     }
 
     #[test]
@@ -832,7 +909,7 @@ mod tests {
             rva: Rva::new(0x2000),
             kind: RelocKind::Dir64,
         });
-        let model = build_reference_model(&module, &[]).unwrap();
+        let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
         assert_eq!(
             model.functions[&Rva::new(0x1000)].unresolved,
             vec![reference(0x2000, 0x1001, ReferenceKind::Absolute)]
@@ -850,7 +927,7 @@ mod tests {
         };
         let first = module(vec![0xeb, 0, 0xc3], vec![cfg_function], Vec::new());
         assert!(
-            build_reference_model(&first, &[])
+            build_reference_model(&first, &MetadataReferences::default())
                 .unwrap()
                 .is_resolved(Rva::new(0x1000))
         );
@@ -860,7 +937,7 @@ mod tests {
             vec![function(0x1000, 0x1006)],
             Vec::new(),
         );
-        let model = build_reference_model(&module, &[]).unwrap();
+        let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
         assert_eq!(
             model.functions[&Rva::new(0x1000)].unresolved,
             vec![reference(0x1000, 0x1005, ReferenceKind::DirectBranch)]
@@ -875,7 +952,7 @@ mod tests {
         let mut caller = function(0x1000, 0x1005);
         caller.blocks[0].terminator = Terminator::Jump(Rva::new(0x1011));
         let module = module(code, vec![caller, function(0x1010, 0x1012)], Vec::new());
-        let model = build_reference_model(&module, &[]).unwrap();
+        let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
         assert!(model.is_resolved(Rva::new(0x1000)));
         assert_eq!(
             model.functions[&Rva::new(0x1010)].unresolved,
@@ -892,7 +969,7 @@ mod tests {
             vec![first, function(0x1001, 0x1002)],
             Vec::new(),
         );
-        let model = build_reference_model(&module, &[]).unwrap();
+        let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
         assert_eq!(
             model.references,
             vec![reference(0x1000, 0x1001, ReferenceKind::DirectBranch)]
@@ -921,7 +998,7 @@ mod tests {
             ],
         };
         let module = module(vec![0xff, 0xe0, 0xc3], vec![function], Vec::new());
-        let model = build_reference_model(&module, &[]).unwrap();
+        let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
         assert_eq!(
             model.references,
             vec![reference(0x1000, 0x1002, ReferenceKind::Switch)]
@@ -940,7 +1017,7 @@ mod tests {
             vec![function(0x1000, 0x1001), function(0x1010, 0x1011)],
             Vec::new(),
         );
-        let model = build_reference_model(&module, &[]).unwrap();
+        let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
         assert!(model.is_resolved(Rva::new(0x1000)));
         assert_eq!(
             model.functions[&Rva::new(0x1010)].unresolved,
@@ -959,10 +1036,14 @@ mod tests {
             (BASE + 0x1010).to_le_bytes().to_vec(),
         );
         let opaque = reference(0x2000, 0x1010, ReferenceKind::Opaque);
-        let model = build_reference_model(&module, &[]).unwrap();
+        let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
         assert!(model.is_resolved(Rva::new(0x1000)));
         assert_eq!(model.functions[&Rva::new(0x1010)].unresolved, vec![opaque]);
-        let known = build_reference_model(&module, &[opaque]).unwrap();
+        let metadata = MetadataReferences {
+            references: vec![opaque],
+            ..MetadataReferences::default()
+        };
+        let known = build_reference_model(&module, &metadata).unwrap();
         assert!(!known.is_resolved(Rva::new(0x1010)));
     }
 
@@ -976,7 +1057,7 @@ mod tests {
             vec![function(0x1000, 0x1001), function(0x1010, 0x1011)],
             Vec::new(),
         );
-        let model = build_reference_model(&first, &[]).unwrap();
+        let model = build_reference_model(&first, &MetadataReferences::default()).unwrap();
         assert!(!model.is_resolved(Rva::new(0x1000)));
         assert!(model.is_resolved(Rva::new(0x1010)));
 
@@ -985,7 +1066,7 @@ mod tests {
             vec![function(0x1000, 0x1002), function(0x1001, 0x1002)],
             Vec::new(),
         );
-        let model = build_reference_model(&module, &[]).unwrap();
+        let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
         assert!(
             model
                 .functions
@@ -1011,7 +1092,7 @@ mod tests {
             ],
         };
         let module = module(vec![0x74, 2, 0xeb, 0, 0xc3], vec![function], Vec::new());
-        let model = build_reference_model(&module, &[]).unwrap();
+        let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
         assert_eq!(
             model.references,
             vec![
@@ -1035,7 +1116,7 @@ mod tests {
             vec![function(0x1000, 0x100b), function(0x1010, 0x1011)],
             Vec::new(),
         );
-        let unknown = build_reference_model(&module, &[]).unwrap();
+        let unknown = build_reference_model(&module, &MetadataReferences::default()).unwrap();
         assert_eq!(
             unknown.references,
             vec![reference(0x1000, 0x1010, ReferenceKind::Opaque)]
@@ -1046,7 +1127,7 @@ mod tests {
             rva: Rva::new(0x1002),
             kind: RelocKind::Dir64,
         });
-        let known = build_reference_model(&module, &[]).unwrap();
+        let known = build_reference_model(&module, &MetadataReferences::default()).unwrap();
         assert_eq!(
             known.references,
             vec![reference(0x1002, 0x1010, ReferenceKind::Absolute)]
@@ -1069,7 +1150,7 @@ mod tests {
             ],
         };
         let module = module(vec![0xe8, 0, 0, 0, 0, 0xc3], vec![function], Vec::new());
-        let model = build_reference_model(&module, &[]).unwrap();
+        let model = build_reference_model(&module, &MetadataReferences::default()).unwrap();
         assert_eq!(
             model.functions[&Rva::new(0x1000)].unresolved,
             vec![reference(0x1000, 0x1005, ReferenceKind::DirectBranch)]

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 const NONVOLATILE: [usize; 8] = [3, 5, 6, 7, 12, 13, 14, 15];
 const RETURN_PC: u64 = 0x1234_5678_9abc_def0;
-const STACK_MIN: i64 = -8184;
+const STACK_MIN: i64 = -16 * 1024 * 1024;
 const STACK_MAX: i64 = 8200;
 
 fn gpr_sentinel(index: usize) -> u64 {
@@ -114,10 +114,21 @@ impl Machine {
 
     fn read_register(&self, register: Register) -> Value {
         if let Some(index) = gpr(register) {
-            if register.is_gpr64() {
-                self.registers[index]
-            } else {
-                Value::Unknown
+            match self.registers[index] {
+                value if register.is_gpr64() => value,
+                Value::Bits(bits) => {
+                    let shift = if register.is_gpr8()
+                        && register >= Register::AH
+                        && register <= Register::BH
+                    {
+                        8
+                    } else {
+                        0
+                    };
+                    let mask = (1u128 << (register.size() * 8)) - 1;
+                    Value::Bits((bits >> shift) & mask)
+                }
+                _ => Value::Unknown,
             }
         } else if let Some(index) = vector(register) {
             self.vectors[index]
@@ -130,6 +141,20 @@ impl Machine {
         if let Some(index) = gpr(register) {
             let value = if register.is_gpr64() {
                 value
+            } else if let Value::Bits(bits) = value {
+                let mask = (1u128 << (register.size() * 8)) - 1;
+                if register.is_gpr32() {
+                    Value::Bits(bits & mask)
+                } else if let Value::Bits(previous) = self.registers[index] {
+                    let shift = if register >= Register::AH && register <= Register::BH {
+                        8
+                    } else {
+                        0
+                    };
+                    Value::Bits((previous & !(mask << shift)) | ((bits & mask) << shift))
+                } else {
+                    Value::Unknown
+                }
             } else {
                 Value::Unknown
             };
@@ -182,19 +207,20 @@ fn stack_address(machine: &Machine, instruction: &Instruction) -> Result<Option<
         return Ok(None);
     }
     let base = machine.read_register(instruction.memory_base());
-    let index = machine.read_register(instruction.memory_index());
-    ensure!(
-        !matches!(index, Value::Stack(_)),
-        "independent unwind oracle cannot simulate indexed stack addresses"
-    );
     if let Value::Stack(offset) = base {
-        ensure!(
-            instruction.memory_index() == Register::None,
-            "independent unwind oracle cannot simulate indexed stack addresses"
-        );
+        let index = match instruction.memory_index() {
+            Register::None => 0,
+            _ => match machine.read_register(instruction.memory_index()) {
+                Value::Bits(bits) => (bits as i64)
+                    .checked_mul(i64::from(instruction.memory_index_scale()))
+                    .context("simulated stack index overflow")?,
+                _ => return Ok(None),
+            },
+        };
         return Ok(Some(
             offset
-                .checked_add(instruction.memory_displacement64() as i64)
+                .checked_add(index)
+                .and_then(|offset| offset.checked_add(instruction.memory_displacement64() as i64))
                 .context("simulated stack displacement overflow")?,
         ));
     }
@@ -312,16 +338,13 @@ fn advance_prologue(machine: &mut Machine, instruction: &Instruction) -> Result<
         && instruction.op0_kind() == OpKind::Memory
         && let Some(offset) = stack_address(machine, instruction)?
     {
-        ensure!(
-            instruction.op1_kind() == OpKind::Register,
-            "independent unwind oracle cannot simulate this prologue save"
-        );
         let size = instruction.memory_size().size();
         let register = instruction.op1_register();
-        ensure!(
-            (size == 8 && register.is_gpr64()) || (size == 16 && vector(register).is_some()),
-            "independent unwind oracle cannot simulate partial/oversized prologue save"
-        );
+        if instruction.op1_kind() != OpKind::Register
+            || !((size == 8 && register.is_gpr64()) || (size == 16 && vector(register).is_some()))
+        {
+            return Ok(false);
+        }
         if matches!(
             instruction.mnemonic(),
             Mnemonic::Movaps
@@ -355,7 +378,6 @@ fn advance_prologue(machine: &mut Machine, instruction: &Instruction) -> Result<
 #[derive(Debug)]
 pub struct Prologue {
     pub pc: u32,
-    machine: Machine,
 }
 
 pub fn decode_prologue(code: &[u8], begin: u32) -> Result<Prologue> {
@@ -388,10 +410,255 @@ pub fn decode_prologue(code: &[u8], begin: u32) -> Result<Prologue> {
         }
         return Ok(Prologue {
             pc: u32::try_from(instruction.ip())?,
-            machine,
         });
     }
     bail!("logical function has no instruction after its decoded prologue")
+}
+
+#[derive(Debug)]
+struct Snapshot {
+    pc: u32,
+    machine: Machine,
+    epilogue: bool,
+}
+
+fn operand(machine: &Machine, instruction: &Instruction, index: u32) -> Result<Value> {
+    Ok(match instruction.op_kind(index) {
+        OpKind::Register => machine.read_register(instruction.op_register(index)),
+        OpKind::Memory => {
+            if let Some(offset) = stack_address(machine, instruction)? {
+                let size = instruction.memory_size().size();
+                stack_bounds(offset, size)?;
+                machine
+                    .stack
+                    .get(&offset)
+                    .filter(|slot| slot.size == size)
+                    .map_or(Value::Unknown, |slot| slot.value)
+            } else {
+                Value::Unknown
+            }
+        }
+        OpKind::Immediate8
+        | OpKind::Immediate16
+        | OpKind::Immediate32
+        | OpKind::Immediate64
+        | OpKind::Immediate8to16
+        | OpKind::Immediate8to32
+        | OpKind::Immediate8to64
+        | OpKind::Immediate32to64 => Value::Bits(instruction.immediate(index).into()),
+        _ => Value::Unknown,
+    })
+}
+
+fn advance_body(
+    machine: &mut Machine,
+    instruction: &Instruction,
+    factory: &mut InstructionInfoFactory,
+) -> Result<()> {
+    if instruction.mnemonic() == Mnemonic::Pop || instruction.mnemonic() == Mnemonic::Popfq {
+        ensure!(
+            instruction.stack_pointer_increment() == 8,
+            "unsupported POP width"
+        );
+        let offset = machine.rsp()?;
+        let value = machine
+            .stack
+            .get(&offset)
+            .filter(|slot| slot.size == 8)
+            .map_or(Value::Unknown, |slot| slot.value);
+        machine.write_register(Register::RSP, Value::Stack(offset + 8))?;
+        if instruction.mnemonic() == Mnemonic::Pop {
+            ensure!(
+                instruction.op0_kind() == OpKind::Register,
+                "unsupported POP destination"
+            );
+            machine.write_register(instruction.op0_register(), value)?;
+        }
+        return Ok(());
+    }
+    if instruction.mnemonic() == Mnemonic::Leave {
+        machine.write_register(Register::RSP, machine.read_register(Register::RBP))?;
+        let offset = machine.rsp()?;
+        let value = machine
+            .stack
+            .get(&offset)
+            .filter(|slot| slot.size == 8)
+            .map_or(Value::Unknown, |slot| slot.value);
+        machine.write_register(Register::RSP, Value::Stack(offset + 8))?;
+        machine.write_register(Register::RBP, value)?;
+        return Ok(());
+    }
+    if instruction.mnemonic() == Mnemonic::Add && instruction.op0_register() == Register::RSP {
+        let Value::Bits(value) = operand(machine, instruction, 1)? else {
+            bail!("independent unwind oracle cannot prove body stack deallocation");
+        };
+        let offset = machine
+            .rsp()?
+            .checked_add(i64::try_from(value)?)
+            .context("body stack deallocation overflow")?;
+        machine.write_register(Register::RSP, Value::Stack(offset))?;
+        return Ok(());
+    }
+    if is_move(instruction) {
+        let value = operand(machine, instruction, 1)?;
+        if instruction.op0_kind() == OpKind::Register {
+            machine.write_register(instruction.op0_register(), value)?;
+        } else if let Some(offset) = stack_address(machine, instruction)? {
+            machine.store(offset, instruction.memory_size().size(), value)?;
+            let register = instruction.op1_register();
+            if let Some(index) = gpr(register)
+                && NONVOLATILE.contains(&index)
+                && value == Value::Bits(gpr_sentinel(index).into())
+            {
+                machine.saved_gpr |= 1 << index;
+            }
+            if let Some(index) = vector(register)
+                && index >= 6
+                && value == Value::Bits(xmm_sentinel(index))
+            {
+                machine.saved_xmm |= 1 << index;
+            }
+        }
+        return Ok(());
+    }
+    if advance_prologue(machine, instruction)? {
+        return Ok(());
+    }
+    if instruction.flow_control() == FlowControl::Call
+        || instruction.flow_control() == FlowControl::IndirectCall
+    {
+        for index in [0, 1, 2, 8, 9, 10, 11] {
+            machine.registers[index] = Value::Unknown;
+        }
+        machine.vectors[..6].fill(Value::Unknown);
+        return Ok(());
+    }
+    let info = factory.info(instruction);
+    if info
+        .used_memory()
+        .iter()
+        .any(|memory| writes(memory.access()))
+        && let Some(offset) = stack_address(machine, instruction)?
+    {
+        machine.store(offset, instruction.memory_size().size(), Value::Unknown)?;
+    }
+    for used in info
+        .used_registers()
+        .iter()
+        .filter(|used| writes(used.access()))
+    {
+        if gpr(used.register()).is_some() || vector(used.register()).is_some() {
+            machine.write_register(used.register(), Value::Unknown)?;
+        }
+    }
+    Ok(())
+}
+
+fn machine_snapshots(code: &[u8], begin: u32) -> Result<Vec<Snapshot>> {
+    let end = begin
+        .checked_add(u32::try_from(code.len())?)
+        .context("oracle code extent overflow")?;
+    let mut instructions = BTreeMap::new();
+    let mut decoder = Decoder::with_ip(64, code, u64::from(begin), DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        ensure!(
+            !instruction.is_invalid(),
+            "invalid machine instruction in unwind oracle"
+        );
+        instructions.insert(u32::try_from(instruction.ip())?, instruction);
+    }
+    let mut pending = vec![(begin, Machine::entry())];
+    let mut states: BTreeMap<u32, Machine> = BTreeMap::new();
+    let mut factory = InstructionInfoFactory::new();
+    let mut snapshots = BTreeMap::new();
+    while let Some((mut pc, mut machine)) = pending.pop() {
+        loop {
+            ensure!(
+                states.len() <= 1_000_000,
+                "independent unwind oracle instruction limit exceeded"
+            );
+            if let Some(previous) = states.get(&pc) {
+                let mut merged = previous.clone();
+                for (index, (old, current)) in merged
+                    .registers
+                    .iter_mut()
+                    .zip(machine.registers)
+                    .enumerate()
+                {
+                    if *old != current {
+                        ensure!(
+                            index != 4,
+                            "independent unwind oracle has conflicting RSP at {pc:#x}"
+                        );
+                        *old = Value::Unknown;
+                    }
+                }
+                for (old, current) in merged.vectors.iter_mut().zip(machine.vectors) {
+                    if *old != current {
+                        *old = Value::Unknown;
+                    }
+                }
+                merged
+                    .stack
+                    .retain(|offset, slot| machine.stack.get(offset) == Some(slot));
+                merged.saved_gpr |= machine.saved_gpr;
+                merged.saved_xmm |= machine.saved_xmm;
+                if &merged == previous {
+                    break;
+                }
+                machine = merged;
+            }
+            states.insert(pc, machine.clone());
+            let instruction = instructions
+                .get(&pc)
+                .context("unwind oracle branch is not an instruction boundary")?;
+            let next = u32::try_from(instruction.next_ip())?;
+            let epilogue = matches!(
+                instruction.mnemonic(),
+                Mnemonic::Pop | Mnemonic::Leave | Mnemonic::Ret
+            ) || (instruction.mnemonic() == Mnemonic::Add
+                && instruction.op0_register() == Register::RSP)
+                || (is_move(instruction)
+                    && instruction.op0_kind() == OpKind::Register
+                    && instruction.op1_kind() == OpKind::Memory
+                    && (instruction.op0_register().is_xmm()
+                        || gpr(instruction.op0_register())
+                            .is_some_and(|index| NONVOLATILE.contains(&index))));
+            snapshots.insert(
+                pc,
+                Snapshot {
+                    pc,
+                    machine: machine.clone(),
+                    epilogue,
+                },
+            );
+            match instruction.flow_control() {
+                FlowControl::Return | FlowControl::Exception | FlowControl::Interrupt => break,
+                FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
+                    ensure!(
+                        instruction.op0_kind() == OpKind::NearBranch64,
+                        "unknown direct branch operand"
+                    );
+                    let target = u32::try_from(instruction.near_branch64())?;
+                    if target >= begin && target < end {
+                        pending.push((target, machine.clone()));
+                    }
+                    if instruction.flow_control() == FlowControl::UnconditionalBranch {
+                        break;
+                    }
+                }
+                FlowControl::IndirectBranch => break,
+                _ => advance_body(&mut machine, instruction, &mut factory)
+                    .with_context(|| format!("independent body simulation at {pc:#x}"))?,
+            }
+            if next >= end {
+                break;
+            }
+            pc = next;
+        }
+    }
+    Ok(snapshots.into_values().collect())
 }
 
 #[cfg(windows)]
@@ -400,9 +667,6 @@ mod windows_oracle {
     use windows::Win32::System::Diagnostics::Debug::{
         CONTEXT, CONTEXT_ALL_AMD64, M128A, RtlLookupFunctionEntry, RtlVirtualUnwind,
     };
-
-    #[repr(align(16))]
-    struct Stack([u64; 2048]);
 
     fn concrete(value: Value, initial_sp: u64, poison: u64) -> u64 {
         match value {
@@ -426,16 +690,14 @@ mod windows_oracle {
         }
     }
 
-    unsafe fn unwind_one(image: *const u8, begin: u32, pc_rva: u32, end: u32) -> Result<()> {
-        let code = unsafe {
-            core::slice::from_raw_parts(image.add(begin as usize), (end - begin) as usize)
-        };
-        let prologue = decode_prologue(code, begin)?;
-        ensure!(
-            prologue.pc == pc_rva,
-            "unwind probe is not the independently decoded post-prologue PC"
-        );
-        let machine = prologue.machine;
+    unsafe fn unwind_one(
+        image: *const u8,
+        begin: u32,
+        snapshot: &Snapshot,
+        stack: &mut Vec<u128>,
+    ) -> Result<()> {
+        let pc_rva = snapshot.pc;
+        let machine = &snapshot.machine;
         let pc = image as u64 + u64::from(pc_rva);
         let mut image_base = 0;
         let entry = unsafe { RtlLookupFunctionEntry(pc, &mut image_base, None) };
@@ -452,8 +714,20 @@ mod windows_oracle {
             runtime.BeginAddress <= pc_rva && pc_rva < runtime.EndAddress,
             "native lookup returned runtime record excluding exact probe PC"
         );
-        let mut stack = Stack([0; 2048]);
-        let initial_sp = unsafe { stack.0.as_mut_ptr().add(1023) } as u64;
+        let lowest = machine
+            .stack
+            .keys()
+            .copied()
+            .min()
+            .unwrap_or(0)
+            .min(machine.rsp()?);
+        let below = usize::try_from(-lowest)?
+            .checked_add(31)
+            .context("synthetic stack size overflow")?
+            / 16;
+        stack.resize(below + (STACK_MAX as usize / 16) + 2, 0);
+        stack.fill(0);
+        let initial_sp = unsafe { stack.as_mut_ptr().add(below).cast::<u8>().add(8) } as u64;
         ensure!(
             initial_sp % 16 == 8,
             "synthetic Win64 entry stack is misaligned"
@@ -461,28 +735,26 @@ mod windows_oracle {
         for (&offset, slot) in &machine.stack {
             stack_bounds(offset, slot.size)?;
             let destination = initial_sp.wrapping_add_signed(offset) as *mut u8;
-            match (slot.value, slot.size) {
-                (value, 8) => unsafe {
-                    destination
-                        .cast::<u64>()
-                        .write_unaligned(concrete(value, initial_sp, 0))
-                },
-                (Value::Bits(value), 16) => unsafe {
-                    destination.cast::<u128>().write_unaligned(value)
-                },
-                _ => {
-                    bail!("independent unwind oracle cannot materialize stack slot at {offset:+#x}")
-                }
+            let value = match slot.value {
+                Value::Bits(bits) => bits,
+                value => u128::from(concrete(value, initial_sp, 0)),
+            };
+            ensure!(
+                matches!(slot.size, 1 | 2 | 4 | 8 | 16),
+                "unsupported synthetic stack width"
+            );
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    value.to_le_bytes().as_ptr(),
+                    destination,
+                    slot.size,
+                );
             }
         }
         let values: [u64; 16] = std::array::from_fn(|index| {
             let poison = 0xdead_beef_0000_0000 + index as u64;
             let value = machine.registers[index];
-            if machine.saved_gpr & (1 << index) != 0 && !matches!(value, Value::Stack(_)) {
-                poison
-            } else {
-                concrete(value, initial_sp, poison)
-            }
+            concrete(value, initial_sp, poison)
         });
         let mut context = CONTEXT {
             ContextFlags: CONTEXT_ALL_AMD64,
@@ -507,13 +779,9 @@ mod windows_oracle {
             ..Default::default()
         };
         for index in 0..16 {
-            let value = if machine.saved_xmm & (1 << index) != 0 {
-                0xdead_0000 + index as u128
-            } else {
-                match machine.vectors[index] {
-                    Value::Bits(value) => value,
-                    _ => 0xdead_0000 + index as u128,
-                }
+            let value = match machine.vectors[index] {
+                Value::Bits(value) => value,
+                _ => 0xdead_0000 + index as u128,
             };
             set_xmm(&mut context, index, value);
         }
@@ -567,18 +835,19 @@ mod windows_oracle {
                 "native unwind did not restore XMM{index} at RVA {pc_rva:#x}"
             );
         }
-        println!(
-            "native_unwind function={begin:#x} rva={pc_rva:#x} frame={} saved_gpr={} saved_xmm={}",
-            -machine.rsp()?,
-            (machine.saved_gpr & 0xf0e8).count_ones(),
-            (machine.saved_xmm & 0xffc0).count_ones()
-        );
         Ok(())
     }
 
     pub unsafe fn check_ranges(image: *const u8, image_size: u32, ranges: &str) -> Result<()> {
         let mut generated = 0;
         let mut authored = 0;
+        let mut host = 0;
+        let mut total = 0;
+        let mut epilogues = 0;
+        let mut max_frame = 0;
+        let mut saved_gpr = 0u16;
+        let mut saved_xmm = 0u16;
+        let mut stack = Vec::new();
         for range in ranges.split(',').filter(|value| !value.is_empty()) {
             let (origin, coordinates) = range
                 .split_once('@')
@@ -586,6 +855,7 @@ mod windows_oracle {
             match origin {
                 "generated" => generated += 1,
                 "authored" => authored += 1,
+                "host" => host += 1,
                 _ => bail!("invalid unwind origin {origin}"),
             }
             let mut coordinates = coordinates.split(':');
@@ -609,15 +879,45 @@ mod windows_oracle {
                 begin <= pc && pc < end && end <= image_size,
                 "unwind probe coordinates lie outside mapped image/function"
             );
-            unsafe {
-                unwind_one(image, begin, pc, end)?;
+            let code = unsafe {
+                core::slice::from_raw_parts(image.add(begin as usize), (end - begin) as usize)
+            };
+            ensure!(
+                decode_prologue(code, begin)?.pc == pc,
+                "unwind anchor is not independently decoded"
+            );
+            let snapshots = machine_snapshots(code, begin)?;
+            ensure!(
+                snapshots.iter().any(|snapshot| snapshot.pc == pc),
+                "unwind anchor was not reached"
+            );
+            for snapshot in &snapshots {
+                unsafe {
+                    unwind_one(image, begin, snapshot, &mut stack)?;
+                }
+                max_frame = max_frame.max(-snapshot.machine.rsp()?);
+                saved_gpr |= snapshot.machine.saved_gpr;
+                saved_xmm |= snapshot.machine.saved_xmm;
+                epilogues += usize::from(snapshot.epilogue);
             }
+            total += snapshots.len();
         }
         ensure!(
-            generated > 0 && authored > 0,
-            "native unwind MUST exercise generated loader and authored module code"
+            (generated > 0 && authored > 0) || host > 0,
+            "native unwind MUST exercise generated/authored code or the standalone frame host"
         );
-        println!("unwind_generated={generated} unwind_authored={authored}");
+        ensure!(epilogues > 0, "native unwind did not reach an epilogue");
+        if host > 0 {
+            ensure!(
+                max_frame > 4096 && saved_gpr != 0 && saved_xmm != 0,
+                "frame oracle did not exercise large allocation and both GPR/XMM saves"
+            );
+        }
+        println!(
+            "unwind_generated={generated} unwind_authored={authored} unwind_host={host} unwind_pcs={total} unwind_epilogues={epilogues} max_frame={max_frame} saved_gpr={} saved_xmm={}",
+            saved_gpr.count_ones(),
+            saved_xmm.count_ones()
+        );
         Ok(())
     }
 }
@@ -636,14 +936,16 @@ mod tests {
         ];
         let prologue = decode_prologue(&code, 0x1000).unwrap();
         assert_eq!(prologue.pc, 0x1009);
-        assert_eq!(prologue.machine.rsp().unwrap(), -72);
+        let snapshots = machine_snapshots(&code, 0x1000).unwrap();
+        let machine = &snapshots
+            .iter()
+            .find(|snapshot| snapshot.pc == prologue.pc)
+            .unwrap()
+            .machine;
+        assert_eq!(machine.rsp().unwrap(), -72);
+        assert_eq!(machine.stack[&0].value, Value::Bits(RETURN_PC.into()));
         assert_eq!(
-            prologue.machine.stack[&0].value,
-            Value::Bits(RETURN_PC.into())
-        );
-        assert_eq!(
-            decode_prologue(&code[9..], 0x1009)
-                .unwrap()
+            machine_snapshots(&code[9..], 0x1009).unwrap()[0]
                 .machine
                 .rsp()
                 .unwrap(),
@@ -659,22 +961,74 @@ mod tests {
         ];
         let prologue = decode_prologue(&code, 0x2000).unwrap();
         assert_eq!(prologue.pc, 0x200d);
-        assert_eq!(prologue.machine.rsp().unwrap(), -56);
+        let snapshots = machine_snapshots(&code, 0x2000).unwrap();
+        let machine = &snapshots
+            .iter()
+            .find(|snapshot| snapshot.pc == prologue.pc)
+            .unwrap()
+            .machine;
+        assert_eq!(machine.rsp().unwrap(), -56);
         assert_eq!(
-            prologue.machine.stack[&-8].value,
+            machine.stack[&-8].value,
             Value::Bits(gpr_sentinel(3).into())
         );
         assert_eq!(
-            prologue.machine.stack[&-16].value,
+            machine.stack[&-16].value,
             Value::Bits(gpr_sentinel(5).into())
         );
-        assert_eq!(
-            prologue.machine.stack[&-56].value,
-            Value::Bits(xmm_sentinel(6))
+        assert_eq!(machine.stack[&-56].value, Value::Bits(xmm_sentinel(6)));
+        assert_eq!(machine.registers[5], Value::Stack(-56));
+        assert_eq!(machine.saved_gpr, (1 << 3) | (1 << 5));
+        assert_eq!(machine.saved_xmm, 1 << 6);
+    }
+
+    #[test]
+    fn body_and_epilogue_restore_independent_large_frame_sentinels() {
+        let code = [
+            0x48, 0x81, 0xec, 0x00, 0x30, 0x00, 0x00, 0x85, 0x04, 0x24, 0x48, 0x89, 0x5c, 0x24,
+            0x10, 0x0f, 0x11, 0x74, 0x24, 0x20, 0x31, 0xdb, 0x0f, 0x57, 0xf6, 0x0f, 0x10, 0x74,
+            0x24, 0x20, 0x48, 0x8b, 0x5c, 0x24, 0x10, 0x48, 0x81, 0xc4, 0x00, 0x30, 0x00, 0x00,
+            0xc3,
+        ];
+        let snapshots = machine_snapshots(&code, 0x3000).unwrap();
+        assert!(
+            snapshots
+                .iter()
+                .any(|snapshot| snapshot.machine.rsp().unwrap() == -0x3000)
         );
-        assert_eq!(prologue.machine.registers[5], Value::Stack(-56));
-        assert_eq!(prologue.machine.saved_gpr, (1 << 3) | (1 << 5));
-        assert_eq!(prologue.machine.saved_xmm, 1 << 6);
+        assert!(
+            snapshots
+                .iter()
+                .any(|snapshot| snapshot.machine.registers[3] == Value::Unknown)
+        );
+        assert!(
+            snapshots
+                .iter()
+                .any(|snapshot| snapshot.machine.vectors[6] == Value::Unknown)
+        );
+        let returned = snapshots.last().unwrap();
+        assert!(returned.epilogue);
+        assert_eq!(returned.machine.rsp().unwrap(), 0);
+        assert_eq!(
+            returned.machine.registers[3],
+            Value::Bits(gpr_sentinel(3).into())
+        );
+        assert_eq!(returned.machine.vectors[6], Value::Bits(xmm_sentinel(6)));
+    }
+
+    #[test]
+    fn cfg_join_keeps_stack_state_without_ambient_scalar_values() {
+        let code = [
+            0x53, 0x48, 0x83, 0xec, 0x20, 0x85, 0xc9, 0x74, 0x05, 0xb8, 0x01, 0x00, 0x00, 0x00,
+            0x31, 0xdb, 0x48, 0x83, 0xc4, 0x20, 0x5b, 0xc3,
+        ];
+        let snapshots = machine_snapshots(&code, 0x4000).unwrap();
+        let returned = snapshots.last().unwrap();
+        assert_eq!(returned.machine.rsp().unwrap(), 0);
+        assert_eq!(
+            returned.machine.registers[3],
+            Value::Bits(gpr_sentinel(3).into())
+        );
     }
 
     #[test]

@@ -13,14 +13,15 @@
 //! - A function containing a `call` is skipped. A call consumes its callee's
 //!   argument registers, which iced does not model as reads and whose count we
 //!   do not know without the callee's signature (the deferred interprocedural
-//!   fixpoint); inferring one could under-count a forwarded argument. Leaf
-//!   functions have only explicit reads, which iced models exactly.
-//! - Partial (sub-32-bit) register writes do not count as a definition, so the
-//!   register stays live-in-eligible.
+//!   fixpoint); inferring one could under-count a forwarded argument.
+//! - The possible XMM0 return is live-out at RET; an unmodified floating-point
+//!   argument can be returned without an explicit register read.
+//! - Partial (sub-32-bit) and conditional register writes do not count as a
+//!   definition, so the register stays live-in-eligible.
 //! - A block that tail-calls out of the function, or ends in an unresolved
 //!   indirect/unknown transfer, is given every argument register as live-out.
 //! - A non-contiguous or class-ambiguous argument prefix abandons inference for
-//!   the function (it keeps the four-argument Win64 default).
+//!   the function (it keeps the conservative Win64 default).
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, InstructionInfoFactory, OpAccess, Register};
 use kamy_core::ir::{FnSignature, Gpr, PhysReg, Win64Default, XmmReg};
@@ -36,10 +37,9 @@ const ALL_ARGS: ArgMask = 0xFF;
 const ARG_GPRS: [Gpr; 4] = [Gpr::Rcx, Gpr::Rdx, Gpr::R8, Gpr::R9];
 const ARG_XMMS: [XmmReg; 4] = [XmmReg::Xmm0, XmmReg::Xmm1, XmmReg::Xmm2, XmmReg::Xmm3];
 
-/// Recover a narrowed Win64 signature for `func`, or `None` to keep the
-/// four-argument default. Only the argument list is narrowed; the return
-/// register and the full volatile clobber set stay at the Win64 default
-/// (narrowing those needs the lowering-aware interprocedural pass).
+/// Recover a narrowed Win64 argument contract, or `None` to keep the default.
+/// Return candidates and volatile clobbers remain conservative; argument reads
+/// do not establish the return class or which volatile registers a callee preserves.
 pub fn infer_signature(module: &Module, func: &Function) -> Option<FnSignature> {
     if func.blocks.is_empty() {
         return None;
@@ -57,10 +57,7 @@ pub fn infer_signature(module: &Module, func: &Function) -> Option<FnSignature> 
     let mut defs = vec![0 as ArgMask; n];
     let mut exits_function = vec![false; n];
     for (i, block) in func.blocks.iter().enumerate() {
-        let (u, d, has_call) = block_use_def(module, block.start, block.end);
-        if has_call {
-            return None;
-        }
+        let (u, d) = block_use_def(module, block.start, block.end)?;
         uses[i] = u;
         defs[i] = d;
         exits_function[i] = block_leaves_function(block, &index);
@@ -74,6 +71,9 @@ pub fn infer_signature(module: &Module, func: &Function) -> Option<FnSignature> 
             let mut live_out = 0;
             if exits_function[i] {
                 live_out = ALL_ARGS;
+            }
+            if matches!(func.blocks[i].terminator, Terminator::Return) {
+                live_out |= xmm_bit(0);
             }
             for succ in &func.blocks[i].successors {
                 if let Some(&bi) = index.get(&succ.get()) {
@@ -149,15 +149,14 @@ fn block_leaves_function(block: &BasicBlock, index: &HashMap<u32, usize>) -> boo
     }
 }
 
-/// Per-block use/def masks plus whether the block contains a call. A register is
-/// a *use* if read before any full-width write, a *def* if full-width written
-/// before any read.
-fn block_use_def(module: &Module, start: Rva, end: Rva) -> (ArgMask, ArgMask, bool) {
-    let len = end.get().saturating_sub(start.get()) as usize;
-    let bytes = match module.bytes_at(start) {
-        Some(b) => &b[..len.min(b.len())],
-        None => return (0, 0, false),
-    };
+/// Read-before-write uses and unconditional full-width definitions. Calls or
+/// incomplete decoding cannot prove a narrower argument contract.
+fn block_use_def(module: &Module, start: Rva, end: Rva) -> Option<(ArgMask, ArgMask)> {
+    let len = end.get().checked_sub(start.get())? as usize;
+    if len == 0 {
+        return None;
+    }
+    let bytes = module.bytes_at(start)?.get(..len)?;
     let ip = module.image_base + u64::from(start.get());
     let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
     let mut factory = InstructionInfoFactory::new();
@@ -170,13 +169,13 @@ fn block_use_def(module: &Module, start: Rva, end: Rva) -> (ArgMask, ArgMask, bo
     while decoder.can_decode() {
         let insn = decoder.decode();
         if insn.is_invalid() {
-            break;
+            return None;
         }
         if matches!(
             insn.flow_control(),
             FlowControl::Call | FlowControl::IndirectCall
         ) {
-            return (use_mask, def_mask, true);
+            return None;
         }
         let info = factory.info(&insn);
         // Reads before writes within the instruction: a read-modify-write slot
@@ -202,16 +201,15 @@ fn block_use_def(module: &Module, start: Rva, end: Rva) -> (ArgMask, ArgMask, bo
             if settled & bit != 0 {
                 continue;
             }
-            // Only a full-width write (>=32-bit GPR zero-extends to 64; a vector
-            // write replaces the scalar argument bits) kills live-in. A partial
-            // write leaves the slot live-in-eligible.
+            // Conditional writes leave the incoming value observable on the
+            // unwritten path, as do writes narrower than a zero-extending GPR.
             if is_write(used.access()) && size >= 4 {
                 def_mask |= bit;
                 settled |= bit;
             }
         }
     }
-    (use_mask, def_mask, false)
+    Some((use_mask, def_mask))
 }
 
 fn is_read(a: OpAccess) -> bool {
@@ -222,10 +220,7 @@ fn is_read(a: OpAccess) -> bool {
 }
 
 fn is_write(a: OpAccess) -> bool {
-    matches!(
-        a,
-        OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
-    )
+    matches!(a, OpAccess::Write | OpAccess::ReadWrite)
 }
 
 /// Map a physical register to its Win64 argument slot `(position, is_float,
@@ -263,6 +258,97 @@ fn arg_slot(reg: Register) -> Option<(usize, bool, u32)> {
 mod tests {
     use super::*;
     use kamy_core::{BasicBlock, Function, Machine, Module, Section, SectionFlags, Terminator};
+
+    fn leaf(code: &[u8]) -> (Module, Function) {
+        let entry = Rva::new(0x1000);
+        let function = Function {
+            entry,
+            blocks: vec![BasicBlock {
+                start: entry,
+                end: Rva::new(0x1000 + code.len() as u32),
+                successors: vec![],
+                terminator: Terminator::Return,
+            }],
+        };
+        let module = Module {
+            image_base: 0x1_4000_0000,
+            machine: Machine::X64,
+            entry_point: Some(entry),
+            sections: vec![Section {
+                name: ".text".into(),
+                rva: entry,
+                virtual_size: code.len() as u32,
+                data: code.to_vec(),
+                flags: SectionFlags {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+            }],
+            symbols: vec![],
+            relocations: vec![],
+            functions: vec![],
+        };
+        (module, function)
+    }
+
+    #[test]
+    fn conditional_definition_keeps_forwarded_argument() {
+        let (module, function) = leaf(&[
+            0x0f, 0x44, 0xca, 0x89, 0xc8, 0x66, 0x48, 0x0f, 0x6e, 0xc0, 0xc3,
+        ]);
+        let signature = infer_signature(&module, &function).unwrap();
+        assert_eq!(
+            signature.args,
+            vec![
+                kamy_core::ir::AbiValue::register(PhysReg::Gpr(Gpr::Rcx)),
+                kamy_core::ir::AbiValue::register(PhysReg::Gpr(Gpr::Rdx)),
+            ]
+        );
+        assert_eq!(signature.returns, Win64Default::default_signature().returns);
+        assert_eq!(
+            signature.clobbers,
+            Win64Default::default_signature().clobbers
+        );
+    }
+
+    #[test]
+    fn only_unconditional_full_writes_kill_incoming_arguments() {
+        for (code, arguments) in [
+            (&[0xb1, 7, 0x48, 0x89, 0xc8][..], 1),
+            (&[0x66, 0xb9, 7, 0, 0x48, 0x89, 0xc8][..], 1),
+            (&[0xb9, 7, 0, 0, 0, 0x48, 0x89, 0xc8][..], 0),
+        ] {
+            let mut code = code.to_vec();
+            code.extend_from_slice(&[0x66, 0x48, 0x0f, 0x6e, 0xc0, 0xc3]);
+            let (module, function) = leaf(&code);
+            assert_eq!(
+                infer_signature(&module, &function).unwrap().args.len(),
+                arguments
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_decoding_never_narrows_the_call_contract() {
+        for code in [&[][..], &[0x0f][..], &[0xc5, 0, 0][..]] {
+            let (module, function) = leaf(code);
+            assert!(infer_signature(&module, &function).is_none());
+        }
+        let (module, mut function) = leaf(&[0xc3]);
+        function.blocks[0].end = Rva::new(0x1002);
+        assert!(infer_signature(&module, &function).is_none());
+        function.blocks[0].start = Rva::new(0x2000);
+        function.blocks[0].end = Rva::new(0x2001);
+        function.entry = function.blocks[0].start;
+        assert!(infer_signature(&module, &function).is_none());
+    }
+
+    #[test]
+    fn calls_keep_the_conservative_contract() {
+        let (module, function) = leaf(&[0xe8, 0, 0, 0, 0, 0xc3]);
+        assert!(infer_signature(&module, &function).is_none());
+    }
 
     /// A tail-forwarding thunk (`mov r8d, N; jmp sub`) reads no argument
     /// register directly but forwards RCX/RDX to the tail callee. Inference must
@@ -307,12 +393,30 @@ mod tests {
             }],
         };
 
-        // None keeps the four-argument Win64 default; either way the forwarded
-        // RCX/RDX must survive — never a zero/one-argument narrowing.
-        let argc = infer_signature(&module, &thunk).map_or(4, |s| s.args.len());
+        // An unresolved tail target may consume either class in every slot.
+        let signature =
+            infer_signature(&module, &thunk).unwrap_or_else(Win64Default::default_signature);
+        let argc = signature.args.len();
         assert!(
             argc >= 2,
             "tail-forwarding thunk must not under-count forwarded args (got {argc})"
         );
+    }
+
+    #[test]
+    fn floating_passthrough_return_keeps_its_implicit_argument() {
+        for code in [&[0xc3][..], &[0xb8, 7, 0, 0, 0, 0xc3][..]] {
+            let (module, function) = leaf(code);
+            let signature = infer_signature(&module, &function).unwrap();
+            assert_eq!(
+                signature.args,
+                vec![kamy_core::ir::AbiValue::register(PhysReg::Xmm(
+                    XmmReg::Xmm0
+                ))]
+            );
+            assert_eq!(signature.returns, Win64Default::default_signature().returns);
+        }
+        let (module, function) = leaf(&[0x89, 0xc8, 0xc3]);
+        assert!(infer_signature(&module, &function).is_none());
     }
 }

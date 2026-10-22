@@ -278,6 +278,16 @@ The shared definitions live in `kamy-core`, not in a module-only address model:
   local RVAs. It is not a second authoritative module/link binding model, and
   representable references alone do not establish host completeness.
 
+`MetadataReferences { references, classified_ranges }` is format-agnostic.
+The half-open classified ranges identify validated metadata storage with no
+unenumerated address fields; they exclude scalar bytes from speculative raw
+pointer scanning, not actual reference fields from enumeration or rebinding.
+The PE adapter owns validation of typed unwind-code and BaseReloc scalar
+storage. Unknown handler payloads remain conservative. BaseReloc parsing rejects
+malformed/truncated blocks and unsupported types (supported types are 0, 3 and
+10); a terminal 14-byte block is valid because block starts, not every block
+size, require alignment. Actual unwind/relocation field references remain live.
+
 `OperandReference { instruction, operand, reference }` attaches exact provenance
 to an operand at the unmodified local decode coordinate. `lift_function` takes
 these annotations as its final slice argument. Host callers may pass an empty
@@ -339,28 +349,23 @@ fixup belongs to the direct target. Proven `noreturn` calls end with
 stops there and selection emits no synthetic return/epilogue after the call.
 
 `CallingConvLookup::lookup(target_va)` serves source decoding;
-`lookup_symbol(&SymbolId)` serves exact authored calls. Unknown authored calls
-MUST fail closed, not use the host four-GPR/RAX default. The public callback's
-Win64 `extern "system"` ABI does not establish the ABI of internal Rust calls.
-Host lookup retains callee inference, named import slots and import-thunk
-precedence, using the existing Win32metadata/CRT signatures before conservative
-unknown-host behavior. No mangled-name ABI inference or Rust ABI stability is
-assumed. Metadata representation does not imply every represented instruction,
-frame or aggregate shape is currently lowerable.
-Authored callee preservation also matters: compiler-preserved Win64-volatile
-GPR/XMM values remain pinned live-outs at return/tail boundaries. This preserves
-decoded restores and prevents scratch allocation from overwriting untouched
-values; the existing nonvolatile save/unwind machinery remains shared. Current
-limitations include R11 flag replay conflicting with pinned R11, CL-based
-shift/rotate lowering for exact contracts preserving RCX, and unknown stack
-return locations. Immediate shifts do not require that CL scratch path.
-Physical constraints attach to real boundaries: function-entry live-ins, local
-call/native operand copies and return copies. Logical GPR/XMM moves detach the
-value from a source physical pin rather than extending that pin through every
-alias and later call. Multiple consumers MUST NOT turn a return constant, phi
-or copied call result into an unrelated function-wide register constraint.
-This repairs boundary representation; it is not spilling, concrete-frame
-reconstruction or the pressure guarantee assigned to handoff 2.
+`lookup_symbol(&SymbolId)` serves exact authored calls.
+`build_callconv(&PeFile, &Module) -> anyhow::Result<MapCallConv>` incorporates
+validated PE metadata. Unknown authored calls MUST fail closed. Unknown host
+calls conservatively consume the first four GPR and XMM argument possibilities
+and retain RAX and XMM0 returns; exact Win32/CRT/authored contracts stay precise.
+LoadConfig CF dispatch slots and transparent thunks add the hidden RAX target
+input. This does not establish guard-check or XFG contracts. No mangled-name
+ABI inference or Rust ABI stability is assumed. Unknown stack return locations
+remain unsupported.
+
+Physical constraints attach to function-entry live-ins, local call/native
+operands and return/tail boundaries, not function-wide alias lifetimes.
+Compiler-preserved volatile registers remain boundary live-outs. Memory homes
+preserve values while instruction selection loads boundary registers and
+captures call/native outputs immediately after their definitions. Logical
+copies detach source physical pins. R11 flag replay and CL shifts therefore
+do not impose the former pressure/conflict exclusions.
 
 Implicit arithmetic uses explicit machine boundaries. `UDiv`/`SDiv` take
 `[high, low, divisor]`, with fixed RDX/RAX dividend inputs and quotient in RAX.
@@ -369,10 +374,9 @@ division; a remainder-only consumer MUST NOT emit a second division.
 `UMulHi`/`SMulHi` take `[lhs, rhs]`, with lhs in RAX and the high result in RDX;
 the immediately dependent unary `Mul [high_product]` projects the low RAX result
 from the same hardware multiplication. Binary `Mul` remains an independent
-operation. Allocation retains the producer's RAX result until its low projection,
-and both outputs are snapshotted. Multiplication clobbers RAX/RDX. Architectural
-inputs and sources are snapshotted before boundary pins; this path adds neither
-R10/R11 scratch nor spill/frame storage.
+operation. Both machine results are captured into homes before later scratch
+reuse. Multiplication clobbers RAX/RDX; inputs are loaded at the explicit
+boundary rather than imposing persistent register-resident live ranges.
 Supported widths are I8/I16/I32/I64, with byte division using AX and AL/AH.
 Signed IMUL overflow compares the high result with the low result's sign
 extension. Divisions remain DCE roots even with dead results, preserving
@@ -388,7 +392,7 @@ preflight rather than entering a partial lowering.
 Ordered, composable. All passes operate on the SSA IR. The pipeline for each function:
 
 ```
-1. Lift                      — x86 → SSA IR with modeled call contracts
+1. Lift + construct_ssa       — x86 → SSA IR, proved frame facts and call contracts
 2. Obfuscation passes        — ordered, profile-selected:
      ObscureReferences       — hide cross-references
      ObscureConstants        — hide/encrypt constant values
@@ -399,7 +403,7 @@ Ordered, composable. All passes operate on the SSA IR. The pipeline for each fun
      OpaquePredicatePass     — inject provably-invariant predicates
      DeadCodeInjectPass      — realistic dead-code with dataflow
 3. Optimize                  — constant propagation, instruction combine, DCE
-4. Compile                   — instruction selection + register allocation (linear scan)
+4. Compile                   — concrete memory homes + bounded-scratch selection
 5. Assemble                  — encode via iced-x86, shuffle basic blocks
 ```
 
@@ -423,10 +427,63 @@ Every pass must:
 ## 8. Rebuild Phase
 
 ### 8.1 Code Generation
-- Instruction selection: IR ops → x86 instruction sequences
-- Register allocation: D40 adopts memory-backed intermediates and bounded scratch sets; handoff 2 owns that backend cutover. Until then, report pressure-driven reductions and identity lowering honestly; never verbatim-relocate failures.
-- Concrete original-frame reconstruction and memory-home integration are handoff-2 work, not implied by current generated save frames or plain unwind support.
-- Encode via iced-x86
+`allocate_registers(func, rsp_pinned, reg_pins)` returns `RegAllocation` with
+homes, boundary pins, `FrameAnalysis` and `ConcreteFrame`.
+`select_instructions(func, alloc)` consumes that allocation and returns symbolic
+selected instructions. There are no saved-register vectors, image-base/entry-VA
+arguments or exported callee-save-pool helpers. Canonical GPR/XMM save pools are
+internal; `frame.saves: Vec<FrameSave>` is the actual save/unwind contract.
+`construct_ssa(&mut LiftResult) -> Result<(), RejectionReason>` is mandatory
+before transforms, including identity lowering.
+
+Every materialized intermediate has a width/alignment/class-aware `FrameHome`.
+Ordinary working sets are seven GPRs (RAX, RCX, RDX, R8–R11) and four XMMs
+(XMM0–XMM3). Other explicit ABI/native registers are boundary constraints, not
+extra interchangeable scratch registers. Flags are explicit memory-backed
+booleans. Definedness and class checks precede selection; after-definition
+capture preserves ABI results. Mixed memory phis use edge copies, cycle-safe
+parallel copies and critical-edge splitting, with a dedicated copy slot.
+
+There is one frame, one backend and one link plan. Let E be actual entry RSP,
+N = `original_size`, S = `stack_size`, and B = E − S be generated body RSP:
+
+```text
+high addresses   incoming homes/stack arguments/return: E + d (d >= 0)
+                 generated homes, copyScratch, saves: [B + N, B + S)
+low addresses    original negative-coordinate zone:   [B, B + N)
+```
+
+An original coordinate d < 0 maps to B + N + d; d >= 0 maps to
+B + S + d = E + d. For an original call delta c, selection sets
+call RSP = B + N + c and restores B after the call. Original outgoing storage
+remains in the low zone; homes remain above call RSP. Unknown stack arguments
+are neither guessed nor copied/dropped. `outgoing_frame_size` reports only the
+ABI-known minimum shadow/declared stack extent, not all actual arguments.
+S − N is a multiple of 16, preserving original object and call alignment.
+
+`FrameAddress`, `FrameOffset`, proof-carrying `FrameIndex`, `FrameLogical` and
+`StackProbe` are semantic IR, not numeric pointer guesses. `FrameIndex` retains
+checked pre-MBA loop bounds; rewrites MUST preserve that proof. Logical scalar
+extraction applies only to fully proved subtractive pointer pairs. Mixed
+call-returned aliases remain runtime coordinates. Unproved dynamic addresses
+fail specifically rather than acquiring fabricated bounds.
+
+Checked arithmetic/resource IDs bound frames to `MAX_FRAME_SIZE` (16 MiB).
+`FrameDynamic`, `FrameConflict`, `FrameOverflow` and `FrameResourceLimit`
+distinguish unproved semantics, incompatible constraints, overflow and the
+resource cap. Generated page probes cover the actual frame; `__chkstk` is
+recognized only from an authoritative symbol and its exact ABI, not anonymous
+helper bytes. Final machine CFG analysis emits unwind for actual allocations,
+saves, restores and epilogues, including full XMM offsets. Unproved EH state
+remains rejected. Encoding uses iced-x86.
+
+Native constant BT/BTS/BTR/BTC frame accesses preserve signed word offsets,
+full operand widths and LOCK semantics. Unknown frame indices fail specifically.
+FS/GS accesses, unmodeled native classes and variable-count carry dependencies
+with unsupported zero-count prior-CF semantics remain limitations. The observed
+INT29/termination paths and unproved EH buckets remain H5/H6 work, not pressure
+failures or proof that all interrupt/EH behavior is modeled. See
+[STATUS.md](STATUS.md) for the exact recovered/lost cohort and runtime evidence.
 
 ### 8.2 Linking & PE Emission (D37)
 - Place selected/lowered bodies in `.kamy`, using PIC rel32/RIP-relative code where possible; resolve links at final addresses.
@@ -468,12 +525,12 @@ callbacks and report `selected=false`, `lowered=true`, `intensity=0`.
 The `Report` exposes `moved`, `(symbol, reason)` `rejected`, `ssa_lowered`,
 `ssa_lowered_symbols`, `address_map: BTreeMap<SymbolId, Rva>`, `functions`,
 `placements` and `directories`. `FunctionReport` separates selection,
-eligibility, lowering, actual transformation and successful intensity. The
-temporary pressure ladder is `1.0 → 0.5 → 0.25 → 0.0`; report only the successful
-attempt, with identity/no-transform intensity zero. Only `RegisterPressure`
-permits this retry; other structured allocation/domain failures propagate with
-their actual reason rather than being relabeled pressure. The ladder is not the
-D40 target.
+eligibility, lowering, actual transformation and successful intensity. There is
+one attempt at the requested intensity, with identity/no-transform reported at
+zero. Pressure/caller-frame/self-recursion exclusions and the intensity ladder
+are retired; no verbatim-relocation fallback substitutes for lowering.
+Allocation metrics are additive fields in report JSON version 1. Authored
+artifact/debug-map versions remain 2/2, with source-qualified symbols unchanged.
 
 `Placement { symbol, source_rva, rva, size, ownership }` records retained,
 resident, generated or retired ownership. A source RVA is optional, not a global
@@ -603,16 +660,16 @@ The build command never loads the plugin into the protection process.
 
 ### 8.6 Contracts consumed by the next handoffs
 
-Handoff 2 MUST reuse `SymbolId`, `Reference`, operand annotations,
+Handoff 2 reuses `SymbolId`, `Reference`, operand annotations,
 `FnSignature`/`AbiValue`, symbolic selection/binding and the single link plan.
-It owns the concrete frame, memory homes, bounded scratch sets and explicit
-flag state. It MUST preserve exact authored call locations and actual-body
-unwind, then remove pressure-only rejects/intensity retries when their causes
-are repaired. The intact combined bounds-check/counter callback remains an
-acceptance witness; splitting it is not frame recovery.
+Its concrete-frame, memory-home, bounded-scratch and explicit-flag contracts
+above are producer/consumer interfaces, not a second backend. Exercised frame,
+ABI, probing and native-unwind fixtures and remaining limits are recorded in
+[STATUS.md](STATUS.md), rather than inferred from requested protection.
 
-Handoff 3 MUST build on those same contracts and the versioned specialized DLL
-producer/consumer. It owns replacing generated startup with compiled Rust
+Handoff 3 MUST consume the same concrete frame, ABI, actual-body unwind and
+regression fixtures, without duplicate conventions, together with the versioned
+specialized DLL producer/consumer. It owns replacing generated startup with compiled Rust
 module code, ordinary imports, Rust `std` with `panic=abort`, required runtime/TLS
 initialization and teardown, and process-attach-only DLL initialization. The
 generated startup/helper path remains an intentional handoff-1 input, not proof
@@ -666,8 +723,8 @@ error.
 Diagnostics use `tracing`. `kamy-observe` owns the terminal-first subscriber;
 `kamy-cli` installs it via `kamy_observe::init`, and library crates only emit
 events and spans. Severity is a contract: `warn!` for graceful degradation or
-rejection (pass skipped, intensity reduced, function rejected, register
-pressure, symbolization below threshold, fallback), `info!` for milestones with
+structured rejection (unsupported semantics, frame/resource limits or unresolved
+symbolization), `info!` for milestones with
 counts, `debug!` for per-unit detail, `trace!` for per-instruction/interval
 detail; `error!` is reserved for the front-end. Level and per-crate scope are
 controlled by `KAMY_LOG` (EnvFilter syntax, e.g.

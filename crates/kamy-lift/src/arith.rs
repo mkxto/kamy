@@ -1,8 +1,8 @@
-use iced_x86::Instruction;
+use iced_x86::{Instruction, OpKind};
 use kamy_core::ir::{Gpr, IrOp, IrType, PhysReg, ValueId, X86Flag};
 
 use crate::builder::IrBuilder;
-use crate::flags::{emit_arith_flags, emit_logic_flags, emit_shift_flags};
+use crate::flags::{emit_arith_flags, emit_logic_flags, emit_shift_flags, preserve_zero_count};
 use crate::state::LiftState;
 use crate::{compute_mem_addr, read_operand, write_operand};
 
@@ -105,52 +105,92 @@ pub(crate) fn lift_not(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState)
     write_operand(insn, 0, result, ty, b, s);
 }
 
+fn zero_immediate_count(insn: &Instruction, ty: IrType) -> bool {
+    let mask = if ty == IrType::I64 { 63 } else { 31 };
+    crate::is_immediate(insn.op1_kind()) && crate::get_immediate(insn, 1) & mask == 0
+}
+
 pub(crate) fn lift_shl(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
     let (a, ty) = read_operand(insn, 0, b, s);
-    let (count, _) = read_operand(insn, 1, b, s);
+    let (count, count_ty) = read_operand(insn, 1, b, s);
     let result = b.emit(IrOp::Shl, &[a, count], ty);
-    emit_shift_flags(b, s, result, a, count, &IrOp::Shl);
+    if !zero_immediate_count(insn, ty) {
+        let prior = (insn.op1_kind() == OpKind::Register)
+            .then(|| X86Flag::ALL.map(|flag| (flag, s.get_flag(flag))));
+        emit_shift_flags(b, s, result, a, count, &IrOp::Shl);
+        if let Some(prior) = prior {
+            preserve_zero_count(b, s, (count, count_ty), ty, &prior);
+        }
+    }
     write_operand(insn, 0, result, ty, b, s);
 }
 
 pub(crate) fn lift_shr(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
     let (a, ty) = read_operand(insn, 0, b, s);
-    let (count, _) = read_operand(insn, 1, b, s);
+    let (count, count_ty) = read_operand(insn, 1, b, s);
     let result = b.emit(IrOp::Shr, &[a, count], ty);
-    emit_shift_flags(b, s, result, a, count, &IrOp::Shr);
+    if !zero_immediate_count(insn, ty) {
+        let prior = (insn.op1_kind() == OpKind::Register)
+            .then(|| X86Flag::ALL.map(|flag| (flag, s.get_flag(flag))));
+        emit_shift_flags(b, s, result, a, count, &IrOp::Shr);
+        if let Some(prior) = prior {
+            preserve_zero_count(b, s, (count, count_ty), ty, &prior);
+        }
+    }
     write_operand(insn, 0, result, ty, b, s);
 }
 
 pub(crate) fn lift_sar(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
     let (a, ty) = read_operand(insn, 0, b, s);
-    let (count, _) = read_operand(insn, 1, b, s);
+    let (count, count_ty) = read_operand(insn, 1, b, s);
     let result = b.emit(IrOp::Sar, &[a, count], ty);
-    emit_shift_flags(b, s, result, a, count, &IrOp::Sar);
+    if !zero_immediate_count(insn, ty) {
+        let prior = (insn.op1_kind() == OpKind::Register)
+            .then(|| X86Flag::ALL.map(|flag| (flag, s.get_flag(flag))));
+        emit_shift_flags(b, s, result, a, count, &IrOp::Sar);
+        if let Some(prior) = prior {
+            preserve_zero_count(b, s, (count, count_ty), ty, &prior);
+        }
+    }
     write_operand(insn, 0, result, ty, b, s);
 }
 
 pub(crate) fn lift_rol(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
     let (a, ty) = read_operand(insn, 0, b, s);
-    let (count, _) = read_operand(insn, 1, b, s);
+    let (count, count_ty) = read_operand(insn, 1, b, s);
     let result = b.emit(IrOp::Rol, &[a, count], ty);
 
-    let cf = b.emit(IrOp::CarryShl, &[a, count], IrType::I8);
-    s.set_flag(X86Flag::Cf, cf);
-    let of = b.emit(IrOp::Undef, &[], IrType::I8);
-    s.set_flag(X86Flag::Of, of);
+    if !zero_immediate_count(insn, ty) {
+        let prior = (insn.op1_kind() == OpKind::Register)
+            .then(|| [X86Flag::Cf, X86Flag::Of].map(|flag| (flag, s.get_flag(flag))));
+        let cf = b.emit(IrOp::CarryShl, &[a, count], IrType::I8);
+        s.set_flag(X86Flag::Cf, cf);
+        let of = b.emit(IrOp::Undef, &[], IrType::I8);
+        s.set_flag(X86Flag::Of, of);
+        if let Some(prior) = prior {
+            preserve_zero_count(b, s, (count, count_ty), ty, &prior);
+        }
+    }
 
     write_operand(insn, 0, result, ty, b, s);
 }
 
 pub(crate) fn lift_ror(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
     let (a, ty) = read_operand(insn, 0, b, s);
-    let (count, _) = read_operand(insn, 1, b, s);
+    let (count, count_ty) = read_operand(insn, 1, b, s);
     let result = b.emit(IrOp::Ror, &[a, count], ty);
 
-    let cf = b.emit(IrOp::CarryShr, &[a, count], IrType::I8);
-    s.set_flag(X86Flag::Cf, cf);
-    let of = b.emit(IrOp::Undef, &[], IrType::I8);
-    s.set_flag(X86Flag::Of, of);
+    if !zero_immediate_count(insn, ty) {
+        let prior = (insn.op1_kind() == OpKind::Register)
+            .then(|| [X86Flag::Cf, X86Flag::Of].map(|flag| (flag, s.get_flag(flag))));
+        let cf = b.emit(IrOp::CarryShr, &[a, count], IrType::I8);
+        s.set_flag(X86Flag::Cf, cf);
+        let of = b.emit(IrOp::Undef, &[], IrType::I8);
+        s.set_flag(X86Flag::Of, of);
+        if let Some(prior) = prior {
+            preserve_zero_count(b, s, (count, count_ty), ty, &prior);
+        }
+    }
 
     write_operand(insn, 0, result, ty, b, s);
 }
@@ -512,6 +552,99 @@ mod tests {
     use kamy_core::ir::{BlockId, IrBlock, IrFunction, IrTerminator};
     use std::collections::HashMap;
 
+    #[test]
+    fn immediate_zero_and_masked_zero_preserve_all_shift_flags() {
+        for extension in [0xe0, 0xe8, 0xf8, 0xc0, 0xc8] {
+            for (wide, count) in [(false, 0), (false, 32), (true, 0), (true, 64)] {
+                let mut func = IrFunction {
+                    entry: BlockId(0),
+                    next_value: 0,
+                    blocks: vec![IrBlock {
+                        id: BlockId(0),
+                        phis: vec![],
+                        insts: vec![],
+                        term: IrTerminator::Ret,
+                    }],
+                };
+                let mut builder = IrBuilder::new(&mut func, BlockId(0));
+                let mut state = LiftState::new_with_undefs(&mut builder, true);
+                let before = X86Flag::ALL.map(|flag| state.get_flag(flag));
+                let mut bytes = Vec::new();
+                if wide {
+                    bytes.push(0x48);
+                }
+                bytes.extend([0xc1, extension, count]);
+                let instruction =
+                    iced_x86::Decoder::new(64, &bytes, iced_x86::DecoderOptions::NONE).decode();
+                match instruction.mnemonic() {
+                    iced_x86::Mnemonic::Shl => lift_shl(&instruction, &mut builder, &mut state),
+                    iced_x86::Mnemonic::Shr => lift_shr(&instruction, &mut builder, &mut state),
+                    iced_x86::Mnemonic::Sar => lift_sar(&instruction, &mut builder, &mut state),
+                    iced_x86::Mnemonic::Rol => lift_rol(&instruction, &mut builder, &mut state),
+                    iced_x86::Mnemonic::Ror => lift_ror(&instruction, &mut builder, &mut state),
+                    other => panic!("unexpected zero-count fixture: {other:?}"),
+                }
+                assert_eq!(X86Flag::ALL.map(|flag| state.get_flag(flag)), before);
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_count_guard_selects_prior_flags_only_for_effective_zero() {
+        for ty in [IrType::I8, IrType::I16, IrType::I32, IrType::I64] {
+            for count_ty in [IrType::I8, IrType::I64] {
+                for count in [0, 1, 31, 32, 63, 64, 256] {
+                    let mut func = IrFunction {
+                        entry: BlockId(0),
+                        next_value: 0,
+                        blocks: vec![IrBlock {
+                            id: BlockId(0),
+                            phis: vec![],
+                            insts: vec![],
+                            term: IrTerminator::Ret,
+                        }],
+                    };
+                    let outputs = {
+                        let mut builder = IrBuilder::new(&mut func, BlockId(0));
+                        let mut state = LiftState::new_with_undefs(&mut builder, true);
+                        let prior = X86Flag::ALL.map(|flag| {
+                            let previous = builder.emit(
+                                IrOp::Const((flag.index() & 1) as u64),
+                                &[],
+                                IrType::I8,
+                            );
+                            let current = builder.emit(
+                                IrOp::Const(((flag.index() & 1) ^ 1) as u64),
+                                &[],
+                                IrType::I8,
+                            );
+                            state.set_flag(flag, current);
+                            (flag, previous)
+                        });
+                        let count_value = builder.emit(IrOp::Const(count), &[], count_ty);
+                        preserve_zero_count(
+                            &mut builder,
+                            &mut state,
+                            (count_value, count_ty),
+                            ty,
+                            &prior,
+                        );
+                        X86Flag::ALL.map(|flag| state.get_flag(flag))
+                    };
+                    let values = evaluate(&func);
+                    let zero = count & if ty == IrType::I64 { 63 } else { 31 } == 0;
+                    for flag in X86Flag::ALL {
+                        let previous = (flag.index() & 1) as u64;
+                        assert_eq!(
+                            values[&outputs[flag.index()]],
+                            if zero { previous } else { previous ^ 1 }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn lifted(
         code: &[u8],
         initial: [u64; 3],
@@ -613,6 +746,13 @@ mod tests {
                 IrOp::URem | IrOp::SRem => remainders[&inst.args[0]],
                 IrOp::IsZero => u64::from(input(0) == 0),
                 IrOp::BoolNot => u64::from(input(0) == 0),
+                IrOp::Select => {
+                    if input(0) != 0 {
+                        input(1)
+                    } else {
+                        input(2)
+                    }
+                }
                 ref other => panic!("unexpected lifted arithmetic op {other:?}"),
             };
             values.insert(dest, value & mask);
@@ -717,14 +857,9 @@ mod tests {
                         .find(|inst| matches!(inst.op, IrOp::Mul))
                         .unwrap();
                     assert_eq!(low.args, vec![high.dest.unwrap()]);
-                    let alloc = kamy_codegen::allocate_registers(
-                        &func,
-                        &kamy_codegen::CALLEE_SAVED_GPRS,
-                        &Default::default(),
-                        &pins,
-                    )
-                    .unwrap();
-                    let selected = kamy_codegen::select_instructions(&func, &alloc, 0, 0, &[], &[]);
+                    let alloc = kamy_codegen::allocate_registers(&func, &Default::default(), &pins)
+                        .unwrap();
+                    let selected = kamy_codegen::select_instructions(&func, &alloc);
                     assert_eq!(
                         selected
                             .instructions
@@ -768,14 +903,9 @@ mod tests {
                     .unwrap();
                 assert_eq!(remainder.args, vec![division[0].dest.unwrap()]);
             }
-            let alloc = kamy_codegen::allocate_registers(
-                &func,
-                &kamy_codegen::CALLEE_SAVED_GPRS,
-                &Default::default(),
-                &pins,
-            )
-            .unwrap();
-            let selected = kamy_codegen::select_instructions(&func, &alloc, 0, 0, &[], &[]);
+            let alloc =
+                kamy_codegen::allocate_registers(&func, &Default::default(), &pins).unwrap();
+            let selected = kamy_codegen::select_instructions(&func, &alloc);
             assert_eq!(
                 selected
                     .instructions

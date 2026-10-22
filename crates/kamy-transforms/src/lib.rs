@@ -579,7 +579,7 @@ mod tests {
         }];
         let mut lifted = kamy_lift::lift_function(&module, &func, &Cc(source), &annotations);
         assert!(!lifted.unsupported);
-        kamy_lift::construct_ssa(&mut lifted);
+        kamy_lift::construct_ssa(&mut lifted).unwrap();
         optimize(&mut lifted.func);
         assert!(
             lifted

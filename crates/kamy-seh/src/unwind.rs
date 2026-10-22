@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::rc::Rc;
 
 use anyhow::{Context, Result, bail, ensure};
 use iced_x86::{
@@ -34,9 +35,20 @@ struct State {
     gprs: [Value; 16],
     xmms: [Value; 16],
     slots: BTreeMap<i64, Slot>,
+    saved: [BTreeSet<i64>; 18],
 }
 
 const NONVOLATILE_GPRS: [usize; 8] = [3, 5, 6, 7, 12, 13, 14, 15];
+
+fn save_index(value: Value, size: usize) -> Option<usize> {
+    match value {
+        Value::OriginalGpr(reg) if size == 8 => NONVOLATILE_GPRS
+            .iter()
+            .position(|&number| number == reg as usize),
+        Value::OriginalXmm(reg) if size == 16 && (6..16).contains(&reg) => Some(reg as usize + 2),
+        _ => None,
+    }
+}
 
 impl State {
     fn entry() -> Self {
@@ -44,6 +56,7 @@ impl State {
             gprs: std::array::from_fn(|i| Value::OriginalGpr(i as u8)),
             xmms: std::array::from_fn(|i| Value::OriginalXmm(i as u8)),
             slots: BTreeMap::new(),
+            saved: std::array::from_fn(|_| BTreeSet::new()),
         };
         state.gprs[4] = Value::Stack(0);
         state
@@ -66,9 +79,14 @@ impl State {
             offset >= -(u32::MAX as i64),
             "stack frame exceeds UNWIND_INFO limits"
         );
-        self.gprs[4] = Value::Stack(offset);
         // Released stack storage cannot remain a source for subsequent unwinds.
-        self.slots.retain(|address, _| *address >= offset);
+        if offset > self.rsp()? {
+            self.slots = self.slots.split_off(&offset);
+            for saved in &mut self.saved {
+                *saved = saved.split_off(&offset);
+            }
+        }
+        self.gprs[4] = Value::Stack(offset);
         Ok(())
     }
 
@@ -136,13 +154,41 @@ impl State {
             address >= self.rsp()?,
             "stack store uses unallocated storage below RSP"
         );
-        self.slots.retain(|slot_address, slot| {
-            *slot_address + slot.size as i64 <= address || *slot_address >= end
-        });
+        self.forget(address, end);
         if value != Value::Unknown {
             self.slots.insert(address, Slot { size, value });
+            if let Some(index) = save_index(value, size) {
+                self.saved[index].insert(address);
+            }
         }
         Ok(())
+    }
+
+    fn remove_slot(&mut self, address: i64) {
+        if let Some(slot) = self.slots.remove(&address) {
+            if let Some(index) = save_index(slot.value, slot.size) {
+                self.saved[index].remove(&address);
+            }
+        }
+    }
+
+    fn forget(&mut self, address: i64, end: i64) {
+        let previous = self
+            .slots
+            .range(..address)
+            .next_back()
+            .and_then(|(&start, slot)| (start + slot.size as i64 > address).then_some(start));
+        if let Some(previous) = previous {
+            self.remove_slot(previous);
+        }
+        while let Some(address) = self
+            .slots
+            .range(address..end)
+            .next()
+            .map(|(&start, _)| start)
+        {
+            self.remove_slot(address);
+        }
     }
 
     fn load(&self, address: i64, size: usize) -> Value {
@@ -170,9 +216,15 @@ impl State {
                 changed = true;
             }
         }
+        let saved = &mut self.saved;
         self.slots.retain(|address, slot| {
             let keep = incoming.slots.get(address) == Some(slot);
             changed |= !keep;
+            if !keep {
+                if let Some(index) = save_index(slot.value, slot.size) {
+                    saved[index].remove(address);
+                }
+            }
             keep
         });
         self.plan()
@@ -185,11 +237,11 @@ impl State {
         let mut saves = [None; 18];
         for (index, &reg) in NONVOLATILE_GPRS.iter().enumerate() {
             saves[index] =
-                self.save_location(Value::OriginalGpr(reg as u8), 8, self.gprs[reg], rsp)?;
+                self.save_location(index, Value::OriginalGpr(reg as u8), self.gprs[reg], rsp)?;
         }
         for reg in 6..16 {
             saves[reg + 2] =
-                self.save_location(Value::OriginalXmm(reg as u8), 16, self.xmms[reg], rsp)?;
+                self.save_location(reg + 2, Value::OriginalXmm(reg as u8), self.xmms[reg], rsp)?;
         }
         Ok(Plan {
             allocation: (-rsp) as u32,
@@ -199,20 +251,18 @@ impl State {
 
     fn save_location(
         &self,
+        index: usize,
         original: Value,
-        size: usize,
         current: Value,
         rsp: i64,
     ) -> Result<Option<(Value, u32)>> {
-        for (&address, slot) in &self.slots {
-            if slot.size == size && slot.value == original && address >= rsp {
-                let offset = address
-                    .checked_sub(rsp)
-                    .context("nonvolatile save offset overflow")?;
-                let offset = u32::try_from(offset)
-                    .context("nonvolatile save offset exceeds UNWIND_INFO limits")?;
-                return Ok(Some((original, offset)));
-            }
+        if let Some(&address) = self.saved[index].range(rsp..).next() {
+            let offset = address
+                .checked_sub(rsp)
+                .context("nonvolatile save offset overflow")?;
+            let offset = u32::try_from(offset)
+                .context("nonvolatile save offset exceeds UNWIND_INFO limits")?;
+            return Ok(Some((original, offset)));
         }
         ensure!(
             current == original,
@@ -330,6 +380,47 @@ fn encode_save(info: &mut Vec<u8>, register: Value, offset: u32) {
     }
 }
 
+struct AnalyzedInstruction {
+    instruction: Instruction,
+    owner: u32,
+    plan: Rc<Plan>,
+}
+
+#[derive(Default)]
+struct MachineCfg {
+    instructions: BTreeMap<u32, AnalyzedInstruction>,
+    states: BTreeMap<u32, State>,
+    queue: VecDeque<u32>,
+    queued: HashSet<u32>,
+}
+
+impl MachineCfg {
+    fn enqueue(&mut self, offset: u32) {
+        if self.queued.insert(offset) {
+            self.queue.push_back(offset);
+        }
+    }
+
+    fn merge(&mut self, offset: u32, incoming: &State) -> Result<()> {
+        if let Some(current) = self.states.get_mut(&offset) {
+            if current.merge(incoming)? {
+                self.enqueue(offset);
+            }
+        } else {
+            self.states.insert(offset, incoming.clone());
+            // A new backedge can split an earlier linear walk. Its owner must
+            // supply the fallthrough state before the new head can converge.
+            if let Some(owner) = self.instructions.get(&offset).map(|entry| entry.owner) {
+                if owner != offset {
+                    self.enqueue(owner);
+                }
+            }
+            self.enqueue(offset);
+        }
+        Ok(())
+    }
+}
+
 /// Reconstructs reachable Win64 unwind states from final encoded instructions.
 /// Rejects dynamic frames, incompatible joins, and nonvolatile values that cannot
 /// be recovered from their current register or a statically proved stack slot.
@@ -342,126 +433,141 @@ pub fn unwind_ranges(code: &[u8], entry_va: u64) -> Result<Vec<UnwindRange>> {
     let end_va = entry_va
         .checked_add(code.len() as u64)
         .context("function VA overflow")?;
-    let mut instructions = BTreeMap::<u32, Instruction>::new();
-    let mut states = BTreeMap::from([(0u32, State::entry())]);
-    let mut queue = VecDeque::from([0u32]);
+    let mut cfg = MachineCfg::default();
+    cfg.states.insert(0, State::entry());
+    cfg.enqueue(0);
     let mut factory = InstructionInfoFactory::new();
-    while let Some(offset) = queue.pop_front() {
-        let instruction = if let Some(instruction) = instructions.get(&offset) {
-            *instruction
-        } else {
-            if let Some((&previous, instruction)) = instructions.range(..offset).next_back() {
-                ensure!(
-                    previous + instruction.len() as u32 <= offset,
-                    "branch at +{offset:#x} enters an instruction"
-                );
+    while let Some(head) = cfg.queue.pop_front() {
+        cfg.queued.remove(&head);
+        let mut state = cfg.states[&head].clone();
+        let mut offset = head;
+        let mut previous_plan: Option<Rc<Plan>> = None;
+        loop {
+            if offset != head && cfg.states.contains_key(&offset) {
+                cfg.merge(offset, &state)
+                    .with_context(|| format!("fallthrough join at +{offset:#x} from +{head:#x}"))?;
+                break;
             }
-            let mut decoder = Decoder::with_ip(
-                64,
-                &code[offset as usize..],
-                entry_va + offset as u64,
-                DecoderOptions::NONE,
+            let instruction = if let Some(entry) = cfg.instructions.get(&offset) {
+                entry.instruction
+            } else {
+                if let Some((&previous, entry)) = cfg.instructions.range(..offset).next_back() {
+                    ensure!(
+                        previous + entry.instruction.len() as u32 <= offset,
+                        "branch at +{offset:#x} enters an instruction"
+                    );
+                }
+                let mut decoder = Decoder::with_ip(
+                    64,
+                    &code[offset as usize..],
+                    entry_va + offset as u64,
+                    DecoderOptions::NONE,
+                );
+                let instruction = decoder.decode();
+                ensure!(
+                    !instruction.is_invalid(),
+                    "invalid instruction at +{offset:#x}"
+                );
+                let next = offset + instruction.len() as u32;
+                if let Some((&following, _)) = cfg.instructions.range((offset + 1)..).next() {
+                    ensure!(
+                        next <= following,
+                        "instruction at +{offset:#x} overlaps a branch target"
+                    );
+                }
+                instruction
+            };
+            let plan = state.plan().with_context(|| {
+                format!("unwind state at +{offset:#x} ({:#x})", instruction.ip())
+            })?;
+            let plan = match previous_plan.take() {
+                Some(previous) if *previous == plan => previous,
+                _ => Rc::new(plan),
+            };
+            previous_plan = Some(Rc::clone(&plan));
+            cfg.instructions.insert(
+                offset,
+                AnalyzedInstruction {
+                    instruction,
+                    owner: head,
+                    plan,
+                },
             );
-            let instruction = decoder.decode();
-            ensure!(
-                !instruction.is_invalid(),
-                "invalid instruction at +{offset:#x}"
-            );
+            transfer(&instruction, &mut state, &mut factory).with_context(|| {
+                format!(
+                    "unwind instruction at +{offset:#x} ({:#x}, {:?})",
+                    instruction.ip(),
+                    instruction.mnemonic()
+                )
+            })?;
+            state
+                .plan()
+                .with_context(|| format!("unwind state after +{offset:#x}"))?;
             let next = offset + instruction.len() as u32;
-            if let Some((&following, _)) = instructions.range((offset + 1)..).next() {
-                ensure!(
-                    next <= following,
-                    "instruction at +{offset:#x} overlaps a branch target"
-                );
-            }
-            instructions.insert(offset, instruction);
-            instruction
-        };
-        let mut state = states[&offset].clone();
-        state
-            .plan()
-            .with_context(|| format!("unwind state at +{offset:#x} ({:#x})", instruction.ip()))?;
-        transfer(&instruction, &mut state, &mut factory).with_context(|| {
-            format!(
-                "unwind instruction at +{offset:#x} ({:#x}, {:?})",
-                instruction.ip(),
-                instruction.mnemonic()
-            )
-        })?;
-        state
-            .plan()
-            .with_context(|| format!("unwind state after +{offset:#x}"))?;
-        let next = offset + instruction.len() as u32;
-        let mut successors = [None; 2];
-        let internal_target = |target: u64| {
-            (target >= entry_va && target < end_va).then(|| (target - entry_va) as u32)
-        };
-        match instruction.flow_control() {
-            FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall => {
-                ensure!(
-                    next < length,
-                    "reachable fallthrough exits the code at +{next:#x}"
-                );
-                successors[0] = Some(next);
-            }
-            FlowControl::ConditionalBranch => {
-                successors[0] = internal_target(instruction.near_branch_target());
-                ensure!(
-                    next < length,
-                    "conditional fallthrough exits the code at +{next:#x}"
-                );
-                successors[1] = Some(next);
-            }
-            FlowControl::UnconditionalBranch => {
-                ensure!(
-                    matches!(instruction.op0_kind(), OpKind::NearBranch64),
-                    "far branch at +{offset:#x} is unsupported"
-                );
-                successors[0] = internal_target(instruction.near_branch_target());
-            }
-            FlowControl::IndirectBranch => {
-                if let Value::Constant(target) = operand(&instruction, 0, &state)? {
-                    successors[0] = internal_target(target);
-                } else if instruction.is_ip_rel_memory_operand() {
-                    let address = instruction.ip_rel_memory_address();
-                    if address >= entry_va
-                        && address.checked_add(8).is_some_and(|end| end <= end_va)
-                    {
-                        let begin = (address - entry_va) as usize;
-                        successors[0] = internal_target(u64::from_le_bytes(
-                            code[begin..begin + 8].try_into().unwrap(),
-                        ));
+            let mut successors = [None; 2];
+            let internal_target = |target: u64| {
+                (target >= entry_va && target < end_va).then(|| (target - entry_va) as u32)
+            };
+            match instruction.flow_control() {
+                FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall => {
+                    ensure!(
+                        next < length,
+                        "reachable fallthrough exits the code at +{next:#x}"
+                    );
+                    offset = next;
+                    continue;
+                }
+                FlowControl::ConditionalBranch => {
+                    successors[0] = internal_target(instruction.near_branch_target());
+                    ensure!(
+                        next < length,
+                        "conditional fallthrough exits the code at +{next:#x}"
+                    );
+                    successors[1] = Some(next);
+                }
+                FlowControl::UnconditionalBranch => {
+                    ensure!(
+                        matches!(instruction.op0_kind(), OpKind::NearBranch64),
+                        "far branch at +{offset:#x} is unsupported"
+                    );
+                    successors[0] = internal_target(instruction.near_branch_target());
+                }
+                FlowControl::IndirectBranch => {
+                    if let Value::Constant(target) = operand(&instruction, 0, &state)? {
+                        successors[0] = internal_target(target);
+                    } else if instruction.is_ip_rel_memory_operand() {
+                        let address = instruction.ip_rel_memory_address();
+                        if address >= entry_va
+                            && address.checked_add(8).is_some_and(|end| end <= end_va)
+                        {
+                            let begin = (address - entry_va) as usize;
+                            successors[0] = internal_target(u64::from_le_bytes(
+                                code[begin..begin + 8].try_into().unwrap(),
+                            ));
+                        }
                     }
                 }
+                FlowControl::Return => state
+                    .returned()
+                    .with_context(|| format!("return at +{offset:#x}"))?,
+                FlowControl::Exception | FlowControl::Interrupt => {}
+                other => bail!("unsupported control flow {other:?} at +{offset:#x}"),
             }
-            FlowControl::Return => state
-                .returned()
-                .with_context(|| format!("return at +{offset:#x}"))?,
-            FlowControl::Exception | FlowControl::Interrupt => {}
-            other => bail!("unsupported control flow {other:?} at +{offset:#x}"),
-        }
-        for successor in successors.into_iter().flatten() {
-            if let Some(current) = states.get_mut(&successor) {
-                if current
-                    .merge(&state)
-                    .with_context(|| format!("join at +{successor:#x} from +{offset:#x}"))?
-                {
-                    queue.push_back(successor);
-                }
-            } else {
-                states.insert(successor, state.clone());
-                queue.push_back(successor);
+            for successor in successors.into_iter().flatten() {
+                cfg.merge(successor, &state)
+                    .with_context(|| format!("join at +{successor:#x} from +{offset:#x}"))?;
             }
+            break;
         }
     }
     let mut ranges = Vec::<UnwindRange>::new();
     let mut previous_plan = None;
-    for (&offset, instruction) in &instructions {
-        let plan = states[&offset].plan()?;
-        let end = offset + instruction.len() as u32;
+    for (&offset, entry) in &cfg.instructions {
+        let plan = entry.plan.as_ref();
+        let end = offset + entry.instruction.len() as u32;
         if let Some(previous) = ranges
             .last_mut()
-            .filter(|previous| previous.end == offset && previous_plan.as_ref() == Some(&plan))
+            .filter(|previous| previous.end == offset && previous_plan == Some(plan))
         {
             previous.end = end;
         } else {
@@ -478,7 +584,8 @@ pub fn unwind_ranges(code: &[u8], entry_va: u64) -> Result<Vec<UnwindRange>> {
     }
     tracing::trace!(
         entry_va,
-        instructions = instructions.len(),
+        instructions = cfg.instructions.len(),
+        block_states = cfg.states.len(),
         ranges = ranges.len(),
         "reconstructed unwind states"
     );
@@ -742,9 +849,7 @@ fn transfer(
         FlowControl::Call | FlowControl::IndirectCall
     ) {
         let rsp = state.rsp()?;
-        state
-            .slots
-            .retain(|address, slot| *address + slot.size as i64 <= rsp || *address >= rsp + 32);
+        state.forget(rsp, rsp + 32);
         for reg in [0, 1, 2, 8, 9, 10, 11] {
             state.gprs[reg] = Value::Unknown;
         }
@@ -1104,6 +1209,82 @@ mod tests {
     }
 
     #[test]
+    fn probed_memory_frame_tracks_calls_branches_and_far_restores() {
+        let frame_size = 0x102028i64;
+        let mut code = Vec::new();
+        let mut checkpoints = Vec::new();
+        let mut rsp = 0;
+        while rsp > -0x102000 {
+            checkpoints.push((code.len(), rsp, false, false));
+            code.extend_from_slice(&[0x48, 0x81, 0xec, 0x00, 0x10, 0x00, 0x00]);
+            rsp -= 4096;
+            checkpoints.push((code.len(), rsp, false, false));
+            code.extend_from_slice(&[0x85, 0x04, 0x24]);
+        }
+        code.extend_from_slice(&[0x48, 0x83, 0xec, 0x28, 0x85, 0x04, 0x24]);
+        rsp = -frame_size;
+        code.extend_from_slice(&[0x48, 0x89, 0x9c, 0x24, 0x00, 0x00, 0x10, 0x00]);
+        code.extend_from_slice(&[0x0f, 0x11, 0xb4, 0x24, 0x08, 0x00, 0x10, 0x00]);
+        code.extend_from_slice(&[0x31, 0xdb, 0x66, 0x0f, 0xef, 0xf6]);
+        for index in 0..16384u32 {
+            code.extend_from_slice(&[0x48, 0xb8]);
+            code.extend_from_slice(&u64::from(index).to_le_bytes());
+            code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]);
+            code.extend_from_slice(&(32 + index * 8).to_le_bytes());
+        }
+        checkpoints.push((code.len(), rsp, true, true));
+        code.extend_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x20]);
+        checkpoints.push((code.len(), rsp + 32, true, true));
+        code.extend_from_slice(&[0xe8, 0x00, 0x00, 0x20, 0x00]);
+        checkpoints.push((code.len(), rsp + 32, true, true));
+        code.extend_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0xe0]);
+        checkpoints.push((code.len(), rsp, true, true));
+        code.extend_from_slice(&[0x85, 0xc0, 0x74, 0x02]);
+        checkpoints.push((code.len(), rsp, true, true));
+        code.extend_from_slice(&[0x90, 0x90]);
+        checkpoints.push((code.len(), rsp, true, true));
+        code.extend_from_slice(&[0x48, 0x8b, 0x9c, 0x24, 0x00, 0x00, 0x10, 0x00]);
+        checkpoints.push((code.len(), rsp, false, true));
+        code.extend_from_slice(&[0x0f, 0x10, 0xb4, 0x24, 0x08, 0x00, 0x10, 0x00]);
+        checkpoints.push((code.len(), rsp, false, false));
+        code.extend_from_slice(&[0x48, 0x81, 0xc4, 0x28, 0x20, 0x10, 0x00]);
+        checkpoints.push((code.len(), 0, false, false));
+        code.push(0xc3);
+
+        let ranges = unwind_ranges(&code, ENTRY).unwrap();
+        let original_gprs = std::array::from_fn(|index| 0x1000 + index as u64);
+        let original_xmms =
+            std::array::from_fn(|index| (0x2000 + index as u128) << 64 | index as u128);
+        let stack = BTreeMap::from([
+            (0x100000 - frame_size, original_gprs[3] as u128),
+            (0x100008 - frame_size, original_xmms[6]),
+        ]);
+        for (offset, rsp, dirty_rbx, dirty_xmm) in checkpoints {
+            let mut gprs = original_gprs;
+            let mut xmms = original_xmms;
+            if dirty_rbx {
+                gprs[3] = 0;
+            }
+            if dirty_xmm {
+                xmms[6] = 0;
+            }
+            assert_eq!(
+                restore(
+                    info_at(&ranges, offset as u32),
+                    rsp,
+                    &mut gprs,
+                    &mut xmms,
+                    &stack
+                ),
+                8,
+                "caller stack at +{offset:#x}"
+            );
+            assert_eq!(gprs[3], original_gprs[3], "RBX at +{offset:#x}");
+            assert_eq!(xmms[6], original_xmms[6], "XMM6 at +{offset:#x}");
+        }
+    }
+
+    #[test]
     fn terminal_tail_keeps_its_real_frame_and_unreachable_data_is_not_code() {
         let code = [0x48, 0x83, 0xec, 0x28, 0xe9, 0x00, 0x10, 0x00, 0x00, 0x0f];
         let ranges = unwind_ranges(&code, ENTRY).unwrap();
@@ -1118,6 +1299,15 @@ mod tests {
             ),
             8
         );
+    }
+
+    #[test]
+    fn late_backedge_cannot_hide_the_first_iteration_stack_state() {
+        let code = [
+            0x49, 0x89, 0xe3, 0x48, 0x83, 0xec, 0x20, 0x90, 0x49, 0x8d, 0x63, 0xc0, 0xeb, 0xf9,
+        ];
+        let error = unwind_ranges(&code, ENTRY).unwrap_err();
+        assert!(format!("{error:#}").contains("incompatible RSP offsets"));
     }
 
     #[test]

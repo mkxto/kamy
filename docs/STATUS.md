@@ -28,7 +28,7 @@ Current repair evidence is recorded in the final campaign section. Earlier reloc
 | SSA construction (maximal phi, RPO traversal, cross-block register threading) | Done | `1cfc37b`, threading fixed (RPO + block_exit propagation) |
 | Optimizer (constprop, instcombine, DCE, prune-phis, convergence) | Done | `1cfc37b` |
 | DCE live-out fix (`Use` ops before `Ret` for RAX + callee-saved) | Done | `88e9e8a` |
-| Register allocator (linear-scan, zero-spill hard constraint) | Done | `1cfc37b` |
+| Historical register allocator (linear-scan, zero-spill hard constraint) | Superseded by H2 | `1cfc37b`; the final H2 campaign below records the memory-backed cutover. |
 | Instruction selector (IR → x86, flag fusion, NativeInline re-emit) | Done | `1cfc37b` |
 | RSP pinning (lifter tracks RSP chain, regalloc pins to physical RSP) | Done | `26216be` |
 | Callee-saved activation (D31) | ✅ Done | Pool enabled; push/pop + RSP 16-byte align shim; dropped live-through `Use` pins. Required the SSA backend ABI-correctness pass below to ship correctly. |
@@ -41,13 +41,17 @@ Current repair evidence is recorded in the final campaign section. Earlier reloc
 | MBA probability fix | Done | `fa6b941` |
 | MBA visible output | ✅ Done | Exposed two real lowering bugs (now fixed): constant shifts routed the count through `CL`, clobbering a live RCX the allocator does not model — now emit the immediate-form shift (`shl r,imm`); and `emit_void` hardcoded I64 store width, truncating sub-qword stores — now threads the real operand width. `sw`/`sw2`/`sw3`/`target` with MBA (`probability:100`): exit matches original, `kamy verify` PASS (200 runs), output deterministic, bytes differ from `probability:0`. **94/203 via SSA** on `sw` (was a deterministic crash before the fix). |
 | Win32metadata calling-convention DB (D14) | ✅ Done | Embedded 18.2k-fn table generated offline from `Windows.Win32.winmd` (`tools/win32cc-gen`, workspace-excluded) + curated CRT supplement; `MapCallConv` resolves import slots (`call [rip+slot]`) and single-block import thunks to precise per-arg GPR/XMM classes + return class; variadic/aggregate-return omitted (sound). Cross-checked vs IDA 9.4 til (1168 common names, 0 float/vararg errors, 19 diffs all on legacy fns where metadata is authoritative). Corpus 21/23, RegisterPressure 3576→3531, SSA-lowered 2113→2158. |
-| Pressure-aware transform budgeting (D28) | Partial | Intensity knob on the MBA pass landed (`run_with_intensity`); the retry-at-lower-intensity ladder is not wired. |
+| Historical pressure-aware transform budgeting (D28) | Superseded by H2 | The intensity knob remains; pressure-driven retry/reduction is removed by the final H2 cutover below. |
 | Actual-body .pdata/UNWIND_INFO reconstruction (D31/#20) | Done for supported plain functions | Per-state v2 ranges describe body stack allocation and GPR/XMM saves; handler/scoped or unprovable states stay resident |
 | Differential self-test harness (kamy-verify) | ✅ Done | `kamy verify --original X --protected Y`: exit + stdout diff over N seeded runs. The Phase 2 shipping gate. |
 | 8/16-bit register write semantics | ✅ Done | `write_gpr_sub64`: 8/16-bit GPR writes merge into the live register (`(old & ~mask) | zext`) rather than zero-extending; only 32-bit zero-extends (x86). Fixed a latent partial-register miscompile (`mov al,X` dropped the destination's upper bits). `b3b326a`. |
 | Callee-side argument inference (own functions) | ✅ Done | Leaf-only read-before-write liveness over the Win64 argument registers narrows signatures for the target's unnamed functions (`kamy-analysis::infer_signature`); sound-by-construction — tail-forwarding/indirect exits force all args live-out, ambiguous/non-contiguous prefixes bail to the four-arg default. +25 SSA-lowered / −26 RegisterPressure over the partial-register-fix baseline; corpus 21/23. `214e2ee`. |
 
-### Known bugs
+### Historical backend bugs and repairs
+
+These entries retain their original measurements. H2 below supersedes the
+zero-spill pools and volatile-pinned live-across-call limitation in entries 3
+and 7; their old counts are not current rejection totals.
 
 1. ✅ **FIXED — RSP/callee-saved not threaded across blocks.** Registers unchanged
    through a block kept their block-entry `Undef`; φ-nodes then referenced dead undefs
@@ -441,10 +445,11 @@ Enabled YAML profiles select an ordered list of named artifacts and either
 inline or init-table entry sequencing. Paths resolve relative to the profile;
 `plugin::symbol` selectors use the existing transform pipeline. Every module
 function must pass SSA/codegen and unwind reconstruction; an unsupported or
-over-budget function fails injection rather than being omitted or relocated
-verbatim. A combined bounds-check/counter probe exercised this strict
-`RegisterPressure` failure. Injection remains off by default, requires an
-original entry point, and rejects kernel images before discovery.
+resource-exceeding function fails injection rather than being omitted or relocated
+verbatim. Historically the combined bounds-check/counter probe exercised a strict
+`RegisterPressure` failure; H2 below records its intact identity/MBA execution.
+Injection remains off by default, requires an original entry point, and rejects
+kernel images before discovery.
 
 Authored references retain compiler symbol bases and signed addends rather
 than guessing pointers from constants. Portable regressions and real Rust
@@ -474,9 +479,9 @@ Module imports, module TLS/PE export directories, language-handler unwind,
 interior-code pointers and unsupported instruction/operand forms remain explicit
 errors. Exact authored reference coverage does not waive instruction, explicit
 ABI, frame or unwind support. D40 supersedes the former zero-spill policy;
-pressure rejection/reduced intensity remain current backend limitations until
-handoff 2. Enforcing module CFG and the vendor's unobserved extras remain outside
-this epic's gates.
+pressure rejection/reduced intensity were pre-H2 limitations, superseded by the
+memory-backed cutover below. Enforcing module CFG and the vendor's unobserved
+extras remain outside this epic's gates.
 
 ## D40 repair campaign — handoff-1 contracts and evidence
 
@@ -760,4 +765,230 @@ Observed verification:
 - Identity corpus: **23/23 PASS**, **1,721/11,202 SSA-lowered**, **9,481
   rejected**, **0 transformed**, **0 verbatim-relocated**; totals match the
   preceding recorded campaign result.
+
+## D40 repair campaign — H2 concrete frames and memory-backed lowering
+
+### Verification state and reproducible commands
+
+Working-tree implementation verification is complete for the measurements below.
+This is not an accepted-commit publication or a completion-notice update. The
+accepted implementation commit is not yet published; the master register and H2
+notice remain a separate, joint publication after the real green commit exists.
+Historical H1 counts and accepted evidence above remain historical evidence.
+
+The fresh pre-H2 baseline was **314 tests / 41 suites**, **23/23 corpus PASS**,
+**1,721 lowered / 9,481 rejected**. After the final API cutover the integration
+owner ran all four workspace gates green: **427 tests / 47 suites**.
+
+```sh
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo build --workspace --all-targets
+cargo test --workspace
+```
+
+The identity corpus command is portable across checkout locations:
+
+```sh
+target/debug/kamy.exe -q corpus verify --corpus <corpus-checkout> --keep --baseline <pre-H2.yml> --write-baseline <H2.yml>
+```
+
+The observed corpus result is **23/23 PASS**, **3,173/11,202 lowered**, **8,029
+rejected**, **0 actually transformed**, and **0 verbatim-relocated**. The final
+fresh SDK `all --scope full` exited **0**, reporting `sdk-rebuild=full PASS` after
+rebuilding the hosts and regenerating all **11 normal module artifacts** plus
+the ordinary-Rust dynamic negative artifact. The SDK commands retain explicit
+local tool/library parameters:
+
+```sh
+target/debug/sdk-rebuild.exe build --out <sdk-output> --kamy target/debug/kamy.exe --cargo cargo --rustc rustc --linker <lld-link.exe> --llvm-tools <matching-LLVM-tools-directory> --lib-dirs <semicolon-separated-library-directories> --scope full
+target/debug/sdk-rebuild.exe produce --out <sdk-output> --kamy target/debug/kamy.exe --cargo cargo --rustc rustc --linker <lld-link.exe> --llvm-tools <matching-LLVM-tools-directory> --lib-dirs <semicolon-separated-library-directories> --scope full
+target/debug/sdk-rebuild.exe run --out <sdk-output> --kamy target/debug/kamy.exe --cargo cargo --rustc rustc --linker <lld-link.exe> --llvm-tools <matching-LLVM-tools-directory> --lib-dirs <semicolon-separated-library-directories> --scope full
+target/debug/sdk-rebuild.exe all --out <sdk-output> --kamy target/debug/kamy.exe --cargo cargo --rustc rustc --linker <lld-link.exe> --llvm-tools <matching-LLVM-tools-directory> --lib-dirs <semicolon-separated-library-directories> --scope full
+```
+
+The final `all` invocation repeats build, production and the full strict runtime
+matrix; it is not merely a rerun against stale module artifacts. No witness was
+skipped and no expected-pressure branch was used. Final combined callback frames
+are **176 bytes identity / 320 bytes MBA**; ordered callback maxima are **160 /
+208 bytes**. The final host-only DLL moves **1 host function** (2 eligible, with
+1 `UnsupportedInstruction` remaining); the retained-original-table oracle is
+still covered separately by four portable regressions, not evidence that this
+final DLL has no moved host bodies.
+Portable fixtures are `tests/sdk-rebuild/hosts/frame.rs`,
+`tests/sdk-rebuild/src/{frame,native,probe}.rs`, and
+`tests/sdk-rebuild/plugins/pressure/{original.rs,lib.rs}`. Lowering/link regression
+fixtures are `crates/kamy-codegen/tests/{memory_frames,frame_coordinates}.rs`
+and `crates/kamy-link/tests/{memory_frames,frame_call_alias,guard_calls}.rs`.
+External temporary baseline executables and headless reports are not required
+fixture dependencies.
+
+### Stable source-function cohort, not an aggregate recovery estimate
+
+Both snapshots contain the **same 12,848 discovered/selected identities**:
+**0 added, 0 removed**. Of these, **11,202 are classified** and **1,646 skipped
+identities remain unchanged**. Eligibility is **3,343 → 3,421**; it is a separate
+axis, not the population denominator. Actual intensity is **0.0** for all
+**1,721 → 3,173** lowered functions in this identity campaign.
+
+The per-function comparison records **1,454 recovered**, **2 lost**, and net
+**+1,452 lowered**. The complete rejection totals, including zeroed old classes:
+
+| Rejection reason | Before H2 | After H2 |
+|---|---:|---:|
+| BadIndirectBranch | 101 | 101 |
+| CallerFrameAccess | 488 | 0 |
+| EhNoBucketCreation | 3 | 5 |
+| FrameDynamic | 0 | 5 |
+| InvalidReference | 12 | 12 |
+| LiftFailure | 557 | 557 |
+| RegisterPressure | 869 | 0 |
+| ResolvableIndirect | 32 | 32 |
+| SEHComplex | 3,846 | 3,846 |
+| SelfRecursive | 3 | 0 |
+| SymbolizationUncertain | 3,323 | 3,245 |
+| UnsupportedInstruction | 247 | 226 |
+| **Rejected total** | **9,481** | **8,029** |
+
+Every changed classification row follows; unchanged identities are not omitted
+from the cohort, only from this transition table.
+
+| Before | After | Functions |
+|---|---|---:|
+| CallerFrameAccess | EhNoBucketCreation | 1 |
+| CallerFrameAccess | FrameDynamic | 1 |
+| CallerFrameAccess | SSA-lowered | 486 |
+| EhNoBucketCreation | SSA-lowered | 2 |
+| RegisterPressure | EhNoBucketCreation | 2 |
+| RegisterPressure | FrameDynamic | 4 |
+| RegisterPressure | SSA-lowered | 853 |
+| RegisterPressure | UnsupportedInstruction | 10 |
+| SSA-lowered | UnsupportedInstruction | 2 |
+| SelfRecursive | SSA-lowered | 3 |
+| SymbolizationUncertain | EhNoBucketCreation | 1 |
+| SymbolizationUncertain | SSA-lowered | 68 |
+| SymbolizationUncertain | UnsupportedInstruction | 9 |
+| UnsupportedInstruction | SSA-lowered | 42 |
+
+The **16 pressure-to-semantic/unwind migrations** (2 unwind, 4 dynamic-frame,
+10 unsupported-instruction) are **not recovered functions**. Neither are the
+other reject-to-reject migrations. Zero remaining `RegisterPressure` is not a
+license to hide unproved frame or native effects under a different success label.
+
+The two losses are `console_fibmix` source RVA **0x2650** and `console_jtable`
+source RVA **0x2320**: both were lowered before and now report
+`UnsupportedInstruction`. Their headless lift evidence ends in NativeInline
+bytes **CD 29 (`INT 29`)**, an implicit RSP read, and a `Ret` terminator. This
+observes an unsupported interrupt/termination path; it does not establish a more
+specific validator cause. H5/H6 own the remaining native termination/exception
+semantics. These losses are disclosed separately, not counted as pressure
+recovery or as evidence of general EH completion.
+
+### Real allocations and bounded resources
+
+All **3,173 lowered corpus functions** use the memory-backed allocation result
+and have nonzero homes; **2,132** have explicit flag homes. **15** generated
+frames exceed **4,096 bytes**. The largest is **11,640 bytes**, `kernel32` source
+RVA **0x67cb8**: original frame **104**, outgoing known minimum **32**, **1,793
+homes** comprising **1,563 GPR**, **72 XMM**, **158 flag** homes, and **8
+nonvolatile saves**. These are structural identity-lowering measurements, not
+execution of every body and not MBA coverage.
+
+Ordinary scratch pools are exactly **7 GPRs** (`RAX RCX RDX R8 R9 R10 R11`)
+and **4 XMMs** (`XMM0..3`). Other explicit native/ABI registers are boundary
+constraints, not extra interchangeable scratch. The checked frame-size resource
+bound is **16 MiB**; arithmetic overflow and resource IDs fail explicitly.
+Generated page probes cover the actual frame. The standalone fixture links and
+exports the real `__chkstk` from an explicit MSVC `libcmt.lib`; recognition uses
+its authoritative symbol/ABI, not guesses about anonymous helper bytes.
+
+### Runtime and independent native unwind evidence
+
+The standalone frame DLL's **eight exports** execute as original, protected
+identity and protected ordered MBA through `kamy-run` with **forced ASLR**.
+Both protected variants lower **8** exports; identity transforms **0**, MBA
+actually transforms **8**. The matrix exercises six mixed register/stack
+arguments, incoming homes, local/address-taken storage, pinned results,
+**recursion depth 64** retaining the original **4,096-byte** object, an actual
+**24 KiB** guard-page frame, and a **16 KiB** GPR/XMM-save case. Separate portable
+link regression recursion reaches **96**; it is not the standalone depth-64 run.
+
+An independent machine-CFG oracle supplies Windows `RtlLookupFunctionEntry` /
+`RtlVirtualUnwind` probes over the **8 actual host placements**. Identity covers
+**1,161 native PCs**, including **90 epilogue PCs**; MBA covers **1,926 native
+PCs**, including **90 epilogue PCs**. Maximum actual frames are **25,208 bytes
+identity / 25,640 bytes MBA**, with maximum saved **3 GPRs / 1 XMM**. These are
+the standalone probes, not all corpus PCs or arbitrary handler unwinding.
+
+The intact combined bounds/counter callback executes in **both identity and
+ordered MBA**, with **trace 12 / bounds span 24**. MBA retains requested intensity
+**1.0**; identity reports **0.0**. Callback lowered counts are **[1,1]**;
+transformed counts are **[0,0] identity** and **[1,1] MBA**.
+No split, skip, expected-pressure branch or intensity fallback substitutes for
+execution. Full-scope EXE/DLL ×
+inline/init-table runtime cases also pass callback ordering, Float64/aggregate
+ABI, BSS, bounds, actual **0xc0000409** fast-fail, strict configuration and
+disabled-path checks. This does not assert arbitrary ISA, EH or Rust-std parity.
+A real ordinary Rust dynamic-inline-asm callback packages through the existing
+compiler-ABI producer, then mandatory protection fails source-qualified
+`FrameDynamic` with **no output file**, as the harness requires.
+
+### Root repairs and issue/residual ownership
+
+The backend now shares format-agnostic `FrameAnalysis`, `ConcreteFrame`,
+`FrameHome` and `FrameSave` producers/consumers. Original negative-zone storage
+stays LOW; intermediate homes, copy scratch and saves stay HIGH. Entry-relative
+incoming homes/stack arguments/return storage retain their real coordinates.
+Calls use original outgoing storage, with homes above call RSP. Unknown actual
+stack arguments survive through the entire original zone; the ABI-known
+`outgoing_frame_size` minimum is not guessed to be the actual argument extent.
+Generated overhead is a multiple of 16, preserving original object/call alignment.
+
+Frame logical extraction requires fully proved subtractive pointer pairs;
+mixed call-returned aliases retain runtime coordinates. Proof-carrying frame
+indices retain checked pre-MBA bounds. A real compiler loop exposed a dangling
+XMM0-return root in `PrunePhis`; transitive cycle-safe replacement repairs the
+alias graph instead of dropping the return. Constant register-index
+`BT/BTS/BTR/BTC` preserve signed word offsets, full width and LOCK semantics;
+unproved frame indices fail specifically. Invalid unaligned PSHUFD probes were
+corrected to valid MOVDQU cases while retaining the aligned PSHUFD counterexample
+and negative alignment tests. Data oracles were not weakened.
+
+Typed UNWIND_CODE and BaseReloc scalar storage is excluded from raw-pointer scans
+only after validated metadata ownership; real pointer fields remain rebound and
+unknown handler data remains conservative. BaseReloc parsing accepts supported
+types 0/3/10, rejects malformed/truncated data, and permits a terminal 14-byte
+block because the block start, not its size, has the alignment constraint.
+GuardCF dispatch's hidden RAX target comes from the real LoadConfig slot and
+transparent thunk, not a name/RVA allowlist. Corpus bisects at `console_cfg`
+**0x9c88** and `console_tls` **0x8874** exposed that missing input. The typed
+dispatch slot is rebound while an unrelated decoy remains unchanged. Retained
+host metadata is accepted only as an independently identical active original
+graph when no replacement is generated; generated metadata checks stay strict.
+These are semantic/ownership repairs, not pressure-masking bandaids.
+
+| Issue / scope | H2 implementation and evidence | Remaining ownership |
+|---|---|---|
+| #15 frame/pressure recovery | Concrete frames and real homes remove pressure rejection/reduced-intensity paths; stable-cohort and runtime evidence above | Dynamic/unproved frames remain explicit; this does not close every umbrella limitation |
+| #6 serial scheduling / zero-spill policy | Applicability reconciled with D40: bounded scratch plus memory homes replaces zero-spill as the default | No obligation to preserve the superseded zero-spill scheduling design |
+| #5 applicability | Requested existing MBA intensity is retained through the new backend | Nonlinear MBA/protection strength remains separate; no strength-completion claim |
+| #9 volatile-pinned live-across-call | After-definition call/native capture and homes preserve supported live values and boundary pins; pinned runtime witness executes | Unsupported native/ABI effects remain semantic limitations, not a pressure escape |
+| #10 recursion/caller-frame access | Original object/entry coordinates preserved without duplicating the original frame; 486 caller-frame and 3 recursion functions recovered, recursion 64/96 exercised | Dynamic joins and unproved frame forms remain `FrameDynamic` |
+| #13 signature precision | Existing metadata/CRT/import-thunk/inference path retained; exact authored contracts remain precise; unknown host calls consume all four GPR and XMM argument possibilities and retain RAX/XMM0 returns | No invented narrow signature or guessed unknown stack-argument count; broader signature work is not declared closed |
+| #16 dead dependencies | Successor-aware per-bit analysis admits native flag writers only when their outputs are proved dead; partial writes, native reads, calls and memory effects retain their dependencies | Unmodeled native flag effects and variable-count carry semantics remain H5 work |
+| #23 preservation | All 23 real corpus members pass without re-blessing protected outputs; actual GuardCF RAX input and phi-alias roots repaired | Handler/personality reconstruction and the disclosed INT29 paths remain H5/H6; not umbrella closure |
+| #8 preservation | Native physical operand pins/effects survive memory-backed lowering; native bit-string widths/offsets preserved | FS/GS and unknown native classes remain H5 limits |
+| #17 bounded prerequisite | Existing one-plan reference/link ownership extended for frame/probe/helper and validated typed metadata consumers | Not whole-image compaction or every reference consumer; H4 retains global compaction |
+| #20 bounded prerequisite | Actual frame saves/page probes feed real unwind generation; independent Windows native-PC oracle passes | **5 EhNoBucketCreation**, handler/scope/personality and broader EH remain H6 |
+| #30 bounded prerequisite | Validated BaseReloc storage classification retains the real relocation records and existing field rebasing/rebuild; code-shaped scalar headers no longer pin movers | HIGHLOW/opaque-reference limits stay conservative; global layout work remains H4, not issue-wide closure |
+| #32 preserved prerequisites | The intact combined Rust callback executes identity/full MBA through the shared backend and linker | Compiled Rust startup, ordinary imports, std/runtime/TLS and lifecycle remain H3 |
+
+After this campaign **5 FrameDynamic** and **5 EhNoBucketCreation** rejections
+remain genuine current limits. Other unchanged semantic/reference reasons in the
+table are not declared repaired merely because the suite passes. FS/GS,
+variable-count carry semantics, broader ISA/native classes and EH remain later
+work. H3 Rust std/import/startup/lifecycle and H4 global compaction are not
+implemented here. The intentional H1 generated loader remains; this is not a
+claim to have compiled that loader or completed H3. No remote issue is claimed
+closed, and no #36 output-optimization work or stronger MBA is claimed.
 
