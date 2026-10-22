@@ -87,7 +87,7 @@ Follow the repository's loaded operating guide. Read:
   section recycling; selective versus whole-image layout; memory-backed
   register model; entry handling; module code/data and linker provenance.
 - `docs/STATUS.md`: its final relocation section is the current snapshot;
-  earlier measurements and the crash RCA are historical.
+  earlier measurements are historical.
 - `docs/tooling.md` and the `kamy-triage` skill when investigating miscompiles.
 - The relevant issues and their comments, then the current source. Issue state
   and historical rejection counts are not an implementation inventory.
