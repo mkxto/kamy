@@ -37,20 +37,21 @@ already exist. Update the register and the numbered handoff's notice together.
 | Handoff | Status | Accepted commits | Completion notice |
 |---|---|---|---|
 | 01 — Unified symbols and single rebuild | **Completed** | Policy `5ef9b46`; implementation `feaffd8` | [01 notice](01-unified-rebuild.md#completion-notice) |
-| 02 — Concrete frames and memory-backed lowering | Pending | None recorded | [02 notice](02-memory-backed-lowering.md#completion-notice) |
+| 02 — Concrete frames and memory-backed lowering | **Completed** | Policy `5ef9b46`; implementation `278f5ef81dd096e8325c06bd02ba7c88b84b0646` | [02 notice](02-memory-backed-lowering.md#completion-notice) |
 | 03 — Rust SDK, runtime and lifecycle | Pending | None recorded | [03 notice](03-rust-sdk-runtime.md#completion-notice) |
 | 04 — Whole-image virtual compaction | Pending | None recorded | [04 notice](04-whole-image-compaction.md#completion-notice) |
 | 05 — Instruction, flag and segment semantics | Pending | None recorded | [05 notice](05-instruction-semantics.md#completion-notice) |
 | 06 — Exception semantics | Pending | None recorded | [06 notice](06-exception-semantics.md#completion-notice) |
 | 07 — Control-flow residuals | Pending | None recorded | [07 notice](07-control-flow-residuals.md#completion-notice) |
 
-The next assignment is **02**. Handoff 01's exercised results and remaining
-limits are recorded in the final D40 campaign section of
-[STATUS.md](../STATUS.md); its shared contracts are in
-[architecture.md](../architecture.md). Read those records and the current code
-before taking a fresh baseline. Do not replace historical baselines with newer
-measurements or interpret completed H1 acceptance as completed SDK/runtime,
-allocation, EH or compaction work.
+The next assignment is **03**. Read the [completed H2 notice](02-memory-backed-lowering.md#completion-notice),
+the [H2 evidence and residual ledger](../STATUS.md#d40-repair-campaign--h2-concrete-frames-and-memory-backed-lowering)
+and the [concrete backend contracts](../architecture.md#81-code-generation)
+before taking a fresh baseline. H3 MUST reuse the shared frame, memory-home,
+bounded-scratch, ABI, actual-body unwind and single-link-plan contracts and
+portable fixtures. H1's accepted notice and historical measurements remain
+unchanged. Completed H2 acceptance does not complete Rust std/import/startup/
+lifecycle, broad ISA/EH, CFG enforcement or whole-image compaction.
 
 ## Completion notices
 

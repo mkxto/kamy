@@ -770,11 +770,17 @@ Observed verification:
 
 ### Verification state and reproducible commands
 
-Working-tree implementation verification is complete for the measurements below.
-This is not an accepted-commit publication or a completion-notice update. The
-accepted implementation commit is not yet published; the master register and H2
-notice remain a separate, joint publication after the real green commit exists.
-Historical H1 counts and accepted evidence above remain historical evidence.
+**H2 is completed and accepted** at implementation commit
+`278f5ef81dd096e8325c06bd02ba7c88b84b0646` (`Lower SSA through concrete
+memory-backed frames`), under D40 policy commit `5ef9b46`. Accepted scope is
+concrete frames, real memory-backed intermediates and flags, bounded scratch,
+supported call/recursion recovery and actual-frame probing/unwind through the
+shared backend. The [H2 completion notice](handoffs/02-memory-backed-lowering.md#completion-notice)
+and [master register](handoffs/00-master.md#completion-register) record the same
+acceptance; the next assignment is H3. This is not umbrella or remote issue
+closure. Historical H1 counts and accepted evidence above remain historical
+evidence; all detailed H2 measurements and residual ownership below remain in
+force.
 
 The fresh pre-H2 baseline was **314 tests / 41 suites**, **23/23 corpus PASS**,
 **1,721 lowered / 9,481 rejected**. After the final API cutover the integration

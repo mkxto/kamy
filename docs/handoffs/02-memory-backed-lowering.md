@@ -6,12 +6,108 @@ its evidence. Do not recreate its symbolic model or link plan.
 
 ## Completion notice
 
-**Status: Pending; no completion accepted.** Assigned issue scopes are
-#15/#6/#5 applicability, #16/#13 residuals and #9/#10, preserving corrected #23
-behavior. These are assignments, not claims of work performed. On completion,
-replace this notice with the issue-by-issue work/evidence/residual ledger,
-accepted commits and successor contracts required by the master's
-[completion contract](00-master.md#completion-notices), and update its register.
+**Status: Completed.** Policy commit `5ef9b46` (D40); accepted implementation
+commit `278f5ef81dd096e8325c06bd02ba7c88b84b0646` (`Lower SSA through concrete
+memory-backed frames`). H2 acceptance covers concrete original/generated frame
+coordinates, real memory-backed intermediates and explicit flags, bounded
+scratch working sets, supported live-across-call and recursion recovery, and
+actual-frame probing/unwind through the shared host/module backend. Pressure
+rejection and transform-intensity retries are retired, not retained as fallback.
+This notice and the [master register](00-master.md#completion-register) record
+accepted handoff scope, not umbrella or remote issue closure.
+
+| Issue scope | Delivered scope and disposition | Residual owner |
+|---|---|---|
+| #15 | H2 frame/pressure acceptance satisfied: real homes, concrete coordinates and bounded resources | Unproved/dynamic frames remain explicit; no issue-wide closure |
+| #6 | Applicability satisfied under D40: memory homes replace the superseded zero-spill default | No requirement to restore the old scheduling design |
+| #5 applicability | Existing requested MBA intensity preserved; no pressure-driven reduction | Stronger/nonlinear protection remains separate |
+| #9 | Supported volatile-pinned/live-across-call acceptance satisfied by after-definition capture and homes | Unsupported native/ABI effects remain semantic limits |
+| #10 | Supported caller-frame/recursion acceptance satisfied without duplicating original storage; 486 caller-frame and 3 recursion functions recovered | Unproved frame joins/forms remain explicit |
+| #13 | Partial: existing metadata/CRT/import-thunk/inference retained; exact authored ABI and conservative unknown-host calls preserved | Broader signature precision is not declared complete |
+| #16 | Partial: successor-aware per-bit dead-flag dependencies removed only when proved dead | H5 owns unmodeled flags and variable-count carry semantics |
+| #23 | Preserved: all 23 corpus members pass; GuardCF input and phi-alias root repairs included | H5/H6 own native termination/EH residuals, including two disclosed INT29 losses |
+| #8 | Preserved: physical native pins/effects and bit-string widths/offsets survive the cutover | H5 owns FS/GS and unknown native classes |
+| #17 | Bounded prerequisite: one-plan references extended for frame/probe/helper and typed metadata consumers | H4 global compaction and later reference residuals remain |
+| #20 | Bounded prerequisite: real saves/probes/unwind with independent Windows native-PC proof | H6 owns missing buckets and handler/scope/personality reconstruction |
+| #30 | Bounded prerequisite: validated BaseReloc scalar ownership preserves records and field rebasing/rebuild | HIGHLOW/opaque-reference limits remain conservative; H4 owns global layout |
+| #32 | Preserved prerequisite: intact combined Rust callback executes identity and full MBA through the shared backend | H3 owns compiled startup, ordinary imports, std/runtime/TLS and lifecycle |
+
+### Verification and remaining limits
+
+The [H2 STATUS record](../STATUS.md#d40-repair-campaign--h2-concrete-frames-and-memory-backed-lowering)
+contains actual commands and detailed allocation, rejection, transition and
+issue tables. All four workspace gates passed: **427 tests / 47 suites**.
+Fresh SDK `all --scope full` exited **0**, `sdk-rebuild=full PASS`, rebuilding
+hosts and regenerating **11 normal artifacts** plus the dynamic negative
+artifact before the full strict runtime matrix. No witness was skipped or
+accepted through an expected-pressure branch.
+
+Identity corpus: **23/23 PASS**, **3,173/11,202 lowered**, **8,029 rejected**,
+**0 actually transformed**, **0 verbatim-relocated**. The stable source cohort
+has **12,848 identities**, **0 added / 0 removed**, **11,202 classified** and
+**1,646 unchanged skipped identities**; **1,454 recovered / 2 lost**, net
+**+1,452**. Reject-to-reject migrations are not recovery. The two previously
+lowered INT29 helpers now reject `UnsupportedInstruction`; their exact source
+coordinates and evidence remain in the
+[cohort ledger](../STATUS.md#stable-source-function-cohort-not-an-aggregate-recovery-estimate).
+
+Actual transformation proof is separate: the standalone eight-export frame
+fixture executes original, protected identity (**8 lowered / 0 transformed**)
+and protected MBA (**8 lowered / 8 transformed**) under forced ASLR, including
+mixed ABI, depth-64 recursion and a 24 KiB guard frame. Independent Windows
+native unwind probes cover **1,161 identity / 1,926 MBA PCs**, **90 epilogue
+PCs each**, maximum frames **25,208 / 25,640 bytes**, saved **3 GPRs / 1 XMM**.
+The intact combined callback executes **trace 12 / span 24** in both modes:
+actual intensity **0.0 identity / 1.0 MBA**, frames **176 / 320 bytes**.
+See the [runtime proof](../STATUS.md#runtime-and-independent-native-unwind-evidence).
+
+Strict remaining limits include **5 FrameDynamic / 5 EhNoBucketCreation**,
+unproved native/frame effects, FS/GS, variable-count carry semantics and the
+other unchanged semantic/reference rejections. The checked frame bound is
+**16 MiB**, not unbounded memory. GuardCF target repair is not a claim of CFG
+enforcement. Plain-frame unwind is not arbitrary EH; neither Rust-std parity,
+compiled startup nor whole-image compaction is claimed. H3–H7 and separate
+protection-strength/output-optimization work retain their scopes.
+
+### Successor contract
+
+H3 MUST reuse the [concrete code-generation contract](../architecture.md#81-code-generation):
+`FrameAnalysis`, `ConcreteFrame`, `FrameHome`, `FrameSave` and `RegAllocation`;
+`allocate_registers(func, rsp_pinned, reg_pins)` and
+`select_instructions(func, alloc)`; actual `frame.saves` rather than obsolete
+save-vector helpers. `FrameHome` is the memory-home representation, not a second
+`MemoryHome` API. The scratch/ABI contract is seven ordinary GPRs and four XMMs,
+explicit native/ABI boundary pins, after-definition result capture, explicit
+flag homes and memory-phi/cycle scratch. Preserve original LOW storage,
+generated HIGH homes/saves, entry-relative incoming coordinates and original
+outgoing storage; the known outgoing minimum is not a guessed argument extent.
+
+`construct_ssa(&mut LiftResult) -> Result<(), RejectionReason>` is mandatory
+before transforms, including identity. Reuse
+`build_callconv(&PeFile, &Module) -> anyhow::Result<MapCallConv>`, exact
+`FnSignature`/`AbiValue` contracts and conservative unknown-host calls. Actual
+machine-CFG unwind consumes actual saves/probes/epilogues. Reuse
+`MetadataReferences { references, classified_ranges }`: validated scalar ranges
+exclude speculative scans, not real reference enumeration/rebinding. Preserve
+`SymbolId`, `Reference`/`SymbolicExpression`/`LinkField`, `SelectedInstructions`,
+`AuthoredSource` and the single `kamy_link::protect` plan. KAMYMOD v2,
+`kamy-debug-map,2` and `kamy-link-report` v1 remain unchanged; allocation reporting
+is additive. See [architecture successor contracts](../architecture.md#86-contracts-consumed-by-the-next-handoffs).
+
+Portable fixtures H3 MUST retain and reuse:
+[standalone frame host](../../tests/sdk-rebuild/hosts/frame.rs),
+[frame runner](../../tests/sdk-rebuild/src/frame.rs),
+[native unwind oracle](../../tests/sdk-rebuild/src/native.rs),
+[probe support](../../tests/sdk-rebuild/src/probe.rs), intact combined callback
+[original](../../tests/sdk-rebuild/plugins/pressure/original.rs) and
+[protected source](../../tests/sdk-rebuild/plugins/pressure/lib.rs), codegen
+[memory frames](../../crates/kamy-codegen/tests/memory_frames.rs) and
+[frame coordinates](../../crates/kamy-codegen/tests/frame_coordinates.rs), link
+[memory frames](../../crates/kamy-link/tests/memory_frames.rs),
+[call aliases](../../crates/kamy-link/tests/frame_call_alias.rs) and
+[guard calls](../../crates/kamy-link/tests/guard_calls.rs). These use the existing
+specialized DLL producer, not external temporary executable dependencies.
+
 
 ## Goal and explicit policy change
 
