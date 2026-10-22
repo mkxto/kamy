@@ -16,6 +16,7 @@ pub struct NewSection {
     pub name: String,
     pub rva: Rva,
     pub flags: SectionFlags,
+    pub virtual_size: u32,
     pub data: Vec<u8>,
 }
 
@@ -238,15 +239,24 @@ impl PeFile {
         for section in &edits.new_sections {
             let mut header = [0; SECTION_HEADER_SIZE];
             set_name(&mut header, &section.name)?;
-            let virtual_size =
+            let data_size =
                 u32::try_from(section.data.len()).context("section data exceeds u32")?;
+            ensure!(
+                data_size <= section.virtual_size,
+                "new section data exceeds virtual size"
+            );
+            let mut characteristics = characteristics_from_flags(section.flags);
+            if !section.flags.execute && data_size == 0 && section.virtual_size != 0 {
+                characteristics &= !IMAGE_SCN_CNT_INITIALIZED_DATA;
+                characteristics |= IMAGE_SCN_CNT_UNINITIALIZED_DATA;
+            }
             sections.push(OutputSection {
                 header,
                 rva: section.rva.get(),
-                virtual_size,
-                raw_size: checked_align(virtual_size, layout.file_alignment)?,
+                virtual_size: section.virtual_size,
+                raw_size: checked_align(data_size, layout.file_alignment)?,
                 raw_pointer: 0,
-                characteristics: characteristics_from_flags(section.flags),
+                characteristics,
                 data: &section.data,
                 replaced: false,
             });
@@ -947,6 +957,7 @@ mod tests {
             name: ".kamy".into(),
             rva: Rva::new(rva),
             flags: flags(false),
+            virtual_size: 12,
             data: vec![7; 12],
         }
     }
@@ -1109,6 +1120,16 @@ mod tests {
         assert_eq!(read_u32(&out, 0x600 + 24).unwrap(), 0x680);
         assert_eq!(read_u32(&out, 0x61c + 24).unwrap(), 0xc10);
         assert_eq!(read_u32(&out, OPT + 112 + 4 * 8).unwrap(), 0xc00);
+        assert_eq!(
+            pe.output_data_directory(&out, 4).unwrap(),
+            Some((Rva::new(0xc00), 16))
+        );
+        assert_eq!(
+            pe.output_data_directory(&out, 6).unwrap(),
+            Some((Rva::new(0x2000), 56))
+        );
+        assert_eq!(pe.output_data_directory(&out, 16).unwrap(), None);
+        assert!(pe.output_data_directory(&out[..OPT + 120], 4).is_err());
         assert_eq!(&out[0xc00..], &bytes[0x800..]);
         assert_eq!(read_u32(&out, COFF + 8).unwrap(), 0xc20);
         assert_eq!(read_u32(&out, TABLE + 24).unwrap(), 0x400);
@@ -1401,5 +1422,64 @@ mod tests {
         assert_eq!(pe.next_section_rva(), Rva::new(0x3000));
         assert_eq!(align(0x201, 0x200), 0x400);
         assert_eq!(align(0x1234, 0), 0x1234);
+    }
+    #[test]
+    fn new_sections_keep_virtual_zero_fill_out_of_file_storage() {
+        let pe = PeFile::parse(&fixture(&[(0x1000, 0x200, 0x200, 0x200)])).unwrap();
+        let output = pe
+            .rebuild(&PeEdits {
+                new_sections: vec![
+                    NewSection {
+                        name: ".bss".into(),
+                        rva: Rva::new(0x2000),
+                        flags: SectionFlags {
+                            read: true,
+                            write: true,
+                            execute: false,
+                        },
+                        virtual_size: 0x5000,
+                        data: Vec::new(),
+                    },
+                    NewSection {
+                        name: ".mixed".into(),
+                        rva: Rva::new(0x7000),
+                        flags: SectionFlags {
+                            read: true,
+                            write: true,
+                            execute: false,
+                        },
+                        virtual_size: 0x3000,
+                        data: vec![1, 2, 3],
+                    },
+                ],
+                ..PeEdits::default()
+            })
+            .unwrap();
+        let rebuilt = PeFile::parse(&output).unwrap();
+        let bss = &rebuilt.section_headers()[1];
+        assert_eq!(
+            (bss.virtual_size, bss.raw_size, bss.raw_pointer),
+            (0x5000, 0, 0)
+        );
+        assert_ne!(bss.characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA, 0);
+        assert_ne!(bss.characteristics & IMAGE_SCN_MEM_WRITE, 0);
+        let mixed = &rebuilt.section_headers()[2];
+        assert_eq!((mixed.virtual_size, mixed.raw_size), (0x3000, 0x200));
+        assert_eq!(&rebuilt.section_data(2).unwrap()[..3], &[1, 2, 3]);
+        assert!(output.len() < 0x2000);
+    }
+
+    #[test]
+    fn new_section_rejects_initialized_bytes_beyond_virtual_extent() {
+        let pe = PeFile::parse(&fixture(&[(0x1000, 0x200, 0x200, 0x200)])).unwrap();
+        let mut section = new_section(0x2000);
+        section.virtual_size = 11;
+        assert!(
+            pe.rebuild(&PeEdits {
+                new_sections: vec![section],
+                ..PeEdits::default()
+            })
+            .is_err()
+        );
     }
 }

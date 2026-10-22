@@ -741,8 +741,8 @@ incompatible implementation restrictions in D5, D28 and D37–D39.
   MOVABS byte normalization and a second host/module rebuild are not contracts.
 - Rust plugin builds may require version-matched LLVM tools to obtain
   authoritative machine ABI metadata. Metadata must describe the exact emitted
-  native code; compiler diagnostics, mangled names and guessed Win64 defaults
-  are not substitutes for validated contracts. Rust-only authoring remains.
+  native code; unvalidated diagnostic text, mangled names and guessed Win64
+  defaults are not substitutes for validated contracts. Rust-only authoring remains.
 - Handoff 2 implements concrete frames and memory-backed intermediates with
   bounded scratch sets and explicit flags. Pressure must not reject supported
   functions or reduce requested intensity. Register-resident optimization is

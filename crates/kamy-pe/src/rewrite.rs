@@ -1074,6 +1074,7 @@ mod tests {
                             write: false,
                             execute: false,
                         },
+                        virtual_size: u32::try_from(blob.len()).unwrap(),
                         data: blob,
                     },
                     NewSection {
@@ -1084,6 +1085,7 @@ mod tests {
                             write: false,
                             execute: true,
                         },
+                        virtual_size: 0x128,
                         data: vec![0xc3; 0x128],
                     },
                 ],

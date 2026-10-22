@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::parse_rva;
+use kamy_core::SymbolId;
 
 pub(crate) fn run(input: &Path, rva: Option<&str>) -> anyhow::Result<()> {
     let target = rva.map(parse_rva).transpose()?;
@@ -21,12 +22,11 @@ pub(crate) fn run(input: &Path, rva: Option<&str>) -> anyhow::Result<()> {
 
     match target {
         Some(r) => {
-            if let Some((_, reason)) = report.rejected.iter().find(|(x, _)| *x == r) {
+            let symbol = SymbolId::Host { rva: r };
+            if let Some((_, reason)) = report.rejected.iter().find(|(id, _)| id == &symbol) {
                 println!("{r}  rejected: {}", reason.tag());
-            } else if report.ssa_lowered_rvas.contains(&r) {
+            } else if report.ssa_lowered_symbols.contains(&symbol) {
                 println!("{r}  SSA-lowered");
-            } else if report.moved.contains(&r) {
-                println!("{r}  relocated verbatim");
             } else {
                 println!("{r}  not found in report");
             }
@@ -37,7 +37,9 @@ pub(crate) fn run(input: &Path, rva: Option<&str>) -> anyhow::Result<()> {
                 return Ok(());
             }
             for (r, reason) in &report.rejected {
-                println!("{r}  {}", reason.tag());
+                if let SymbolId::Host { rva } = r {
+                    println!("{rva}  {}", reason.tag());
+                }
             }
             let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
             for (_, reason) in &report.rejected {

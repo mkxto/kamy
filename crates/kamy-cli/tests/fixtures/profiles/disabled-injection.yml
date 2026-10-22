@@ -1,0 +1,10 @@
+version: 1.0.0
+module_settings:
+  injection:
+    enabled: false
+    plugins:
+    - name: missing
+      path: does-not-exist.dll
+profiles:
+- name: identity
+  passes: []

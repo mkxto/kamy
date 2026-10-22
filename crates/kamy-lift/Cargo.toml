@@ -15,3 +15,7 @@ kamy-disasm.workspace = true
 kamy-analysis.workspace = true
 iced-x86.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+kamy-codegen.workspace = true
+kamy-transforms.workspace = true

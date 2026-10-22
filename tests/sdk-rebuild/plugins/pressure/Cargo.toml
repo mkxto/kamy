@@ -1,0 +1,15 @@
+[package]
+name = "sdk-rebuild-pressure"
+version = "0.0.0"
+edition = "2024"
+publish = false
+build = "../build.rs"
+
+[workspace]
+
+[lib]
+path = "lib.rs"
+crate-type = ["staticlib"]
+
+[dependencies]
+kamy-sdk = { path = "../../../../crates/kamy-sdk" }

@@ -10,15 +10,11 @@ module_settings:
 profiles:
 - name: default
   passes:
-  - type: ObscureReferences
   - type: MixedBooleanArithmetic
     iterations: 1
     probability: 100
-    semantics: { add: true, sub: true, xor: true, or: true, not: true, neg: true }
+    semantics: { add: true, sub: true, xor: true }
     bitwidths: { bit8: true, bit16: true, bit32: true, bit64: true }
-  - type: MutationEngine
-    iterations: 1
-    probability: 100
   symbols:
   - !Pattern "crypto_*"
   - !Name main

@@ -1,18 +1,75 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use super::phys::{Gpr, PhysReg, XmmReg};
+use super::phys::{Gpr, PhysReg, X86Flag, XmmReg};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbiClass {
+    Integer,
+    Float,
+    Vector,
+    Pointer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbiLocation {
+    Register(PhysReg),
+    /// Byte offset from the callee entry RSP, including the return address.
+    Stack {
+        offset: i32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbiPassing {
+    Direct,
+    Indirect { size: u64, align: u32 },
+    Sret { size: u64, align: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AbiValue {
+    pub location: AbiLocation,
+    pub class: AbiClass,
+    pub bits: u16,
+    pub passing: AbiPassing,
+}
+
+impl AbiValue {
+    pub fn register(reg: PhysReg) -> Self {
+        let (class, bits) = match reg {
+            PhysReg::Xmm(_) => (AbiClass::Vector, 128),
+            _ => (AbiClass::Integer, 64),
+        };
+        Self {
+            location: AbiLocation::Register(reg),
+            class,
+            bits,
+            passing: AbiPassing::Direct,
+        }
+    }
+
+    pub fn register_location(&self) -> Option<PhysReg> {
+        match self.location {
+            AbiLocation::Register(reg) => Some(reg),
+            AbiLocation::Stack { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FnSignature {
-    pub args: Vec<PhysReg>,
-    pub ret: Option<PhysReg>,
+    pub args: Vec<AbiValue>,
+    pub returns: Vec<AbiValue>,
     pub clobbers: Vec<PhysReg>,
     pub noreturn: bool,
 }
 
 pub trait CallingConvLookup {
     fn lookup(&self, target_va: u64) -> Option<FnSignature>;
+    fn lookup_symbol(&self, _symbol: &crate::symbol::SymbolId) -> Option<FnSignature> {
+        None
+    }
 }
 
 /// The four Win64 integer-argument registers, in positional order.
@@ -21,11 +78,8 @@ const WIN64_ARG_GPRS: [Gpr; 4] = [Gpr::Rcx, Gpr::Rdx, Gpr::R8, Gpr::R9];
 /// The four Win64 floating-point argument registers, in positional order.
 const WIN64_ARG_XMMS: [XmmReg; 4] = [XmmReg::Xmm0, XmmReg::Xmm1, XmmReg::Xmm2, XmmReg::Xmm3];
 
-/// Every Win64 call clobbers the full volatile set regardless of the callee's
-/// declared arguments, so a precise signature narrows only the argument pins —
-/// never the clobber set (which must stay a sound superset) and never the RAX
-/// return (threading an unused value is harmless; DCE removes it).
-fn win64_volatiles() -> Vec<PhysReg> {
+/// The volatile set is independent of the argument and return shape.
+pub fn win64_volatiles() -> Vec<PhysReg> {
     use Gpr::*;
     use XmmReg::*;
     vec![
@@ -42,6 +96,12 @@ fn win64_volatiles() -> Vec<PhysReg> {
         PhysReg::Xmm(Xmm3),
         PhysReg::Xmm(Xmm4),
         PhysReg::Xmm(Xmm5),
+        PhysReg::Flag(X86Flag::Cf),
+        PhysReg::Flag(X86Flag::Pf),
+        PhysReg::Flag(X86Flag::Af),
+        PhysReg::Flag(X86Flag::Zf),
+        PhysReg::Flag(X86Flag::Sf),
+        PhysReg::Flag(X86Flag::Of),
     ]
 }
 
@@ -52,17 +112,16 @@ fn win64_sig(int_args: usize, noreturn: bool) -> FnSignature {
         args: WIN64_ARG_GPRS
             .iter()
             .take(int_args.min(WIN64_ARG_GPRS.len()))
-            .map(|g| PhysReg::Gpr(*g))
+            .map(|g| AbiValue::register(PhysReg::Gpr(*g)))
             .collect(),
-        ret: Some(PhysReg::Gpr(Gpr::Rax)),
+        returns: vec![AbiValue::register(PhysReg::Gpr(Gpr::Rax))],
         clobbers: win64_volatiles(),
         noreturn,
     }
 }
 
-/// Win64 ABI default: four integer args in RCX/RDX/R8/R9, return in RAX, the
-/// full volatile clobber set. The safe over-approximation for any call whose
-/// callee we cannot identify.
+/// Conservative integer-call contract for unresolved host calls. Authored calls
+/// require a compiler-produced contract instead.
 pub struct Win64Default;
 
 impl Win64Default {
@@ -83,7 +142,7 @@ impl CallingConvLookup for Win64Default {
 /// the real argument register unpinned and miscompiles the call. Variadic CRT
 /// functions (`printf`, `sprintf`, …) and float-returning ones (`atof`,
 /// `strtod`, the `<math.h>` surface — their result is in XMM0, which
-/// [`win64_sig`] cannot express) are intentionally absent.
+/// the curated integer-only table cannot classify) are intentionally absent.
 fn crt_signature(name: &str) -> Option<FnSignature> {
     let (int_args, noreturn) = match name {
         "abort" => (0, true),
@@ -174,20 +233,28 @@ fn packed_to_signature(p: &PackedSig) -> FnSignature {
     let args = (0..n)
         .map(|i| {
             if p.float_mask & (1 << i) != 0 {
-                PhysReg::Xmm(WIN64_ARG_XMMS[i])
+                AbiValue {
+                    class: AbiClass::Float,
+                    bits: 64,
+                    ..AbiValue::register(PhysReg::Xmm(WIN64_ARG_XMMS[i]))
+                }
             } else {
-                PhysReg::Gpr(WIN64_ARG_GPRS[i])
+                AbiValue::register(PhysReg::Gpr(WIN64_ARG_GPRS[i]))
             }
         })
         .collect();
-    let ret = match p.ret {
-        0 => None,
-        2 => Some(PhysReg::Xmm(XmmReg::Xmm0)),
-        _ => Some(PhysReg::Gpr(Gpr::Rax)),
+    let returns = match p.ret {
+        0 => Vec::new(),
+        2 => vec![AbiValue {
+            class: AbiClass::Float,
+            bits: 64,
+            ..AbiValue::register(PhysReg::Xmm(XmmReg::Xmm0))
+        }],
+        _ => vec![AbiValue::register(PhysReg::Gpr(Gpr::Rax))],
     };
     FnSignature {
         args,
-        ret,
+        returns,
         clobbers: win64_volatiles(),
         noreturn: false,
     }

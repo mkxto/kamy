@@ -1,4 +1,4 @@
-use iced_x86::{Instruction, InstructionInfoFactory, OpAccess, Register};
+use iced_x86::{FlowControl, Instruction, InstructionInfoFactory, OpAccess, OpKind, Register};
 use kamy_core::ir::{IrOp, IrType, NativeInst, PhysReg, ValueId};
 
 use crate::builder::IrBuilder;
@@ -29,14 +29,45 @@ pub(crate) fn native_inline_fallback(
     builder: &mut IrBuilder,
     state: &mut LiftState,
 ) {
+    if insn.rflags_modified() != 0 {
+        // NativeInline has no SSA flag outputs. Retaining the old values would
+        // make later SETcc/Jcc consumers observe an earlier instruction's flags.
+        state.unsupported = true;
+        return;
+    }
+    let mut references = Vec::new();
     if insn.is_ip_rel_memory_operand() {
-        // A RIP-relative operand on an unmodeled instruction would be re-emitted
-        // with its original displacement and resolve to the wrong VA once moved.
-        tracing::warn!(
-            ip = %insn.ip(),
-            mnemonic = ?insn.mnemonic(),
-            "rip-relative operand on unmodeled instruction; lifting unsupported"
-        );
+        let operand = (0..insn.op_count()).find(|&op| insn.op_kind(op) == OpKind::Memory);
+        let reference = operand.and_then(|op| {
+            let reference = state.address_reference(
+                op,
+                insn.ip_rel_memory_address(),
+                kamy_core::LinkField::Relative32 { bias: 0 },
+            )?;
+            let offset = state
+                .instruction
+                .get()
+                .checked_sub(state.source_start.get())?
+                .checked_add(u32::from(state.operand_offsets[op as usize]))?;
+            (insn.memory_base() == Register::RIP
+                && insn.flow_control() == FlowControl::Next
+                && reference.source == state.source
+                && reference.offset == offset
+                && matches!(reference.field, kamy_core::LinkField::Relative32 { .. }))
+            .then_some(kamy_core::OperandReference {
+                instruction: state.instruction,
+                operand: op,
+                reference,
+            })
+        });
+        match reference {
+            Some(reference) => references.push(reference),
+            None => state.unsupported = true,
+        }
+    }
+    if state.references.iter().any(|reference| {
+        reference.instruction == state.instruction && !references.contains(reference)
+    }) {
         state.unsupported = true;
     }
     if insn.rflags_read() != 0 {
@@ -44,8 +75,8 @@ pub(crate) fn native_inline_fallback(
         // a dependency SSA does not thread for a NativeInline: the flag-producing
         // instruction is then DCE'd and the flag the bytes read is garbage
         // (issue #23: bmi1_tzcnt's `cmp rcx,1; adc rcx,0` guard was dropped, so
-        // `tzcnt` saw 73 and returned 0). Reject; the function relocates verbatim
-        // with its flags intact (D22).
+        // `tzcnt` saw 73 and returned 0). Preserve residency rather than losing
+        // the incoming flag dependency (D22).
         state.unsupported = true;
     }
     let mut factory = InstructionInfoFactory::new();
@@ -76,11 +107,7 @@ pub(crate) fn native_inline_fallback(
         }
     }
 
-    // The raw bytes read fixed physical registers, so each read value must sit
-    // in its read register. Pin it there; if it is already pinned elsewhere (the
-    // same value aliased into two registers, e.g. after `mov rbx,rax`), copy it
-    // into a fresh value pinned to this register — one value cannot hold two
-    // pins. Reads are built before the native so the copies precede it.
+    // Constrain the native read, not the incoming definition's entire lifetime.
     let mut read_vals: Vec<ValueId> = Vec::with_capacity(reads.len());
     for r in &reads {
         let v = match r {
@@ -90,11 +117,7 @@ pub(crate) fn native_inline_fallback(
         };
         match state.reg_pins.get(&v).copied() {
             Some(p) if p == *r => read_vals.push(v),
-            None => {
-                state.reg_pins.insert(v, *r);
-                read_vals.push(v);
-            }
-            Some(_) => {
+            _ => {
                 let ty = match r {
                     PhysReg::Xmm(_) => IrType::I128,
                     _ => IrType::I64,
@@ -108,6 +131,7 @@ pub(crate) fn native_inline_fallback(
 
     let native = NativeInst {
         bytes: insn_bytes.to_vec(),
+        references,
         reads,
         writes: writes.clone(),
     };

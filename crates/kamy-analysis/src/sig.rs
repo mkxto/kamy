@@ -90,7 +90,10 @@ pub fn infer_signature(module: &Module, func: &Function) -> Option<FnSignature> 
 
     args_from_mask(live_in[entry_bi]).map(|args| {
         let mut sig = Win64Default::default_signature();
-        sig.args = args;
+        sig.args = args
+            .into_iter()
+            .map(kamy_core::ir::AbiValue::register)
+            .collect();
         sig
     })
 }

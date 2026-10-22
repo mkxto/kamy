@@ -16,7 +16,9 @@ pub use reloc::encode_base_relocations;
 pub use rewrite::ReferenceEdits;
 
 use anyhow::Context;
-use kamy_core::{Machine, Module, Relocation, Rva, Section, SectionFlags, Symbol, SymbolKind};
+use kamy_core::{
+    Machine, Module, Relocation, Rva, Section, SectionFlags, Symbol, SymbolId, SymbolKind,
+};
 
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
@@ -191,6 +193,9 @@ impl PeFile {
         let mut symbols = Vec::new();
         if self.entry_point != 0 {
             symbols.push(Symbol {
+                id: SymbolId::Host {
+                    rva: Rva::new(self.entry_point),
+                },
                 name: "__entry".to_string(),
                 rva: Rva::new(self.entry_point),
                 kind: SymbolKind::EntryPoint,
@@ -199,6 +204,9 @@ impl PeFile {
         for e in &self.exports {
             if let Some(name) = &e.name {
                 symbols.push(Symbol {
+                    id: SymbolId::Host {
+                        rva: Rva::new(e.rva),
+                    },
                     name: name.clone(),
                     rva: Rva::new(e.rva),
                     kind: SymbolKind::Export,
@@ -207,6 +215,9 @@ impl PeFile {
         }
         for i in &self.imports {
             symbols.push(Symbol {
+                id: SymbolId::Host {
+                    rva: Rva::new(i.iat_rva),
+                },
                 name: i.name.clone(),
                 rva: Rva::new(i.iat_rva),
                 kind: SymbolKind::Import,
@@ -268,6 +279,47 @@ impl PeFile {
         self.data_directories
             .get(index)
             .map(|&(rva, size)| (Rva::new(rva), size))
+    }
+
+    /// Reads a directory from an image emitted by this PE's rebuild, without reparsing it.
+    /// Directory 4's address is a file offset, not an RVA.
+    pub fn output_data_directory(
+        &self,
+        output: &[u8],
+        index: usize,
+    ) -> anyhow::Result<Option<(Rva, u32)>> {
+        let pe = read_u32(&self.bytes, 0x3c)? as usize;
+        anyhow::ensure!(
+            read_u32(output, 0x3c)? as usize == pe,
+            "rebuilt DOS header changed the PE header location"
+        );
+        anyhow::ensure!(
+            output.get(pe..pe + 4) == Some(b"PE\0\0".as_slice()),
+            "rebuilt output lacks its PE signature"
+        );
+        let optional = pe
+            .checked_add(24)
+            .context("rebuilt optional-header offset overflow")?;
+        anyhow::ensure!(
+            read_u16(output, optional)? == 0x20b,
+            "rebuilt output is not PE32+"
+        );
+        let count = read_u32(output, optional + 108)? as usize;
+        let size = usize::from(read_u16(output, pe + 20)?);
+        anyhow::ensure!(
+            size >= 112 && count <= MAX_DATA_DIRECTORIES && count <= (size - 112) / 8,
+            "rebuilt data-directory table has invalid bounds"
+        );
+        if index >= count {
+            return Ok(None);
+        }
+        let field = optional
+            .checked_add(112 + index * 8)
+            .context("rebuilt directory offset overflow")?;
+        Ok(Some((
+            Rva::new(read_u32(output, field)?),
+            read_u32(output, field + 4)?,
+        )))
     }
 
     pub fn is_dll(&self) -> bool {

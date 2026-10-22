@@ -1,5 +1,5 @@
 use iced_x86::Instruction;
-use kamy_core::ir::{Gpr, IrOp, IrType, ValueId, X86Flag};
+use kamy_core::ir::{Gpr, IrOp, IrType, PhysReg, ValueId, X86Flag};
 
 use crate::builder::IrBuilder;
 use crate::flags::{emit_arith_flags, emit_logic_flags, emit_shift_flags};
@@ -156,12 +156,11 @@ pub(crate) fn lift_ror(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState)
 }
 
 pub(crate) fn lift_mul(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
+    detach_implicit_gprs(b, s);
     let (src, ty) = read_operand(insn, 0, b, s);
     let rax = read_gpr_at_width(Gpr::Rax, ty, b, s);
-    let lo = b.emit(IrOp::Mul, &[rax, src], ty);
-    let hi = b.emit(IrOp::UMulHi, &[rax, src], ty);
-    write_gpr_at_width(Gpr::Rax, lo, ty, b, s);
-    write_gpr_at_width(Gpr::Rdx, hi, ty, b, s);
+    let (lo, hi) = emit_mul_pair(IrOp::UMulHi, rax, src, ty, b, s);
+    write_implicit_pair(lo, hi, ty, b, s);
 
     let hi_nz = b.emit(IrOp::IsZero, &[hi], IrType::I8);
     let cf = b.emit(IrOp::BoolNot, &[hi_nz], IrType::I8);
@@ -182,100 +181,45 @@ pub(crate) fn lift_imul(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState
 }
 
 fn lift_imul_1op(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
+    detach_implicit_gprs(b, s);
     let (src, ty) = read_operand(insn, 0, b, s);
     let rax = read_gpr_at_width(Gpr::Rax, ty, b, s);
-    let lo = b.emit(IrOp::Mul, &[rax, src], ty);
-    let hi = b.emit(IrOp::SMulHi, &[rax, src], ty);
-    write_gpr_at_width(Gpr::Rax, lo, ty, b, s);
-    write_gpr_at_width(Gpr::Rdx, hi, ty, b, s);
-
-    let hi_nz = b.emit(IrOp::IsZero, &[hi], IrType::I8);
-    let cf = b.emit(IrOp::BoolNot, &[hi_nz], IrType::I8);
-    s.set_flag(X86Flag::Cf, cf);
-    s.set_flag(X86Flag::Of, cf);
+    let (lo, hi) = emit_mul_pair(IrOp::SMulHi, rax, src, ty, b, s);
+    write_implicit_pair(lo, hi, ty, b, s);
+    emit_signed_mul_flags(lo, hi, ty, b, s);
     undef_flags(b, s, &[X86Flag::Zf, X86Flag::Sf, X86Flag::Pf, X86Flag::Af]);
 }
 
 fn lift_imul_2op(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
+    detach_implicit_gprs(b, s);
     let (a, ty) = read_operand(insn, 0, b, s);
     let (bv, _) = read_operand(insn, 1, b, s);
-    let result = b.emit(IrOp::Mul, &[a, bv], ty);
-
-    let hi = b.emit(IrOp::SMulHi, &[a, bv], ty);
-    let bits_m1 = b.emit(IrOp::Const((ty.bits() - 1) as u64), &[], ty);
-    let sign = b.emit(IrOp::Sar, &[result, bits_m1], ty);
-    let diff = b.emit(IrOp::Xor, &[hi, sign], ty);
-    let is_z = b.emit(IrOp::IsZero, &[diff], IrType::I8);
-    let cf = b.emit(IrOp::BoolNot, &[is_z], IrType::I8);
-    s.set_flag(X86Flag::Cf, cf);
-    s.set_flag(X86Flag::Of, cf);
+    let (result, hi) = emit_mul_pair(IrOp::SMulHi, a, bv, ty, b, s);
+    emit_signed_mul_flags(result, hi, ty, b, s);
     undef_flags(b, s, &[X86Flag::Zf, X86Flag::Sf, X86Flag::Pf, X86Flag::Af]);
 
     write_operand(insn, 0, result, ty, b, s);
 }
 
 fn lift_imul_3op(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
+    detach_implicit_gprs(b, s);
     let (_, ty) = read_operand(insn, 0, b, s);
     let (src, _) = read_operand(insn, 1, b, s);
     let imm = crate::get_immediate(insn, 2);
     let imm_val = b.emit(IrOp::Const(imm), &[], ty);
-    let result = b.emit(IrOp::Mul, &[src, imm_val], ty);
-
-    let hi = b.emit(IrOp::SMulHi, &[src, imm_val], ty);
-    let bits_m1 = b.emit(IrOp::Const((ty.bits() - 1) as u64), &[], ty);
-    let sign = b.emit(IrOp::Sar, &[result, bits_m1], ty);
-    let diff = b.emit(IrOp::Xor, &[hi, sign], ty);
-    let is_z = b.emit(IrOp::IsZero, &[diff], IrType::I8);
-    let cf = b.emit(IrOp::BoolNot, &[is_z], IrType::I8);
-    s.set_flag(X86Flag::Cf, cf);
-    s.set_flag(X86Flag::Of, cf);
+    let (result, hi) = emit_mul_pair(IrOp::SMulHi, src, imm_val, ty, b, s);
+    emit_signed_mul_flags(result, hi, ty, b, s);
     undef_flags(b, s, &[X86Flag::Zf, X86Flag::Sf, X86Flag::Pf, X86Flag::Af]);
 
     write_operand(insn, 0, result, ty, b, s);
 }
 
 pub(crate) fn lift_div(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
-    let (divisor, ty) = read_operand(insn, 0, b, s);
-    let rdx = read_gpr_at_width(Gpr::Rdx, ty, b, s);
-    let rax = read_gpr_at_width(Gpr::Rax, ty, b, s);
-    let quot = b.emit(IrOp::UDiv, &[rdx, rax, divisor], ty);
-    let rem = b.emit(IrOp::URem, &[rdx, rax, divisor], ty);
-    write_gpr_at_width(Gpr::Rax, quot, ty, b, s);
-    write_gpr_at_width(Gpr::Rdx, rem, ty, b, s);
-    undef_flags(
-        b,
-        s,
-        &[
-            X86Flag::Cf,
-            X86Flag::Of,
-            X86Flag::Zf,
-            X86Flag::Sf,
-            X86Flag::Pf,
-            X86Flag::Af,
-        ],
-    );
+    lift_division(insn, false, b, s);
 }
 
 pub(crate) fn lift_idiv(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
-    let (divisor, ty) = read_operand(insn, 0, b, s);
-    let rdx = read_gpr_at_width(Gpr::Rdx, ty, b, s);
-    let rax = read_gpr_at_width(Gpr::Rax, ty, b, s);
-    let quot = b.emit(IrOp::SDiv, &[rdx, rax, divisor], ty);
-    let rem = b.emit(IrOp::SRem, &[rdx, rax, divisor], ty);
-    write_gpr_at_width(Gpr::Rax, quot, ty, b, s);
-    write_gpr_at_width(Gpr::Rdx, rem, ty, b, s);
-    undef_flags(
-        b,
-        s,
-        &[
-            X86Flag::Cf,
-            X86Flag::Of,
-            X86Flag::Zf,
-            X86Flag::Sf,
-            X86Flag::Pf,
-            X86Flag::Af,
-        ],
-    );
+    lift_division(insn, true, b, s);
 }
 
 pub(crate) fn lift_mov(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState) {
@@ -423,6 +367,121 @@ pub(crate) fn lift_tzcnt(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftStat
     write_operand(insn, 0, result, ty, b, s);
 }
 
+fn detach_implicit_gprs(b: &mut IrBuilder, s: &mut LiftState) {
+    for gpr in [Gpr::Rax, Gpr::Rdx] {
+        let saved = b.emit(IrOp::Copy, &[s.get_gpr(gpr)], IrType::I64);
+        s.set_gpr(gpr, saved);
+    }
+}
+
+fn fixed_input(
+    value: ValueId,
+    gpr: Gpr,
+    ty: IrType,
+    b: &mut IrBuilder,
+    s: &mut LiftState,
+) -> ValueId {
+    let fixed = b.emit(IrOp::Copy, &[value], ty);
+    s.reg_pins.insert(fixed, PhysReg::Gpr(gpr));
+    fixed
+}
+
+fn emit_mul_pair(
+    op: IrOp,
+    lhs: ValueId,
+    rhs: ValueId,
+    ty: IrType,
+    b: &mut IrBuilder,
+    s: &mut LiftState,
+) -> (ValueId, ValueId) {
+    let lhs = b.emit(IrOp::Copy, &[lhs], ty);
+    let rhs = b.emit(IrOp::Copy, &[rhs], ty);
+    let lhs = fixed_input(lhs, Gpr::Rax, ty, b, s);
+    let high = b.emit(op, &[lhs, rhs], ty);
+    s.reg_pins.insert(high, PhysReg::Gpr(Gpr::Rdx));
+    let low = b.emit(IrOp::Mul, &[high], ty);
+    s.reg_pins.insert(low, PhysReg::Gpr(Gpr::Rax));
+    let low = b.emit(IrOp::Copy, &[low], ty);
+    let high = b.emit(IrOp::Copy, &[high], ty);
+    (low, high)
+}
+
+fn emit_signed_mul_flags(
+    lo: ValueId,
+    hi: ValueId,
+    ty: IrType,
+    b: &mut IrBuilder,
+    s: &mut LiftState,
+) {
+    let shift = b.emit(IrOp::Const((ty.bits() - 1) as u64), &[], ty);
+    let sign = b.emit(IrOp::Sar, &[lo, shift], ty);
+    let diff = b.emit(IrOp::Xor, &[hi, sign], ty);
+    let zero = b.emit(IrOp::IsZero, &[diff], IrType::I8);
+    let overflow = b.emit(IrOp::BoolNot, &[zero], IrType::I8);
+    s.set_flag(X86Flag::Cf, overflow);
+    s.set_flag(X86Flag::Of, overflow);
+}
+
+fn write_implicit_pair(lo: ValueId, hi: ValueId, ty: IrType, b: &mut IrBuilder, s: &mut LiftState) {
+    if ty == IrType::I8 {
+        let lo = b.emit(IrOp::Zext, &[lo], IrType::I16);
+        let hi = b.emit(IrOp::Zext, &[hi], IrType::I16);
+        let eight = b.emit(IrOp::Const(8), &[], IrType::I16);
+        let hi = b.emit(IrOp::Shl, &[hi, eight], IrType::I16);
+        let ax = b.emit(IrOp::Or, &[lo, hi], IrType::I16);
+        write_gpr_at_width(Gpr::Rax, ax, IrType::I16, b, s);
+    } else {
+        write_gpr_at_width(Gpr::Rax, lo, ty, b, s);
+        write_gpr_at_width(Gpr::Rdx, hi, ty, b, s);
+    }
+}
+
+fn lift_division(insn: &Instruction, signed: bool, b: &mut IrBuilder, s: &mut LiftState) {
+    detach_implicit_gprs(b, s);
+    let (divisor, ty) = read_operand(insn, 0, b, s);
+    let low = read_gpr_at_width(Gpr::Rax, ty, b, s);
+    let high = if ty == IrType::I8 {
+        let eight = b.emit(IrOp::Const(8), &[], IrType::I64);
+        let high = b.emit(IrOp::Shr, &[s.get_gpr(Gpr::Rax), eight], IrType::I64);
+        b.emit(IrOp::Trunc, &[high], IrType::I8)
+    } else {
+        read_gpr_at_width(Gpr::Rdx, ty, b, s)
+    };
+    // Snapshot every source before writing either fixed input, including cycles.
+    let high = b.emit(IrOp::Copy, &[high], ty);
+    let low = b.emit(IrOp::Copy, &[low], ty);
+    let divisor = b.emit(IrOp::Copy, &[divisor], ty);
+    let high = fixed_input(high, Gpr::Rdx, ty, b, s);
+    let low = fixed_input(low, Gpr::Rax, ty, b, s);
+    let quotient = b.emit(
+        if signed { IrOp::SDiv } else { IrOp::UDiv },
+        &[high, low, divisor],
+        ty,
+    );
+    s.reg_pins.insert(quotient, PhysReg::Gpr(Gpr::Rax));
+    let remainder = b.emit(
+        if signed { IrOp::SRem } else { IrOp::URem },
+        &[quotient],
+        ty,
+    );
+    s.reg_pins.insert(remainder, PhysReg::Gpr(Gpr::Rdx));
+    let quotient = b.emit(IrOp::Copy, &[quotient], ty);
+    let remainder = b.emit(IrOp::Copy, &[remainder], ty);
+    write_implicit_pair(quotient, remainder, ty, b, s);
+    undef_flags(
+        b,
+        s,
+        &[
+            X86Flag::Cf,
+            X86Flag::Of,
+            X86Flag::Zf,
+            X86Flag::Sf,
+            X86Flag::Pf,
+            X86Flag::Af,
+        ],
+    );
+}
+
 fn read_gpr_at_width(gpr: Gpr, ty: IrType, b: &mut IrBuilder, s: &LiftState) -> ValueId {
     let val = s.get_gpr(gpr);
     if ty == IrType::I64 {
@@ -444,5 +503,287 @@ fn undef_flags(b: &mut IrBuilder, s: &mut LiftState, flags: &[X86Flag]) {
     for &f in flags {
         let v = b.emit(IrOp::Undef, &[], IrType::I8);
         s.set_flag(f, v);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kamy_core::ir::{BlockId, IrBlock, IrFunction, IrTerminator};
+    use std::collections::HashMap;
+
+    fn lifted(
+        code: &[u8],
+        initial: [u64; 3],
+    ) -> (IrFunction, HashMap<ValueId, PhysReg>, [ValueId; 4]) {
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            next_value: 0,
+            blocks: vec![IrBlock {
+                id: BlockId(0),
+                phis: vec![],
+                insts: vec![],
+                term: IrTerminator::Ret,
+            }],
+        };
+        let (pins, outputs) = {
+            let mut builder = IrBuilder::new(&mut func, BlockId(0));
+            let mut state = LiftState::new_with_undefs(&mut builder, true);
+            for (gpr, value) in [Gpr::Rax, Gpr::Rdx, Gpr::Rcx].into_iter().zip(initial) {
+                let value = builder.emit(IrOp::Const(value), &[], IrType::I64);
+                state.set_gpr(gpr, value);
+            }
+            let instruction =
+                iced_x86::Decoder::new(64, code, iced_x86::DecoderOptions::NONE).decode();
+            match instruction.mnemonic() {
+                iced_x86::Mnemonic::Div => lift_div(&instruction, &mut builder, &mut state),
+                iced_x86::Mnemonic::Idiv => lift_idiv(&instruction, &mut builder, &mut state),
+                iced_x86::Mnemonic::Mul => lift_mul(&instruction, &mut builder, &mut state),
+                iced_x86::Mnemonic::Imul => lift_imul(&instruction, &mut builder, &mut state),
+                _ => unreachable!(),
+            }
+            (
+                state.reg_pins.clone(),
+                [
+                    state.get_gpr(Gpr::Rax),
+                    state.get_gpr(Gpr::Rdx),
+                    state.get_flag(X86Flag::Cf),
+                    state.get_flag(X86Flag::Of),
+                ],
+            )
+        };
+        (func, pins, outputs)
+    }
+
+    fn evaluate(func: &IrFunction) -> HashMap<ValueId, u64> {
+        let mut values: HashMap<ValueId, u64> = HashMap::new();
+        let mut types: HashMap<ValueId, u32> = HashMap::new();
+        let mut remainders: HashMap<ValueId, u64> = HashMap::new();
+        let mut low_products: HashMap<ValueId, u64> = HashMap::new();
+        for inst in &func.blocks[0].insts {
+            let Some(dest) = inst.dest else { continue };
+            let bits = inst.ty.bits().min(64);
+            let mask = u64::MAX >> (64 - bits);
+            let input = |index: usize| values[&inst.args[index]];
+            let value = match inst.op {
+                IrOp::Undef => 0,
+                IrOp::Const(value) => value,
+                IrOp::Copy | IrOp::Trunc => input(0),
+                IrOp::Zext => input(0) & (u64::MAX >> (64 - types[&inst.args[0]].min(64))),
+                IrOp::And => input(0) & input(1),
+                IrOp::Or => input(0) | input(1),
+                IrOp::Xor => input(0) ^ input(1),
+                IrOp::Shl => input(0) << input(1),
+                IrOp::Shr => input(0) >> input(1),
+                IrOp::Sar => {
+                    let signed = (i128::from(input(0)) << (128 - bits)) >> (128 - bits);
+                    (signed >> input(1)) as u64
+                }
+                IrOp::Mul if inst.args.len() == 1 => low_products[&inst.args[0]],
+                IrOp::Mul => input(0).wrapping_mul(input(1)),
+                IrOp::UMulHi | IrOp::SMulHi => {
+                    let signed = |value: u64| (i128::from(value) << (128 - bits)) >> (128 - bits);
+                    let product = if matches!(inst.op, IrOp::SMulHi) {
+                        (signed(input(0)) * signed(input(1))) as u128
+                    } else {
+                        u128::from(input(0)) * u128::from(input(1))
+                    };
+                    low_products.insert(dest, product as u64);
+                    (product >> bits) as u64
+                }
+                IrOp::UDiv | IrOp::SDiv => {
+                    let dividend = (u128::from(input(0)) << bits) | u128::from(input(1));
+                    let (quotient, remainder) = if matches!(inst.op, IrOp::UDiv) {
+                        (
+                            dividend / u128::from(input(2)),
+                            dividend % u128::from(input(2)),
+                        )
+                    } else {
+                        let dividend = if bits == 64 {
+                            dividend as i128
+                        } else {
+                            ((dividend << (128 - 2 * bits)) as i128) >> (128 - 2 * bits)
+                        };
+                        let divisor = (i128::from(input(2)) << (128 - bits)) >> (128 - bits);
+                        ((dividend / divisor) as u128, (dividend % divisor) as u128)
+                    };
+                    remainders.insert(dest, remainder as u64);
+                    quotient as u64
+                }
+                IrOp::URem | IrOp::SRem => remainders[&inst.args[0]],
+                IrOp::IsZero => u64::from(input(0) == 0),
+                IrOp::BoolNot => u64::from(input(0) == 0),
+                ref other => panic!("unexpected lifted arithmetic op {other:?}"),
+            };
+            values.insert(dest, value & mask);
+            types.insert(dest, inst.ty.bits());
+        }
+        values
+    }
+
+    #[test]
+    fn byte_division_uses_ax_and_preserves_rdx_and_upper_rax() {
+        let (func, _, outputs) = lifted(
+            &[0xf6, 0xf1],
+            [0xabcd_1234_5678_0064, 0xfedc_ba98_7654_3210, 7],
+        );
+        let values = evaluate(&func);
+        assert_eq!(values[&outputs[0]], 0xabcd_1234_5678_020e);
+        assert_eq!(values[&outputs[1]], 0xfedc_ba98_7654_3210);
+    }
+
+    #[test]
+    fn narrow_division_preserves_upper_halves_and_zero_extends_dword_results() {
+        for (code, initial, expected) in [
+            (
+                &[0x66, 0xf7, 0xf1][..],
+                [0xabcd_1234_5678_ffff, 0xfedc_ba98_7654_0000, 3],
+                [0xabcd_1234_5678_5555, 0xfedc_ba98_7654_0000],
+            ),
+            (
+                &[0xf7, 0xf1][..],
+                [0xabcd_1234_ffff_ffff, 0xfedc_ba98_0000_0000, 3],
+                [0x5555_5555, 0],
+            ),
+        ] {
+            let (func, _, outputs) = lifted(code, initial);
+            let values = evaluate(&func);
+            assert_eq!([values[&outputs[0]], values[&outputs[1]]], expected);
+        }
+    }
+
+    #[test]
+    fn byte_high_product_and_signed_overflow_use_full_product_sign_extension() {
+        for (code, initial, expected_ax, expected_overflow) in [
+            (&[0xf6, 0xe9][..], 0xff, 0xfffe, 0),
+            (&[0xf6, 0xe1][..], 0xff, 0x01fe, 1),
+            (&[0xf6, 0xe9][..], 0x7f, 0x00fe, 1),
+        ] {
+            let (func, _, outputs) = lifted(
+                code,
+                [0xabcd_1234_5678_0000 | initial, 0xfedc_ba98_7654_3210, 2],
+            );
+            let values = evaluate(&func);
+            assert_eq!(values[&outputs[0]], 0xabcd_1234_5678_0000 | expected_ax);
+            assert_eq!(values[&outputs[1]], 0xfedc_ba98_7654_3210);
+            assert_eq!(values[&outputs[2]], expected_overflow);
+            assert_eq!(values[&outputs[3]], expected_overflow);
+        }
+    }
+
+    #[test]
+    fn byte_divisor_and_multiplier_can_read_ah() {
+        for (code, initial, expected) in [
+            (&[0xf6, 0xfc][..], 0xfffe, 2),
+            (&[0xf6, 0xe4][..], 0x02ff, 0x01fe),
+            (&[0xf6, 0xec][..], 0x02ff, 0xfffe),
+        ] {
+            let (func, _, outputs) = lifted(
+                code,
+                [0xabcd_1234_5678_0000 | initial, 0xfedc_ba98_7654_3210, 0],
+            );
+            let values = evaluate(&func);
+            assert_eq!(values[&outputs[0]], 0xabcd_1234_5678_0000 | expected);
+            assert_eq!(values[&outputs[1]], 0xfedc_ba98_7654_3210);
+        }
+    }
+
+    #[test]
+    fn optimized_low_and_high_product_consumers_share_one_multiply() {
+        for prefix in [&[][..], &[0x66][..], &[0x48][..]] {
+            for opcode in [0xe1, 0xe9] {
+                for byte in [false, true] {
+                    if byte && !prefix.is_empty() {
+                        continue;
+                    }
+                    let mut code = prefix.to_vec();
+                    code.extend([if byte { 0xf6 } else { 0xf7 }, opcode]);
+                    let (mut func, pins, outputs) = lifted(&code, [u64::MAX, 0, 3]);
+                    func.blocks[0].insts.push(kamy_core::ir::Inst {
+                        dest: None,
+                        op: IrOp::Use,
+                        args: outputs.to_vec(),
+                        ty: IrType::I64,
+                    });
+                    kamy_transforms::optimize(&mut func);
+                    let high = func.blocks[0]
+                        .insts
+                        .iter()
+                        .find(|inst| matches!(inst.op, IrOp::UMulHi | IrOp::SMulHi))
+                        .unwrap();
+                    let low = func.blocks[0]
+                        .insts
+                        .iter()
+                        .find(|inst| matches!(inst.op, IrOp::Mul))
+                        .unwrap();
+                    assert_eq!(low.args, vec![high.dest.unwrap()]);
+                    let alloc = kamy_codegen::allocate_registers(
+                        &func,
+                        &kamy_codegen::CALLEE_SAVED_GPRS,
+                        &Default::default(),
+                        &pins,
+                    )
+                    .unwrap();
+                    let selected = kamy_codegen::select_instructions(&func, &alloc, 0, 0, &[], &[]);
+                    assert_eq!(
+                        selected
+                            .instructions
+                            .iter()
+                            .filter(|inst| matches!(
+                                inst.mnemonic(),
+                                iced_x86::Mnemonic::Mul | iced_x86::Mnemonic::Imul
+                            ))
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn optimized_remainder_only_and_dead_division_retain_single_faulting_operation() {
+        for remainder_used in [false, true] {
+            let (mut func, pins, outputs) = lifted(&[0x48, 0xf7, 0xf1], [u64::MAX, 0, 3]);
+            if remainder_used {
+                func.blocks[0].insts.push(kamy_core::ir::Inst {
+                    dest: None,
+                    op: IrOp::Use,
+                    args: vec![outputs[1]],
+                    ty: IrType::I64,
+                });
+            }
+            kamy_transforms::optimize(&mut func);
+            let division = func.blocks[0]
+                .insts
+                .iter()
+                .filter(|inst| matches!(inst.op, IrOp::UDiv))
+                .collect::<Vec<_>>();
+            assert_eq!(division.len(), 1);
+            if remainder_used {
+                let remainder = func.blocks[0]
+                    .insts
+                    .iter()
+                    .find(|inst| matches!(inst.op, IrOp::URem))
+                    .unwrap();
+                assert_eq!(remainder.args, vec![division[0].dest.unwrap()]);
+            }
+            let alloc = kamy_codegen::allocate_registers(
+                &func,
+                &kamy_codegen::CALLEE_SAVED_GPRS,
+                &Default::default(),
+                &pins,
+            )
+            .unwrap();
+            let selected = kamy_codegen::select_instructions(&func, &alloc, 0, 0, &[], &[]);
+            assert_eq!(
+                selected
+                    .instructions
+                    .iter()
+                    .filter(|inst| inst.mnemonic() == iced_x86::Mnemonic::Div)
+                    .count(),
+                1
+            );
+        }
     }
 }

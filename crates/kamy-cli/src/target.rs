@@ -1,18 +1,20 @@
-//! Resolve configuration [`SymbolSelector`]s to the concrete function RVAs they
-//! name, using the PDB/export/`sub_<rva>` labels. This is the bridge from a
-//! profile's `symbols:` list to a [`FunctionSelector`] / per-function targeting.
+//! Resolve profile selectors against source-qualified function metadata.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use anyhow::Context as _;
 use kamy_analysis::CallGraph;
-use kamy_config::{Group, SymbolSelector};
-use kamy_core::Rva;
+use kamy_config::{Config, Group, SymbolSelector};
+use kamy_core::{Rva, SymbolId};
 
-/// Match a `*`/`?` wildcard `pattern` against `text` (`*` any run, `?` one
-/// char). No character classes — the config patterns are simple globs.
+pub(crate) struct Entry {
+    pub(crate) symbol: SymbolId,
+    pub(crate) name: String,
+}
+
+/// Match `*` (any run) and `?` (one character), without character classes.
 pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
-    // Iterative wildcard match with backtracking on the last `*`.
     let (mut pi, mut ti) = (0usize, 0usize);
     let (mut star, mut mark): (Option<usize>, usize) = (None, 0);
     while ti < t.len() {
@@ -37,71 +39,162 @@ pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-/// Resolves selectors against host labels and qualified plugin symbol names.
-pub(crate) fn resolve_targets(
-    selectors: &[SymbolSelector],
-    entries: &[(Rva, String)],
-    groups: &[Group],
+pub(crate) fn profile_owners(
+    cfg: &Config,
+    entries: &[Entry],
     cg: &CallGraph,
-) -> HashSet<Rva> {
-    let mut out = HashSet::new();
-    let mut active: HashSet<String> = HashSet::new();
-    resolve_into(selectors, entries, groups, cg, &mut active, &mut out);
-    out
+    image_base: u64,
+) -> anyhow::Result<BTreeMap<SymbolId, usize>> {
+    let excluded: BTreeSet<_> = entries
+        .iter()
+        .filter(|entry| {
+            cfg.exclude
+                .iter()
+                .any(|rule| glob_match(&rule.pattern, &entry.name))
+        })
+        .map(|entry| entry.symbol.clone())
+        .collect();
+    let mut owners = BTreeMap::new();
+    for (index, profile) in cfg.profiles.iter().enumerate() {
+        let targets = if profile.symbols.is_empty() {
+            entries.iter().map(|entry| entry.symbol.clone()).collect()
+        } else {
+            resolve_targets(&profile.symbols, entries, &cfg.groups, cg, image_base)
+                .with_context(|| format!("selecting profile {:?}", profile.name))?
+        };
+        for symbol in targets {
+            if !excluded.contains(&symbol) {
+                owners.entry(symbol).or_insert(index);
+            }
+        }
+    }
+    Ok(owners)
 }
 
-/// Recursive core; `active` guards against `!Group` reference cycles.
-fn resolve_into(
+pub(crate) fn resolve_targets(
     selectors: &[SymbolSelector],
-    entries: &[(Rva, String)],
+    entries: &[Entry],
     groups: &[Group],
     cg: &CallGraph,
+    image_base: u64,
+) -> anyhow::Result<BTreeSet<SymbolId>> {
+    let mut out = BTreeSet::new();
+    let mut active = HashSet::new();
+    let context = TargetContext {
+        entries,
+        groups,
+        cg,
+        image_base,
+    };
+    resolve_into(selectors, &context, &mut active, &mut out)?;
+    Ok(out)
+}
+
+struct TargetContext<'a> {
+    entries: &'a [Entry],
+    groups: &'a [Group],
+    cg: &'a CallGraph,
+    image_base: u64,
+}
+
+fn resolve_into(
+    selectors: &[SymbolSelector],
+    context: &TargetContext<'_>,
     active: &mut HashSet<String>,
-    out: &mut HashSet<Rva>,
-) {
-    for sel in selectors {
-        match sel {
+    out: &mut BTreeSet<SymbolId>,
+) -> anyhow::Result<()> {
+    let entries = context.entries;
+    let groups = context.groups;
+    let cg = context.cg;
+    let image_base = context.image_base;
+    for selector in selectors {
+        match selector {
             SymbolSelector::Name(name) => {
-                for (rva, lbl) in entries {
-                    if lbl == name {
-                        out.insert(*rva);
-                    }
-                }
+                out.extend(
+                    entries
+                        .iter()
+                        .filter(|entry| &entry.name == name)
+                        .map(|entry| entry.symbol.clone()),
+                );
             }
-            SymbolSelector::Pattern(pat) => {
-                for (rva, lbl) in entries {
-                    if glob_match(pat, lbl) {
-                        out.insert(*rva);
-                    }
-                }
+            SymbolSelector::Pattern(pattern) => {
+                out.extend(
+                    entries
+                        .iter()
+                        .filter(|entry| glob_match(pattern, &entry.name))
+                        .map(|entry| entry.symbol.clone()),
+                );
             }
-            SymbolSelector::Address(addr) => {
-                let rva = Rva::new(*addr as u32);
-                if entries.iter().any(|(entry, _)| *entry == rva) {
-                    out.insert(rva);
-                }
+            SymbolSelector::Address(address) => {
+                let rva = u32::try_from(*address).ok().map(Rva::new);
+                let va_rva = address
+                    .checked_sub(image_base)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .map(Rva::new);
+                anyhow::ensure!(
+                    rva.is_some() || va_rva.is_some(),
+                    "!Address {address:#x} is outside the host RVA/VA range"
+                );
+                let matches: BTreeSet<_> = entries
+                    .iter()
+                    .filter(|entry| match &entry.symbol {
+                        SymbolId::Host { rva: source } => {
+                            Some(*source) == rva || Some(*source) == va_rva
+                        }
+                        _ => false,
+                    })
+                    .map(|entry| entry.symbol.clone())
+                    .collect();
+                anyhow::ensure!(
+                    matches.len() <= 1,
+                    "!Address {address:#x} is ambiguous between a host RVA and VA"
+                );
+                out.extend(matches);
             }
             SymbolSelector::TopXref(n) => {
                 for (rva, _) in cg.top_xref(*n) {
-                    out.insert(rva);
+                    let symbol = SymbolId::Host { rva };
+                    if entries.iter().any(|entry| entry.symbol == symbol) {
+                        out.insert(symbol);
+                    }
                 }
             }
             SymbolSelector::Group(name) => {
                 if !active.insert(name.clone()) {
                     continue;
                 }
-                if let Some(g) = groups.iter().find(|g| &g.name == name) {
-                    resolve_into(&g.symbols, entries, groups, cg, active, out);
+                if let Some(group) = groups.iter().find(|group| &group.name == name) {
+                    resolve_into(&group.symbols, context, active, out)?;
                 }
                 active.remove(name);
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BASE: u64 = 0x1_4000_0000;
+
+    fn host(rva: u32, name: &str) -> Entry {
+        Entry {
+            symbol: SymbolId::Host { rva: Rva::new(rva) },
+            name: name.into(),
+        }
+    }
+
+    fn authored(plugin: &str, symbol: &str) -> Entry {
+        Entry {
+            symbol: SymbolId::Authored {
+                module: plugin.into(),
+                symbol: symbol.into(),
+            },
+            name: format!("{plugin}::{symbol}"),
+        }
+    }
 
     #[test]
     fn glob_matches_prefix_and_middle() {
@@ -114,79 +207,128 @@ mod tests {
     }
 
     #[test]
-    fn resolves_name_pattern_and_address() {
-        let label = |rva: Rva| match rva.get() {
-            0x1000 => "main".to_string(),
-            0x1040 => "helper_a".to_string(),
-            other => format!("sub_{other:x}"),
-        };
-        let entries: Vec<_> = [0x1000, 0x1040, 0x2000]
-            .into_iter()
-            .map(Rva::new)
-            .map(|rva| (rva, label(rva)))
-            .collect();
-        let sels = vec![
+    fn resolves_host_names_patterns_rvas_and_vas() {
+        let entries = [
+            host(0x1000, "main"),
+            host(0x1040, "helper_a"),
+            host(0x2000, "sub_2000"),
+        ];
+        let selectors = [
             SymbolSelector::Name("main".into()),
             SymbolSelector::Pattern("helper_*".into()),
-            SymbolSelector::Address(0x2000),
+            SymbolSelector::Address(BASE + 0x2000),
         ];
-        let got = resolve_targets(&sels, &entries, &[], &CallGraph::default());
-        let expected: HashSet<Rva> = [0x1000, 0x1040, 0x2000].into_iter().map(Rva::new).collect();
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn sub_rva_label_matched_without_pdb() {
-        let label = |rva: Rva| format!("sub_{:x}", rva.get());
-        let entries: Vec<_> = [0x1000, 0x2000]
-            .into_iter()
-            .map(Rva::new)
-            .map(|rva| (rva, label(rva)))
-            .collect();
-        // Pattern targeting still works with the fallback labels.
+        let got = resolve_targets(&selectors, &entries, &[], &CallGraph::default(), BASE).unwrap();
+        assert_eq!(
+            got,
+            entries.iter().map(|entry| entry.symbol.clone()).collect()
+        );
         let got = resolve_targets(
-            &[SymbolSelector::Pattern("sub_2*".into())],
+            &[SymbolSelector::Address(0x1000)],
             &entries,
             &[],
             &CallGraph::default(),
-        );
-        assert_eq!(got, [Rva::new(0x2000)].into_iter().collect());
+            BASE,
+        )
+        .unwrap();
+        assert_eq!(got, [entries[0].symbol.clone()].into_iter().collect());
     }
 
     #[test]
-    fn group_selector_expands_and_guards_cycles() {
-        let label = |rva: Rva| match rva.get() {
-            0x1000 => "main".to_string(),
-            other => format!("sub_{other:x}"),
-        };
-        let entries: Vec<_> = [0x1000, 0x2000]
-            .into_iter()
-            .map(Rva::new)
-            .map(|rva| (rva, label(rva)))
-            .collect();
-        let groups = vec![
-            Group {
-                name: "a".into(),
-                symbols: vec![
-                    SymbolSelector::Name("main".into()),
-                    SymbolSelector::Group("b".into()),
-                ],
-            },
-            // `b` references `a` back: the cycle guard must terminate.
-            Group {
-                name: "b".into(),
-                symbols: vec![
-                    SymbolSelector::Pattern("sub_2*".into()),
-                    SymbolSelector::Group("a".into()),
-                ],
-            },
+    fn qualified_targets_do_not_collide_with_host_or_other_modules() {
+        let entries = [
+            host(0x1000, "same"),
+            authored("first", "same"),
+            authored("second", "same"),
         ];
         let got = resolve_targets(
-            &[SymbolSelector::Group("a".into())],
+            &[SymbolSelector::Name("first::same".into())],
             &entries,
-            &groups,
+            &[],
             &CallGraph::default(),
+            BASE,
+        )
+        .unwrap();
+        assert_eq!(got, [entries[1].symbol.clone()].into_iter().collect());
+        let got = resolve_targets(
+            &[SymbolSelector::Address(0x1000)],
+            &entries,
+            &[],
+            &CallGraph::default(),
+            BASE,
+        )
+        .unwrap();
+        assert_eq!(got, [entries[0].symbol.clone()].into_iter().collect());
+    }
+
+    #[test]
+    fn numeric_boundaries_never_truncate_or_select_modules() {
+        let entries = [
+            host(0x1000, "host"),
+            host(u32::MAX, "last"),
+            authored("p", "local_1000"),
+        ];
+        for address in [0x1_0000_1000, u64::MAX, BASE + u64::from(u32::MAX) + 1] {
+            assert!(
+                resolve_targets(
+                    &[SymbolSelector::Address(address)],
+                    &entries,
+                    &[],
+                    &CallGraph::default(),
+                    BASE
+                )
+                .is_err()
+            );
+        }
+        for address in [u64::from(u32::MAX), BASE + u64::from(u32::MAX)] {
+            let got = resolve_targets(
+                &[SymbolSelector::Address(address)],
+                &entries,
+                &[],
+                &CallGraph::default(),
+                BASE,
+            )
+            .unwrap();
+            assert_eq!(got, [entries[1].symbol.clone()].into_iter().collect());
+        }
+        let modules = [authored("p", "local_1000")];
+        assert!(
+            resolve_targets(
+                &[SymbolSelector::Address(0x1000)],
+                &modules,
+                &[],
+                &CallGraph::default(),
+                BASE
+            )
+            .unwrap()
+            .is_empty()
         );
-        assert_eq!(got, [0x1000, 0x2000].into_iter().map(Rva::new).collect());
+        let ambiguous = [host(0x1000, "rva"), host(0x800, "va")];
+        assert!(
+            resolve_targets(
+                &[SymbolSelector::Address(0x1000)],
+                &ambiguous,
+                &[],
+                &CallGraph::default(),
+                0x800
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn groups_preserve_first_profile_ownership_and_exclusions_win() {
+        let entries = [
+            host(0x1000, "main"),
+            authored("p", "same"),
+            authored("q", "same"),
+        ];
+        let cfg = Config::from_yaml_str(
+            "version: '1'\nprofiles:\n- name: first\n  symbols: [!Group shared]\n- name: second\n  symbols: [!Pattern '*']\ngroups:\n- name: shared\n  symbols: [!Name main, !Name 'p::same', !Group cycle]\n- name: cycle\n  symbols: [!Group shared]\nexclude:\n- pattern: 'p::*'\n",
+        ).unwrap();
+        let owners = profile_owners(&cfg, &entries, &CallGraph::default(), BASE).unwrap();
+        assert_eq!(owners.get(&entries[0].symbol), Some(&0));
+        assert!(!owners.contains_key(&entries[1].symbol));
+        assert_eq!(owners.get(&entries[2].symbol), Some(&1));
     }
 }

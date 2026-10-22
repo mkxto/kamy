@@ -1,5 +1,5 @@
 use iced_x86::{Instruction, OpKind};
-use kamy_core::ir::{CallingConvLookup, Gpr, IrOp, IrType, PhysReg, ValueId, X86Flag};
+use kamy_core::ir::{CallingConvLookup, Gpr, IrOp, IrType, PhysReg, ValueId};
 
 use crate::builder::IrBuilder;
 use crate::cond::decode_condition;
@@ -20,10 +20,10 @@ pub(crate) fn lift_push(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState
             let addr = compute_mem_addr(insn, b, s);
             b.emit(IrOp::Load, &[addr], IrType::I64)
         }
-        _ => {
-            let imm = crate::get_immediate(insn, 0);
-            b.emit(IrOp::Const(imm), &[], IrType::I64)
-        }
+        _ => match s.operand_reference(0) {
+            Some(reference) => b.emit(IrOp::Address(reference), &[], IrType::I64),
+            None => b.emit(IrOp::Const(crate::get_immediate(insn, 0)), &[], IrType::I64),
+        },
     };
 
     let rsp = s.get_gpr(Gpr::Rsp);
@@ -42,6 +42,106 @@ pub(crate) fn lift_pop(insn: &Instruction, b: &mut IrBuilder, s: &mut LiftState)
     write_operand(insn, 0, val, IrType::I64, b, s);
 }
 
+fn pin_argument(phys: PhysReg, b: &mut IrBuilder, s: &mut LiftState) -> ValueId {
+    let value = match phys {
+        PhysReg::Gpr(g) => s.get_gpr(g),
+        PhysReg::Xmm(x) => s.get_xmm(x),
+        PhysReg::Flag(f) => s.get_flag(f),
+    };
+    if s.reg_pins.get(&value) == Some(&phys) {
+        return value;
+    }
+    let value = b.emit(IrOp::Copy, &[value], register_type(phys));
+    s.reg_pins.insert(value, phys);
+    value
+}
+
+fn register_type(phys: PhysReg) -> IrType {
+    match phys {
+        PhysReg::Gpr(_) => IrType::I64,
+        PhysReg::Xmm(_) => IrType::I128,
+        PhysReg::Flag(_) => IrType::I8,
+    }
+}
+
+fn call_arguments(
+    sig: &kamy_core::ir::FnSignature,
+    b: &mut IrBuilder,
+    s: &mut LiftState,
+) -> Vec<ValueId> {
+    let mut args = Vec::with_capacity(sig.args.len());
+    for arg in &sig.args {
+        match arg.location {
+            kamy_core::ir::AbiLocation::Register(phys) => args.push(pin_argument(phys, b, s)),
+            kamy_core::ir::AbiLocation::Stack { .. } => {
+                if !args.contains(&s.get_gpr(Gpr::Rsp)) {
+                    args.push(s.get_gpr(Gpr::Rsp));
+                }
+            }
+        }
+    }
+    args
+}
+
+fn set_register(phys: PhysReg, value: ValueId, s: &mut LiftState) {
+    match phys {
+        PhysReg::Gpr(g) => s.set_gpr(g, value),
+        PhysReg::Xmm(x) => s.set_xmm(x, value),
+        PhysReg::Flag(f) => s.set_flag(f, value),
+    }
+}
+
+fn call_results(sig: &kamy_core::ir::FnSignature, b: &mut IrBuilder, s: &mut LiftState) {
+    if sig.noreturn {
+        s.noreturn = true;
+        return;
+    }
+    for &phys in &sig.clobbers {
+        if sig
+            .returns
+            .iter()
+            .any(|result| result.register_location() == Some(phys))
+        {
+            continue;
+        }
+        let value = b.emit(IrOp::Undef, &[], register_type(phys));
+        set_register(phys, value, s);
+    }
+    for result in &sig.returns {
+        let Some(phys) = result.register_location() else {
+            s.unsupported = true;
+            continue;
+        };
+        let value = b.emit(
+            IrOp::CallResult { register: phys },
+            &[],
+            register_type(phys),
+        );
+        set_register(phys, value, s);
+        s.reg_pins.insert(value, phys);
+    }
+}
+
+fn call_signature(
+    target: u64,
+    reference: Option<&kamy_core::Reference>,
+    cc: &dyn CallingConvLookup,
+    s: &mut LiftState,
+) -> Option<kamy_core::ir::FnSignature> {
+    let sig = if s.authored() {
+        reference.and_then(|reference| match &reference.expression {
+            kamy_core::SymbolicExpression::Symbol { symbol, addend: 0 } => cc.lookup_symbol(symbol),
+            _ => None,
+        })
+    } else {
+        cc.lookup(target)
+    };
+    if sig.is_none() {
+        s.unsupported = true;
+    }
+    sig
+}
+
 pub(crate) fn lift_call(
     _insn: &Instruction,
     target: u64,
@@ -49,83 +149,25 @@ pub(crate) fn lift_call(
     s: &mut LiftState,
     cc: &dyn CallingConvLookup,
 ) {
-    let sig = cc.lookup(target);
-
-    let mut arg_vals = Vec::new();
-    if let Some(sig) = &sig {
-        for phys in &sig.args {
-            let v = match phys {
-                PhysReg::Gpr(g) => s.get_gpr(*g),
-                PhysReg::Xmm(x) => s.get_xmm(*x),
-                PhysReg::Flag(f) => s.get_flag(*f),
-            };
-            // The value must sit in its ABI argument register at the call. Pin it
-            // there, or copy first when it is already bound elsewhere (another arg
-            // register, an RSP-chain value, or a prior pin).
-            let arg = if matches!(phys, PhysReg::Flag(_)) || s.reg_pins.get(&v) == Some(phys) {
-                v
-            } else if s.reg_pins.contains_key(&v) || s.rsp_chain.contains(&v) {
-                let ty = if matches!(phys, PhysReg::Xmm(_)) {
-                    IrType::I128
-                } else {
-                    IrType::I64
-                };
-                let c = b.emit(IrOp::Copy, &[v], ty);
-                s.reg_pins.insert(c, *phys);
-                c
-            } else {
-                s.reg_pins.insert(v, *phys);
-                v
-            };
-            arg_vals.push(arg);
-        }
-    }
-
-    // A balanced CALL/RET leaves RSP unchanged: the hardware CALL pushes the
-    // return address and the callee's RET pops it. Materializing that push made
-    // the pre-call RSP a second chain value live across the call, which the
-    // allocator cannot keep in RSP alongside the push slot (it spilled RSP to a
-    // GPR, corrupting the frame).
-    let call_ret = b.emit(IrOp::Call { target }, &arg_vals, IrType::I64);
-
-    if let Some(sig) = &sig {
-        if let Some(ret_reg) = sig.ret {
-            match ret_reg {
-                PhysReg::Gpr(g) => {
-                    s.set_gpr(g, call_ret);
-                    s.reg_pins.insert(call_ret, PhysReg::Gpr(g));
-                }
-                PhysReg::Xmm(x) => {
-                    s.set_xmm(x, call_ret);
-                    s.reg_pins.insert(call_ret, PhysReg::Xmm(x));
-                }
-                PhysReg::Flag(_) => {}
-            }
-        }
-
-        for phys in &sig.clobbers {
-            let already_set = sig.ret == Some(*phys);
-            if already_set {
-                continue;
-            }
-            match phys {
-                PhysReg::Gpr(g) => {
-                    let v = b.emit(IrOp::Undef, &[], IrType::I64);
-                    s.set_gpr(*g, v);
-                }
-                PhysReg::Xmm(x) => {
-                    let v = b.emit(IrOp::Undef, &[], IrType::I128);
-                    s.set_xmm(*x, v);
-                }
-                PhysReg::Flag(_) => {}
-            }
-        }
-    }
-
-    for f in X86Flag::ALL {
-        let v = b.emit(IrOp::Undef, &[], IrType::I8);
-        s.set_flag(f, v);
-    }
+    let Some(reference) =
+        s.address_reference(0, target, kamy_core::LinkField::Relative32 { bias: 0 })
+    else {
+        s.unsupported = true;
+        return;
+    };
+    let Some(sig) = call_signature(target, Some(&reference), cc, s) else {
+        return;
+    };
+    let args = call_arguments(&sig, b, s);
+    b.emit_void(
+        IrOp::Call {
+            target: reference,
+            clobbers: sig.clobbers.clone(),
+        },
+        &args,
+        IrType::I64,
+    );
+    call_results(&sig, b, s);
 }
 
 pub(crate) fn lift_call_indirect(
@@ -135,109 +177,76 @@ pub(crate) fn lift_call_indirect(
     s: &mut LiftState,
     cc: &dyn CallingConvLookup,
 ) {
-    // A `call [rip+slot]` into a resolved import slot carries a precise
-    // signature (fewer argument pins); register-indirect and unresolved targets
-    // pass 0 and fall back to the Win64 default over-approximation — always
-    // sound, never under-approximating the clobber set.
-    let sig = cc.lookup(slot_va.unwrap_or(0));
-
-    let mut arg_vals = Vec::new();
-    if let Some(sig) = &sig {
-        for phys in &sig.args {
-            let v = match phys {
-                PhysReg::Gpr(g) => s.get_gpr(*g),
-                PhysReg::Xmm(x) => s.get_xmm(*x),
-                PhysReg::Flag(f) => s.get_flag(*f),
-            };
-            let arg = if matches!(phys, PhysReg::Flag(_)) || s.reg_pins.get(&v) == Some(phys) {
-                v
-            } else if s.reg_pins.contains_key(&v) || s.rsp_chain.contains(&v) {
-                let ty = if matches!(phys, PhysReg::Xmm(_)) {
-                    IrType::I128
-                } else {
-                    IrType::I64
-                };
-                let c = b.emit(IrOp::Copy, &[v], ty);
-                s.reg_pins.insert(c, *phys);
-                c
-            } else {
-                s.reg_pins.insert(v, *phys);
-                v
-            };
-            arg_vals.push(arg);
-        }
-    }
-
-    // The call reads the target after the argument setup, so park it in R11 —
-    // volatile, never a Win64 argument register. Copy first if already bound.
-    let target = if s.reg_pins.contains_key(&target_val) || s.rsp_chain.contains(&target_val) {
-        let c = b.emit(IrOp::Copy, &[target_val], IrType::I64);
-        s.reg_pins.insert(c, PhysReg::Gpr(Gpr::R11));
-        c
-    } else {
-        s.reg_pins.insert(target_val, PhysReg::Gpr(Gpr::R11));
-        target_val
+    let reference = s.operand_reference(0);
+    let Some(sig) = call_signature(slot_va.unwrap_or(0), reference.as_ref(), cc, s) else {
+        return;
     };
-
-    let mut call_args = Vec::with_capacity(arg_vals.len() + 1);
+    let args = call_arguments(&sig, b, s);
+    let target = b.emit(IrOp::Copy, &[target_val], IrType::I64);
+    s.reg_pins.insert(target, PhysReg::Gpr(Gpr::R11));
+    let mut call_args = Vec::with_capacity(args.len() + 1);
     call_args.push(target);
-    call_args.extend(arg_vals);
-    let call_ret = b.emit(IrOp::CallIndirect, &call_args, IrType::I64);
+    call_args.extend(args);
+    b.emit_void(
+        IrOp::CallIndirect {
+            clobbers: sig.clobbers.clone(),
+        },
+        &call_args,
+        IrType::I64,
+    );
+    call_results(&sig, b, s);
+}
 
-    if let Some(sig) = &sig {
-        if let Some(ret_reg) = sig.ret {
-            match ret_reg {
-                PhysReg::Gpr(g) => {
-                    s.set_gpr(g, call_ret);
-                    s.reg_pins.insert(call_ret, PhysReg::Gpr(g));
-                }
-                PhysReg::Xmm(x) => {
-                    s.set_xmm(x, call_ret);
-                    s.reg_pins.insert(call_ret, PhysReg::Xmm(x));
-                }
-                PhysReg::Flag(_) => {}
-            }
+fn pin_live_out(phys: PhysReg, b: &mut IrBuilder, s: &mut LiftState) {
+    let input = match phys {
+        PhysReg::Gpr(g) => s.get_gpr(g),
+        PhysReg::Xmm(x) => s.get_xmm(x),
+        PhysReg::Flag(f) => s.get_flag(f),
+    };
+    let value = b.emit(IrOp::Copy, &[input], register_type(phys));
+    s.reg_pins.insert(value, phys);
+    b.emit_void(IrOp::Use, &[value], register_type(phys));
+}
+
+fn preserve_authored_registers(b: &mut IrBuilder, s: &mut LiftState, include_rax: bool) {
+    if s.signature.is_none() {
+        return;
+    }
+    for gpr in Gpr::ALL {
+        if !gpr.is_volatile_win64() || (!include_rax && gpr == Gpr::Rax) {
+            continue;
         }
-        for phys in &sig.clobbers {
-            if sig.ret == Some(*phys) {
-                continue;
-            }
-            match phys {
-                PhysReg::Gpr(g) => {
-                    let v = b.emit(IrOp::Undef, &[], IrType::I64);
-                    s.set_gpr(*g, v);
-                }
-                PhysReg::Xmm(x) => {
-                    let v = b.emit(IrOp::Undef, &[], IrType::I128);
-                    s.set_xmm(*x, v);
-                }
-                PhysReg::Flag(_) => {}
-            }
+        let phys = PhysReg::Gpr(gpr);
+        if s.signature
+            .is_some_and(|signature| !signature.clobbers.contains(&phys))
+        {
+            pin_live_out(phys, b, s);
         }
     }
-
-    for f in X86Flag::ALL {
-        let v = b.emit(IrOp::Undef, &[], IrType::I8);
-        s.set_flag(f, v);
+    for xmm in kamy_core::ir::XmmReg::ALL.iter().take(6) {
+        let phys = PhysReg::Xmm(*xmm);
+        if s.signature
+            .is_some_and(|signature| !signature.clobbers.contains(&phys))
+        {
+            pin_live_out(phys, b, s);
+        }
     }
 }
 
 pub(crate) fn lift_ret(b: &mut IrBuilder, s: &mut LiftState) {
-    // The hardware RET pops the return address and adds 8 to RSP; modeling that
-    // here double-counts the adjustment and makes RET read past the saved
-    // return address.
-    //
-    // Return value goes in RAX: pin it there, or copy first when it is already
-    // bound to another physical register (e.g. an argument passed straight
-    // through, or an RSP-chain value). RSP live-out keeps the frame teardown.
-    let rax_value = s.get_gpr(Gpr::Rax);
-    let ret_val = if s.reg_pins.contains_key(&rax_value) || s.rsp_chain.contains(&rax_value) {
-        b.emit(IrOp::Copy, &[rax_value], IrType::I64)
-    } else {
-        rax_value
-    };
-    s.reg_pins.insert(ret_val, PhysReg::Gpr(Gpr::Rax));
-    b.emit_void(IrOp::Use, &[ret_val], IrType::I64);
+    let count = s.signature.as_ref().map_or(1, |sig| sig.returns.len());
+    for index in 0..count {
+        let phys = match s.signature.as_ref() {
+            Some(sig) => sig.returns[index].register_location(),
+            None => Some(PhysReg::Gpr(Gpr::Rax)),
+        };
+        let Some(phys) = phys else {
+            s.unsupported = true;
+            continue;
+        };
+        pin_live_out(phys, b, s);
+    }
+    preserve_authored_registers(b, s, true);
     b.emit_void(IrOp::Use, &[s.get_gpr(Gpr::Rsp)], IrType::I64);
 }
 
@@ -251,50 +260,34 @@ pub(crate) fn lift_tail_call(
     // own RET, returns to our caller. Keep the argument values live in their ABI
     // registers across the jump (mirroring a call's pinning) and keep RSP live so
     // the frame teardown survives DCE.
-    if let Some(sig) = cc.lookup(target) {
-        for phys in &sig.args {
-            if matches!(phys, PhysReg::Flag(_)) {
+    let Some(reference) =
+        s.address_reference(0, target, kamy_core::LinkField::Relative32 { bias: 0 })
+    else {
+        s.unsupported = true;
+        return;
+    };
+    if let Some(sig) = call_signature(target, Some(&reference), cc, s) {
+        for value in &sig.args {
+            let Some(phys) = value.register_location() else {
                 continue;
-            }
-            let v = match phys {
-                PhysReg::Gpr(g) => s.get_gpr(*g),
-                PhysReg::Xmm(x) => s.get_xmm(*x),
-                PhysReg::Flag(f) => s.get_flag(*f),
             };
-            // Copy before pinning so the pin lands on a fresh value defined in
-            // this block. A block-entry register placeholder is pre-pinned, but
-            // construct_ssa rewrites it to a phi at a merge tail block, dropping
-            // the pin (dead key) — the copy's dest survives that rewrite.
-            let arg = if s.reg_pins.contains_key(&v) || s.rsp_chain.contains(&v) {
-                let ty = if matches!(phys, PhysReg::Xmm(_)) {
-                    IrType::I128
-                } else {
-                    IrType::I64
-                };
-                let c = b.emit(IrOp::Copy, &[v], ty);
-                s.reg_pins.insert(c, *phys);
-                c
-            } else {
-                s.reg_pins.insert(v, *phys);
-                v
+            let input = match phys {
+                PhysReg::Gpr(g) => s.get_gpr(g),
+                PhysReg::Xmm(x) => s.get_xmm(x),
+                PhysReg::Flag(f) => s.get_flag(f),
             };
-            b.emit_void(IrOp::Use, &[arg], IrType::I64);
+            // A merge-entry placeholder loses its pin during SSA construction.
+            let copy = b.emit(IrOp::Copy, &[input], register_type(phys));
+            s.reg_pins.insert(copy, phys);
+            b.emit_void(IrOp::Use, &[copy], register_type(phys));
         }
     }
     // RAX carries a tail-forwarded value independent of the arg signature: the
     // Windows /guard:cf dispatch thunk (`jmp [__guard_dispatch_icall_fptr]`)
     // takes the indirect-call target in RAX, so a tail jmp through it must keep
     // the function's RAX live to the jump or the guard dispatches to garbage.
-    let rax_v = s.get_gpr(Gpr::Rax);
-    let rax_out = if s.reg_pins.contains_key(&rax_v) || s.rsp_chain.contains(&rax_v) {
-        let c = b.emit(IrOp::Copy, &[rax_v], IrType::I64);
-        s.reg_pins.insert(c, PhysReg::Gpr(Gpr::Rax));
-        c
-    } else {
-        s.reg_pins.insert(rax_v, PhysReg::Gpr(Gpr::Rax));
-        rax_v
-    };
-    b.emit_void(IrOp::Use, &[rax_out], IrType::I64);
+    pin_live_out(PhysReg::Gpr(Gpr::Rax), b, s);
+    preserve_authored_registers(b, s, false);
     b.emit_void(IrOp::Use, &[s.get_gpr(Gpr::Rsp)], IrType::I64);
 }
 

@@ -10,7 +10,8 @@ use kamy_core::SectionFlags;
 use object::{Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget};
 
 use super::{
-    METADATA_SECTION, Placement, coff, encode, u32_at, validate_base_relocations, validate_image,
+    METADATA_SECTION, Placement, abi, coff, encode, u32_at, validate_base_relocations,
+    validate_image,
 };
 use crate::{NewSection, PeEdits, PeFile};
 
@@ -37,11 +38,83 @@ impl Drop for Scratch {
     }
 }
 
-pub(super) fn build(
+pub(super) fn build_from_llvm_ir(
+    ir: &Path,
+    output: &Path,
+    entry: &str,
+    linker: &Path,
+    llc: &Path,
+    compiler_version: &str,
+) -> anyhow::Result<()> {
+    let version = Command::new(llc)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("query matched LLVM compiler {}", llc.display()))?;
+    ensure!(
+        version.status.success(),
+        "LLVM compiler version query failed"
+    );
+    let version_text =
+        String::from_utf8(version.stdout).context("LLVM compiler version is not UTF-8")?;
+    let actual = version_text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("LLVM version "))
+        .context("LLVM compiler did not identify its version")?
+        .split_whitespace()
+        .next()
+        .context("missing LLVM compiler version")?;
+    ensure!(
+        actual == compiler_version
+            || actual
+                .strip_prefix(compiler_version)
+                .is_some_and(|s| s.starts_with('-')),
+        "LLVM tool version {actual} does not match rustc LLVM version {compiler_version}"
+    );
+    let scratch = Scratch::new()?;
+    let object = scratch.0.join("module.obj");
+    let input = fs::read_to_string(ir).context("read post-LTO Rust LLVM IR")?;
+    let snapshot = scratch.0.join("module.ll");
+    fs::write(&snapshot, input.as_bytes()).context("snapshot native compiler input")?;
+    // The dump observes the live native pipeline. MIR is never deserialized.
+    let result = Command::new(llc)
+        .args([
+            "-filetype=obj",
+            "-O=3",
+            "-mtriple=x86_64-pc-windows-msvc",
+            "-relocation-model=pic",
+            "-code-model=small",
+            "-function-sections",
+            "-data-sections",
+            "-fast-isel=false",
+            "-print-after=finalize-isel",
+            "-print-regmask-num-regs=-1",
+        ])
+        .arg(&snapshot)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .with_context(|| format!("emit native module and ABI with {}", llc.display()))?;
+    ensure!(
+        result.status.success(),
+        "LLVM native module emission failed ({}):\n{}",
+        result.status,
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let compiler = abi::CompilerMetadata {
+        version: actual.to_owned(),
+        ir: input,
+        machine: String::from_utf8(result.stderr).context("LLVM machine metadata is not UTF-8")?,
+    };
+    abi::signatures(&compiler, Some(entry)).context("validate native compiler ABI contract")?;
+    build(&[object], output, entry, linker, &compiler)
+}
+
+fn build(
     paths: &[PathBuf],
     output: &Path,
     entry: &str,
     linker: &Path,
+    compiler: &abi::CompilerMetadata,
 ) -> anyhow::Result<()> {
     ensure!(
         !paths.is_empty(),
@@ -138,15 +211,24 @@ pub(super) fn build(
     }
     remap_pdata(&pe, &originals, &mut placements)?;
     let entry_rva = callback(&originals, &placements, entry)?;
-    let authored = coff::describe(&pe, &originals, &placements, entry_rva)
-        .context("linked SDK provenance validation")?;
-    validate_base_relocations(&pe, &authored.references)?;
-    let metadata = encode(entry_rva, &originals, &placements)?;
+    let signatures = abi::signatures(compiler, Some(entry))?;
+    let authored = coff::describe(
+        &pe,
+        &originals,
+        &placements,
+        entry_rva,
+        "producer",
+        &signatures,
+    )
+    .context("linked SDK provenance validation")?;
+    validate_base_relocations(&pe, &authored)?;
+    let metadata = encode(entry_rva, &originals, &placements, compiler)?;
     let packed = pe
         .rebuild(&PeEdits {
             new_sections: vec![NewSection {
                 name: METADATA_SECTION.to_owned(),
                 rva: pe.next_section_rva(),
+                virtual_size: u32::try_from(metadata.len())?,
                 flags: SectionFlags {
                     read: true,
                     ..SectionFlags::default()

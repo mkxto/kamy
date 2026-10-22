@@ -7,11 +7,12 @@ use object::{
 };
 
 use super::{
-    AuthoredModule, CodeSymbol, DataSymbol, ModuleReference, ModuleReferenceKind, ModuleTarget,
-    Placement, field, mapped, reference_target, u32_at,
+    AuthoredModule, CodeSymbol, DataSymbol, Placement, field, mapped, reference_target, u32_at,
 };
 use crate::PeFile;
-use kamy_core::Rva;
+use kamy_core::ir::FnSignature;
+use kamy_core::{LinkField, Reference, ReferenceOrigin, Rva, Symbol, SymbolId, SymbolicExpression};
+use std::sync::Arc;
 
 pub(super) fn parse(bytes: &[u8]) -> anyhow::Result<object::File<'_>> {
     let file = object::File::parse(bytes).context("invalid compiled COFF object")?;
@@ -118,11 +119,50 @@ pub(super) fn locate(
         .context("linked COFF RVA overflow")
 }
 
+pub(super) fn entry_name(
+    objects: &[impl AsRef<[u8]>],
+    placements: &[Placement],
+    entry: u32,
+) -> anyhow::Result<String> {
+    let mut name = None;
+    for (object, bytes) in objects.iter().enumerate() {
+        let file = parse(bytes.as_ref())?;
+        for symbol in file
+            .symbols()
+            .filter(|s| s.kind() == SymbolKind::Text && s.is_definition())
+        {
+            let Some(section) = symbol.section_index() else {
+                continue;
+            };
+            if !retained(&file.section_by_index(section)?)? {
+                continue;
+            }
+            let address = locate(
+                placements,
+                u32::try_from(object)?,
+                u32::try_from(section.0)?,
+                u32::try_from(symbol.address())?,
+                1,
+            )?;
+            if address == entry {
+                ensure!(
+                    name.is_none(),
+                    "selected callback has ambiguous native compiler symbols"
+                );
+                name = Some(symbol.name()?.to_owned());
+            }
+        }
+    }
+    name.context("selected callback lacks a native compiler function symbol")
+}
+
 pub(super) fn describe(
     pe: &PeFile,
     objects: &[impl AsRef<[u8]>],
     placements: &[Placement],
     entry: u32,
+    identity: &str,
+    signatures: &BTreeMap<String, FnSignature>,
 ) -> anyhow::Result<AuthoredModule> {
     let files: Vec<_> = objects
         .iter()
@@ -131,7 +171,49 @@ pub(super) fn describe(
             parse(bytes.as_ref()).with_context(|| format!("authored COFF object {i}"))
         })
         .collect::<anyhow::Result<_>>()?;
-    let mut globals: BTreeMap<String, Vec<(u32, u32, u32)>> = BTreeMap::new();
+    let module: Arc<str> = identity.into();
+    let mut compiler_ids = BTreeMap::new();
+    for (object, file) in files.iter().enumerate() {
+        let object = u32::try_from(object)?;
+        for symbol in file.symbols() {
+            compiler_ids.insert(
+                (object, symbol.index().0),
+                SymbolId::Authored {
+                    module: module.clone(),
+                    symbol: format!(
+                        "coff:{object}:symbol:{}:{}",
+                        symbol.index().0,
+                        symbol.name()?
+                    )
+                    .into(),
+                },
+            );
+        }
+    }
+    let compiler_id = |object: u32, symbol: &object::Symbol<'_, '_>| -> anyhow::Result<SymbolId> {
+        compiler_ids
+            .get(&(object, symbol.index().0))
+            .cloned()
+            .context("missing interned compiler symbol identity")
+    };
+    let storage_ids: BTreeMap<_, _> = placements
+        .iter()
+        .map(|p| {
+            (
+                (p.object, p.section, p.offset),
+                SymbolId::Authored {
+                    module: module.clone(),
+                    symbol: format!("coff:{}:section:{}:piece:{}", p.object, p.section, p.offset)
+                        .into(),
+                },
+            )
+        })
+        .collect();
+    let storage_id =
+        |object: u32, section: u32, offset: u32| storage_ids[&(object, section, offset)].clone();
+    let mut all_symbols = Vec::new();
+    let mut bindings = BTreeMap::new();
+    let mut globals: BTreeMap<String, Vec<(u32, u32, u32, SymbolId)>> = BTreeMap::new();
     for (index, file) in files.iter().enumerate() {
         for symbol in file
             .symbols()
@@ -142,8 +224,64 @@ pub(super) fn describe(
                     u32::try_from(index)?,
                     u32::try_from(section.0)?,
                     u32::try_from(symbol.address())?,
+                    compiler_id(u32::try_from(index)?, &symbol)?,
                 ));
             }
+        }
+    }
+    for (index, file) in files.iter().enumerate() {
+        let object = u32::try_from(index)?;
+        for symbol in file.symbols().filter(|s| s.is_definition()) {
+            let Some(section) = symbol.section_index() else {
+                continue;
+            };
+            if !retained(&file.section_by_index(section)?)? {
+                continue;
+            }
+            let section_index = u32::try_from(section.0)?;
+            let offset = u32::try_from(symbol.address())?;
+            let piece = placements
+                .iter()
+                .find(|p| {
+                    p.object == object
+                        && p.section == section_index
+                        && offset >= p.offset
+                        && offset < p.offset.saturating_add(p.size)
+                })
+                .or_else(|| {
+                    placements
+                        .iter()
+                        .filter(|p| {
+                            p.object == object
+                                && p.section == section_index
+                                && p.offset.checked_add(p.size) == Some(offset)
+                        })
+                        .max_by_key(|p| p.offset)
+                })
+                .context("compiler symbol lacks exact contribution storage ownership")?;
+            bindings.insert(
+                compiler_id(object, &symbol)?,
+                SymbolicExpression::Symbol {
+                    symbol: storage_id(object, section_index, piece.offset),
+                    addend: i64::from(offset - piece.offset),
+                },
+            );
+            all_symbols.push(Symbol {
+                id: compiler_id(object, &symbol)?,
+                name: symbol.name()?.to_owned(),
+                rva: Rva::new(locate(
+                    placements,
+                    object,
+                    u32::try_from(section.0)?,
+                    u32::try_from(symbol.address())?,
+                    0,
+                )?),
+                kind: if symbol.kind() == SymbolKind::Text {
+                    kamy_core::SymbolKind::Function
+                } else {
+                    kamy_core::SymbolKind::Data
+                },
+            });
         }
     }
     let mut ranges = Vec::new();
@@ -159,6 +297,12 @@ pub(super) fn describe(
             retained(&section)?,
             "authored placement refers to a discarded compiler section"
         );
+        all_symbols.push(Symbol {
+            id: storage_id(p.object, p.section, p.offset),
+            name: format!("$coff{}:{}+{:x}", p.object, section.name()?, p.offset),
+            rva: Rva::new(p.rva),
+            kind: kamy_core::SymbolKind::Data,
+        });
         ensure!(
             p.offset
                 .checked_add(p.size)
@@ -311,11 +455,7 @@ pub(super) fn describe(
                         section.name().unwrap_or("<invalid>")
                     )
                 })?;
-                let width = if kind == ModuleReferenceKind::Absolute64 {
-                    8
-                } else {
-                    4
-                };
+                let width = kind.width();
                 let offset = u32::try_from(offset)?;
                 ensure!(
                     offset
@@ -338,30 +478,31 @@ pub(super) fn describe(
                     .get(offset as usize..(offset + width) as usize)
                     .context("truncated COFF relocation addend")?;
                 let addend = match kind {
-                    ModuleReferenceKind::Absolute64 => {
-                        i64::from_le_bytes(original_field.try_into()?)
-                    }
-                    ModuleReferenceKind::ImageRelative32 => {
+                    LinkField::Absolute64 => i64::from_le_bytes(original_field.try_into()?),
+                    LinkField::ImageRelative32 => {
                         i64::from(u32::from_le_bytes(original_field.try_into()?))
                     }
-                    ModuleReferenceKind::Relative32 { .. } => {
+                    LinkField::Relative32 { .. } => {
                         i64::from(i32::from_le_bytes(original_field.try_into()?))
                     }
                 };
-                let symbol_rva = if image_base {
+                let (symbol_rva, target_id) = if image_base {
                     ensure!(
                         symbol.is_undefined(),
                         "__ImageBase must be the linker-defined image symbol"
                     );
-                    0
+                    (0, SymbolId::HostImageBase)
                 } else if let Some(section) = symbol.section_index() {
-                    locate(
-                        placements,
-                        object_index,
-                        u32::try_from(section.0)?,
-                        u32::try_from(symbol.address())?,
-                        0,
-                    )?
+                    (
+                        locate(
+                            placements,
+                            object_index,
+                            u32::try_from(section.0)?,
+                            u32::try_from(symbol.address())?,
+                            0,
+                        )?,
+                        compiler_id(object_index, &symbol)?,
+                    )
                 } else {
                     ensure!(
                         symbol.is_undefined(),
@@ -379,8 +520,11 @@ pub(super) fn describe(
                         "ambiguous COFF reference target {}",
                         symbol.name()?
                     );
-                    let (object, section, offset) = definitions[0];
-                    locate(placements, object, section, offset, 0)?
+                    let (object, section, offset, id) = &definitions[0];
+                    (
+                        locate(placements, *object, *section, *offset, 0)?,
+                        id.clone(),
+                    )
                 };
                 let expected = i64::from(symbol_rva)
                     .checked_add(addend)
@@ -401,15 +545,19 @@ pub(super) fn describe(
                         "overlapping COFF relocation fields"
                     );
                 }
-                references.push(ModuleReference {
-                    source: Rva::new(source),
-                    target: if image_base {
-                        ModuleTarget::ImageBase
-                    } else {
-                        ModuleTarget::Rva(Rva::new(symbol_rva))
+                let piece = pieces
+                    .iter()
+                    .find(|p| offset >= p.offset && offset < p.offset + p.size)
+                    .context("authored relocation source lacks storage identity")?;
+                references.push(Reference {
+                    source: storage_id(object_index, section_index, piece.offset),
+                    offset: offset - piece.offset,
+                    expression: SymbolicExpression::Symbol {
+                        symbol: target_id,
+                        addend,
                     },
-                    addend,
-                    kind,
+                    field: kind,
+                    origin: ReferenceOrigin::Authored,
                 });
             }
             for p in &pieces {
@@ -499,15 +647,32 @@ pub(super) fn describe(
                     ensure!(size != 0, "zero-sized authored function {}", symbol.name()?);
                     locate(placements, object_index, section_index, offset, size)?;
                     code.push(CodeSymbol {
+                        symbol: compiler_id(object_index, symbol)?,
+                        signature: signatures
+                            .get(symbol.name()?)
+                            .with_context(|| {
+                                format!(
+                                    "authored function {} lacks an exact compiler ABI contract",
+                                    symbol.name().unwrap_or("<invalid>")
+                                )
+                            })?
+                            .clone(),
                         name: symbol.name()?.to_owned(),
                         start: Rva::new(start),
                         end: Rva::new(start.checked_add(size).context("function RVA overflow")?),
                     });
                 }
             } else {
-                let unique_starts: BTreeSet<_> = symbols.iter().map(|s| s.address()).collect();
+                let unique_starts: BTreeSet<_> = symbols
+                    .iter()
+                    .filter(|s| s.address() < u64::from(section_size))
+                    .map(|s| s.address())
+                    .collect();
                 for symbol in &symbols {
                     let offset = u32::try_from(symbol.address())?;
+                    if offset == section_size {
+                        continue;
+                    }
                     let size = if symbol.size() != 0 {
                         u32::try_from(symbol.size())?
                     } else if unique_starts.len() == 1 && offset == 0 {
@@ -518,8 +683,26 @@ pub(super) fn describe(
                             symbol.name()?
                         );
                     };
+                    if matches!(
+                        symbol.name()?,
+                        "SYMBOL_init_table_start" | "SYMBOL_init_table_end"
+                    ) {
+                        ensure!(
+                            size == 8
+                                && characteristics
+                                    .contains(object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA)
+                                && !characteristics
+                                    .contains(object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA)
+                                && offset
+                                    .checked_add(size)
+                                    .is_some_and(|end| end as usize <= original.len()),
+                            "SDK bound {} in object {object_index} requires initialized pointer-sized native storage; rebuild with the current kamy-sdk",
+                            symbol.name()?
+                        );
+                    }
                     let start = locate(placements, object_index, section_index, offset, size)?;
                     data.push(DataSymbol {
+                        symbol: compiler_id(object_index, symbol)?,
                         name: symbol.name()?.to_owned(),
                         start: Rva::new(start),
                         size,
@@ -527,6 +710,7 @@ pub(super) fn describe(
                 }
                 for p in pieces {
                     data.push(DataSymbol {
+                        symbol: storage_id(object_index, section_index, p.offset),
                         name: format!("$coff{object_index}:{}+{:x}", section.name()?, p.offset),
                         start: Rva::new(p.rva),
                         size: p.size,
@@ -556,28 +740,80 @@ pub(super) fn describe(
         }
         canonical.push(symbol);
     }
-    ensure!(
-        canonical.iter().any(|s| s.start.get() == entry),
-        "module callback must select an exact authored function entry"
-    );
-    references.sort_unstable_by_key(|r| r.source);
-    for pair in references.windows(2) {
-        let width = if pair[0].kind == ModuleReferenceKind::Absolute64 {
-            8
-        } else {
-            4
+    let callback = canonical
+        .iter()
+        .find(|s| s.start.get() == entry)
+        .context("module callback must select an exact authored function entry")?;
+    super::abi::validate_callback(&callback.signature).context("module callback ABI")?;
+    for function in &canonical {
+        bindings.remove(&function.symbol);
+    }
+    for p in placements {
+        let section =
+            files[p.object as usize].section_by_index(object::SectionIndex(p.section as usize))?;
+        let SectionFlags::Coff { characteristics } = section.flags() else {
+            bail!("missing COFF section flags")
         };
+        if !characteristics.contains(object::pe::IMAGE_SCN_MEM_EXECUTE) {
+            continue;
+        }
+        let function = canonical
+            .iter()
+            .find(|f| f.start.get() == p.rva)
+            .context("executable compiler storage lacks an exact function base")?;
         ensure!(
-            pair[0]
-                .source
-                .get()
-                .checked_add(width)
-                .is_some_and(|end| end <= pair[1].source.get()),
+            canonical
+                .iter()
+                .filter(|f| f.start.get() >= p.rva && f.start.get() < p.rva.saturating_add(p.size))
+                .count()
+                == 1,
+            "executable contribution with multiple independently movable functions requires per-function compiler sections"
+        );
+        bindings.insert(
+            storage_id(p.object, p.section, p.offset),
+            SymbolicExpression::symbol(function.symbol.clone()),
+        );
+    }
+    for reference in &mut references {
+        let source = all_symbols
+            .iter()
+            .find(|s| s.id == reference.source)
+            .context("authored source symbol identity is missing")?;
+        let source_rva = source
+            .rva
+            .get()
+            .checked_add(reference.offset)
+            .context("authored source RVA overflow")?;
+        if let Some(function) = canonical
+            .iter()
+            .find(|f| source_rva >= f.start.get() && source_rva < f.end.get())
+        {
+            ensure!(
+                source_rva
+                    .checked_add(reference.field.width())
+                    .is_some_and(|end| end <= function.end.get()),
+                "authored relocation crosses compiler function boundary"
+            );
+            reference.source = function.symbol.clone();
+            reference.offset = source_rva - function.start.get();
+        }
+    }
+    references.sort_unstable_by(|a, b| (&a.source, a.offset).cmp(&(&b.source, b.offset)));
+    for pair in references.windows(2) {
+        ensure!(
+            pair[0].source != pair[1].source
+                || pair[0]
+                    .offset
+                    .checked_add(pair[0].field.width())
+                    .is_some_and(|end| end <= pair[1].offset),
             "linked reference fields overlap"
         );
     }
     Ok(AuthoredModule {
         image: Vec::new(),
+        identity: identity.to_owned(),
+        symbols: all_symbols,
+        bindings,
         entry: Rva::new(entry),
         code: canonical,
         data,
@@ -585,16 +821,16 @@ pub(super) fn describe(
     })
 }
 
-fn relocation_kind(typ: object::pe::RelocationType) -> anyhow::Result<ModuleReferenceKind> {
+fn relocation_kind(typ: object::pe::RelocationType) -> anyhow::Result<LinkField> {
     match typ {
-        object::pe::IMAGE_REL_AMD64_ADDR64 => Ok(ModuleReferenceKind::Absolute64),
-        object::pe::IMAGE_REL_AMD64_ADDR32NB => Ok(ModuleReferenceKind::ImageRelative32),
-        object::pe::IMAGE_REL_AMD64_REL32 => Ok(ModuleReferenceKind::Relative32 { bias: 0 }),
-        object::pe::IMAGE_REL_AMD64_REL32_1 => Ok(ModuleReferenceKind::Relative32 { bias: 1 }),
-        object::pe::IMAGE_REL_AMD64_REL32_2 => Ok(ModuleReferenceKind::Relative32 { bias: 2 }),
-        object::pe::IMAGE_REL_AMD64_REL32_3 => Ok(ModuleReferenceKind::Relative32 { bias: 3 }),
-        object::pe::IMAGE_REL_AMD64_REL32_4 => Ok(ModuleReferenceKind::Relative32 { bias: 4 }),
-        object::pe::IMAGE_REL_AMD64_REL32_5 => Ok(ModuleReferenceKind::Relative32 { bias: 5 }),
+        object::pe::IMAGE_REL_AMD64_ADDR64 => Ok(LinkField::Absolute64),
+        object::pe::IMAGE_REL_AMD64_ADDR32NB => Ok(LinkField::ImageRelative32),
+        object::pe::IMAGE_REL_AMD64_REL32 => Ok(LinkField::Relative32 { bias: 0 }),
+        object::pe::IMAGE_REL_AMD64_REL32_1 => Ok(LinkField::Relative32 { bias: 1 }),
+        object::pe::IMAGE_REL_AMD64_REL32_2 => Ok(LinkField::Relative32 { bias: 2 }),
+        object::pe::IMAGE_REL_AMD64_REL32_3 => Ok(LinkField::Relative32 { bias: 3 }),
+        object::pe::IMAGE_REL_AMD64_REL32_4 => Ok(LinkField::Relative32 { bias: 4 }),
+        object::pe::IMAGE_REL_AMD64_REL32_5 => Ok(LinkField::Relative32 { bias: 5 }),
         _ => bail!(
             "unsupported AMD64 COFF relocation type {typ:#x}; address truncation, section-relative arithmetic and linker-generated indirection cannot be silently copied"
         ),

@@ -133,6 +133,25 @@ pub fn coverage_delta(old: &CorpusCoverage, new: &CorpusCoverage) -> Vec<String>
                         om.coverage.rejected, nm.coverage.rejected
                     ));
                 }
+                for (axis, old_count, new_count) in [
+                    ("selected", om.coverage.selected, nm.coverage.selected),
+                    ("eligible", om.coverage.eligible, nm.coverage.eligible),
+                    (
+                        "transformed",
+                        om.coverage.transformed,
+                        nm.coverage.transformed,
+                    ),
+                ] {
+                    if old_count != new_count {
+                        out.push(format!("{name}: {axis} {old_count} -> {new_count}"));
+                    }
+                }
+                if om.coverage.actual_intensity != nm.coverage.actual_intensity {
+                    out.push(format!(
+                        "{name}: actual_intensity {:?} -> {:?}",
+                        om.coverage.actual_intensity, nm.coverage.actual_intensity
+                    ));
+                }
             }
         }
     }
@@ -200,6 +219,10 @@ pub fn verify_corpus(
             tracing::error!(mismatches = mismatches.len(), "FAIL");
         }
         tracing::info!(
+            selected = coverage.selected,
+            eligible = coverage.eligible,
+            transformed = coverage.transformed,
+            actual_intensity = ?coverage.actual_intensity,
             ssa_lowered = coverage.ssa_lowered,
             relocated = coverage.relocated,
             rejected = coverage.rejected,
@@ -216,6 +239,10 @@ pub fn verify_corpus(
         members = members.len(),
         passed,
         failed,
+        selected = total.selected,
+        eligible = total.eligible,
+        transformed = total.transformed,
+        actual_intensity = ?total.actual_intensity,
         ssa_lowered = total.ssa_lowered,
         relocated = total.relocated,
         rejected = total.rejected,
@@ -275,4 +302,52 @@ pub fn list_corpus(dir: &Path) -> Result<()> {
     }
     tracing::info!(members = members.len(), "listed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn baseline_delta_keeps_execution_and_semantic_coverage_separate() {
+        let member = |transformed, intensity: &str| MemberCoverage {
+            name: "portable".into(),
+            passed: true,
+            coverage: Coverage {
+                selected: 3,
+                eligible: 2,
+                ssa_lowered: 2,
+                transformed,
+                rejected: 1,
+                actual_intensity: [(intensity.into(), 2)].into_iter().collect(),
+                ..Default::default()
+            },
+        };
+        let old = CorpusCoverage {
+            members: vec![member(0, "0")],
+            passed: 1,
+            ..Default::default()
+        };
+        let new = CorpusCoverage {
+            members: vec![member(2, "0.5")],
+            passed: 1,
+            ..Default::default()
+        };
+        let delta = coverage_delta(&old, &new);
+        assert!(
+            delta
+                .iter()
+                .any(|line| line == "portable: transformed 0 -> 2")
+        );
+        assert!(
+            delta
+                .iter()
+                .any(|line| line.starts_with("portable: actual_intensity"))
+        );
+        assert!(
+            !delta
+                .iter()
+                .any(|line| line.contains("ssa_lowered") || line.contains("PASS ->"))
+        );
+    }
 }

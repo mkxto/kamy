@@ -1,15 +1,18 @@
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
+use std::path::Path;
 
 use anyhow::{Context, bail, ensure};
-use kamy_core::Rva;
+use kamy_core::ir::FnSignature;
+use kamy_core::{LinkField, Reference, Rva, Symbol, SymbolId};
 
 use crate::PeFile;
 
+mod abi;
 mod coff;
 mod producer;
 
 const MAGIC: &[u8; 8] = b"KAMYMOD\0";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_SIZE: usize = 32;
 const IMAGE_EXECUTE: u32 = 0x2000_0000;
 const METADATA_SECTION: &str = ".kmod";
@@ -17,14 +20,19 @@ const METADATA_SECTION: &str = ".kmod";
 #[derive(Debug, Clone)]
 pub struct AuthoredModule {
     pub image: Vec<u8>,
+    pub identity: String,
+    pub symbols: Vec<Symbol>,
+    pub bindings: BTreeMap<SymbolId, kamy_core::SymbolicExpression>,
     pub entry: Rva,
     pub code: Vec<CodeSymbol>,
     pub data: Vec<DataSymbol>,
-    pub references: Vec<ModuleReference>,
+    pub references: Vec<Reference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeSymbol {
+    pub symbol: SymbolId,
+    pub signature: FnSignature,
     pub name: String,
     pub start: Rva,
     pub end: Rva,
@@ -32,33 +40,10 @@ pub struct CodeSymbol {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataSymbol {
+    pub symbol: SymbolId,
     pub name: String,
     pub start: Rva,
     pub size: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ModuleReference {
-    pub source: Rva,
-    pub target: ModuleTarget,
-    /// COFF field addend; REL32 can include a trailing-immediate adjustment.
-    pub addend: i64,
-    pub kind: ModuleReferenceKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModuleTarget {
-    /// Compiler symbol base in the original module, excluding the addend.
-    Rva(Rva),
-    /// Host image base, not the authored DLL's original load base.
-    ImageBase,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModuleReferenceKind {
-    Absolute64,
-    ImageRelative32,
-    Relative32 { bias: u8 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,12 +55,20 @@ struct Placement {
     rva: u32,
 }
 
-pub fn build(objects: &[PathBuf], output: &Path, entry: &str, linker: &Path) -> anyhow::Result<()> {
-    producer::build(objects, output, entry, linker)
+pub fn build_from_llvm_ir(
+    ir: &Path,
+    output: &Path,
+    entry: &str,
+    linker: &Path,
+    llc: &Path,
+    compiler_version: &str,
+) -> anyhow::Result<()> {
+    producer::build_from_llvm_ir(ir, output, entry, linker, llc, compiler_version)
 }
 
 impl AuthoredModule {
-    pub fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
+    pub fn parse(bytes: &[u8], identity: &str) -> anyhow::Result<Self> {
+        ensure!(!identity.is_empty(), "authored module identity is empty");
         let pe = PeFile::parse(bytes).context("authored module PE")?;
         validate_image(&pe, bytes)?;
         let mut sections = pe
@@ -102,9 +95,13 @@ impl AuthoredModule {
             entry,
             objects,
             placements,
+            compiler,
         } = decode(metadata)?;
-        let authored = coff::describe(&pe, &objects, &placements, entry)?;
-        validate_base_relocations(&pe, &authored.references)?;
+        let callback = coff::entry_name(&objects, &placements, entry)?;
+        let signatures = abi::signatures(&compiler, Some(&callback))
+            .context("authored compiler ABI metadata")?;
+        let authored = coff::describe(&pe, &objects, &placements, entry, identity, &signatures)?;
+        validate_base_relocations(&pe, &authored)?;
         Ok(Self {
             image: pe.bytes,
             entry: Rva::new(entry),
@@ -302,17 +299,17 @@ fn field(pe: &PeFile, rva: u32, size: usize) -> anyhow::Result<&[u8]> {
         .context("reference field is truncated")
 }
 
-fn reference_target(pe: &PeFile, source: u32, kind: ModuleReferenceKind) -> anyhow::Result<i64> {
+fn reference_target(pe: &PeFile, source: u32, kind: LinkField) -> anyhow::Result<i64> {
     match kind {
-        ModuleReferenceKind::Absolute64 => {
+        LinkField::Absolute64 => {
             let value = u64::from_le_bytes(field(pe, source, 8)?.try_into()?);
             i64::try_from(i128::from(value) - i128::from(pe.image_base))
                 .context("absolute module reference exceeds signed expression range")
         }
-        ModuleReferenceKind::ImageRelative32 => Ok(i64::from(u32::from_le_bytes(
+        LinkField::ImageRelative32 => Ok(i64::from(u32::from_le_bytes(
             field(pe, source, 4)?.try_into()?,
         ))),
-        ModuleReferenceKind::Relative32 { bias } => {
+        LinkField::Relative32 { bias } => {
             ensure!(bias <= 5, "invalid AMD64 REL32 bias {bias}");
             let displacement = i32::from_le_bytes(field(pe, source, 4)?.try_into()?);
             Ok(i64::from(source) + 4 + i64::from(bias) + i64::from(displacement))
@@ -320,12 +317,24 @@ fn reference_target(pe: &PeFile, source: u32, kind: ModuleReferenceKind) -> anyh
     }
 }
 
-fn validate_base_relocations(pe: &PeFile, references: &[ModuleReference]) -> anyhow::Result<()> {
-    let mut expected: Vec<_> = references
-        .iter()
-        .filter(|r| r.kind == ModuleReferenceKind::Absolute64)
-        .map(|r| r.source.get())
-        .collect();
+fn validate_base_relocations(pe: &PeFile, module: &AuthoredModule) -> anyhow::Result<()> {
+    let mut expected = Vec::new();
+    for reference in &module.references {
+        if reference.field == LinkField::Absolute64 {
+            let source = module
+                .symbols
+                .iter()
+                .find(|s| s.id == reference.source)
+                .context("authored relocation source symbol is absent")?;
+            expected.push(
+                source
+                    .rva
+                    .get()
+                    .checked_add(reference.offset)
+                    .context("authored relocation source overflow")?,
+            );
+        }
+    }
     let mut actual = Vec::new();
     if let Some((rva, size)) = pe.data_directory(5).filter(|(_, n)| *n != 0) {
         let data = field(pe, rva.get(), size as usize)?;
@@ -368,7 +377,12 @@ fn validate_base_relocations(pe: &PeFile, references: &[ModuleReference]) -> any
     Ok(())
 }
 
-fn encode(entry: u32, objects: &[Vec<u8>], placements: &[Placement]) -> anyhow::Result<Vec<u8>> {
+fn encode(
+    entry: u32,
+    objects: &[Vec<u8>],
+    placements: &[Placement],
+    compiler: &abi::CompilerMetadata,
+) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(MAGIC);
     for word in [
@@ -385,6 +399,10 @@ fn encode(entry: u32, objects: &[Vec<u8>], placements: &[Placement]) -> anyhow::
         bytes.extend_from_slice(&u32::try_from(object.len())?.to_le_bytes());
         bytes.extend_from_slice(object);
     }
+    for text in [&compiler.version, &compiler.ir, &compiler.machine] {
+        bytes.extend_from_slice(&u32::try_from(text.len())?.to_le_bytes());
+        bytes.extend_from_slice(text.as_bytes());
+    }
     for p in placements {
         for word in [p.object, p.section, p.offset, p.size, p.rva] {
             bytes.extend_from_slice(&word.to_le_bytes());
@@ -395,10 +413,12 @@ fn encode(entry: u32, objects: &[Vec<u8>], placements: &[Placement]) -> anyhow::
     Ok(bytes)
 }
 
+#[derive(Debug)]
 struct DecodedMetadata<'a> {
     entry: u32,
     objects: Vec<&'a [u8]>,
     placements: Vec<Placement>,
+    compiler: abi::CompilerMetadata,
 }
 
 fn decode(bytes: &[u8]) -> anyhow::Result<DecodedMetadata<'_>> {
@@ -408,7 +428,8 @@ fn decode(bytes: &[u8]) -> anyhow::Result<DecodedMetadata<'_>> {
     );
     ensure!(
         u32_at(bytes, 8)? == VERSION,
-        "unsupported authored module metadata version"
+        "unsupported authored module metadata version {}; rebuild the Rust plugin with the current SDK producer (expected version {VERSION})",
+        u32_at(bytes, 8)?
     );
     ensure!(
         u32_at(bytes, 12)? as usize == bytes.len(),
@@ -440,6 +461,30 @@ fn decode(bytes: &[u8]) -> anyhow::Result<DecodedMetadata<'_>> {
         );
         cursor = end;
     }
+    let mut texts = Vec::new();
+    for _ in 0..3 {
+        let size = u32_at(bytes, cursor)? as usize;
+        cursor = cursor
+            .checked_add(4)
+            .context("compiler metadata offset overflow")?;
+        let end = cursor
+            .checked_add(size)
+            .context("compiler metadata size overflow")?;
+        texts.push(
+            std::str::from_utf8(
+                bytes
+                    .get(cursor..end)
+                    .context("truncated compiler ABI metadata")?,
+            )?
+            .to_owned(),
+        );
+        cursor = end;
+    }
+    let compiler = abi::CompilerMetadata {
+        version: texts.remove(0),
+        ir: texts.remove(0),
+        machine: texts.remove(0),
+    };
     ensure!(
         placement_count.checked_mul(20) == bytes.len().checked_sub(cursor),
         "authored placement table length mismatch"
@@ -458,6 +503,7 @@ fn decode(bytes: &[u8]) -> anyhow::Result<DecodedMetadata<'_>> {
         entry,
         objects,
         placements,
+        compiler,
     })
 }
 

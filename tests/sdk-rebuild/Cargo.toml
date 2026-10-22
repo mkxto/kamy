@@ -1,0 +1,24 @@
+[package]
+name = "kamy-sdk-rebuild-acceptance"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+csv.workspace = true
+iced-x86.workspace = true
+kamy-core.workspace = true
+kamy-pe.workspace = true
+kamy-run.workspace = true
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel"] }
+serde_json.workspace = true
+
+[[bin]]
+name = "sdk-rebuild"
+path = "src/main.rs"
+
+[[bin]]
+name = "sdk-host-exe"
+path = "hosts/exe.rs"
+

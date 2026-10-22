@@ -7,7 +7,7 @@ pub mod regalloc;
 
 pub use encode::assemble;
 pub use isel::select_instructions;
-pub use references::rebase_instructions;
+pub use references::{InstructionReference, SelectedInstructions, bind_references};
 pub use regalloc::{
     CALLEE_SAVED_GPRS, RegAllocation, RegCopy, allocate_registers, callee_saved_used,
     callee_saved_xmms_used,

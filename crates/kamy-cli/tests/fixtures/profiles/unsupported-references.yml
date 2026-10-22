@@ -1,0 +1,5 @@
+version: 1.0.0
+profiles:
+- name: unsupported-reference-witness
+  passes:
+  - type: ObscureReferences

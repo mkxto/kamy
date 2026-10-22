@@ -1,0 +1,24 @@
+[package]
+name = "sdk-rebuild-first"
+version = "0.0.0"
+edition = "2024"
+publish = false
+build = "../build.rs"
+
+[workspace]
+
+[lib]
+path = "../callback.rs"
+crate-type = ["staticlib"]
+
+[features]
+default = ["first"]
+first = []
+second = []
+abi = []
+bounds = []
+fastfail = []
+
+[dependencies]
+kamy-sdk = { path = "../../../../crates/kamy-sdk" }
+sdk-rebuild-dependency = { path = "../dependency" }

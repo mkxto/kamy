@@ -7,7 +7,7 @@ use std::path::Path;
 
 use anyhow::Context as _;
 use kamy_config::SymbolSelector;
-use kamy_core::{ReferenceKind, Rva, SymbolKind};
+use kamy_core::{ReferenceKind, Rva, SymbolId, SymbolKind};
 use kamy_disasm::discover_functions;
 use kamy_pdb::PdbSymbols;
 use kamy_pe::PeFile;
@@ -126,9 +126,15 @@ pub(crate) fn run(
             .collect();
         let entries: Vec<_> = functions
             .iter()
-            .map(|function| (function.entry, label(function.entry)))
+            .map(|function| crate::target::Entry {
+                symbol: SymbolId::Host {
+                    rva: function.entry,
+                },
+                name: label(function.entry),
+            })
             .collect();
-        let set = crate::target::resolve_targets(&selectors, &entries, &[], &cg);
+        let set =
+            crate::target::resolve_targets(&selectors, &entries, &[], &cg, module.image_base)?;
         writeln!(
             report,
             "selected      {} (globs: {})",
@@ -157,7 +163,7 @@ pub(crate) fn run(
             .get(&f.entry)
             .with_context(|| format!("missing reference model for function {}", f.entry))?;
         let mark = match &selected {
-            Some(s) if s.contains(&f.entry) => '*',
+            Some(s) if s.contains(&SymbolId::Host { rva: f.entry }) => '*',
             _ => ' ',
         };
         writeln!(

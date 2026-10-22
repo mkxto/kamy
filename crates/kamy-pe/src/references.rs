@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, bail, ensure};
-use kamy_core::{Reference, ReferenceKind, Rva};
+use kamy_core::{HostReference, ReferenceKind, Rva};
 
 use crate::{PeFile, read_u32, read_u64};
 
@@ -12,7 +12,7 @@ impl PeFile {
     /// Handler-specific payloads remain unclassified unless the handler identifies their layout.
     /// Callers MUST combine these references with conservative analysis of unclassified bytes.
     /// Unlocalizable encoded metadata and malformed records return errors.
-    pub fn metadata_references(&self) -> anyhow::Result<Vec<Reference>> {
+    pub fn metadata_references(&self) -> anyhow::Result<Vec<HostReference>> {
         let _span = tracing::debug_span!("pe_metadata_references").entered();
         let mut collector = Collector {
             pe: self,
@@ -32,7 +32,7 @@ impl PeFile {
 
 struct Collector<'a> {
     pe: &'a PeFile,
-    references: Vec<Reference>,
+    references: Vec<HostReference>,
 }
 
 #[derive(Default)]
@@ -86,7 +86,7 @@ impl Collector<'_> {
             }),
             "metadata field {source:#x} targets out-of-image RVA {target:#x}"
         );
-        self.references.push(Reference {
+        self.references.push(HostReference {
             source: Rva::new(source),
             target: Rva::new(target),
             kind,
@@ -660,7 +660,7 @@ mod tests {
         put32(pe, field + 8, unwind);
     }
 
-    fn has_opaque(references: &[Reference], target: u32) -> bool {
+    fn has_opaque(references: &[HostReference], target: u32) -> bool {
         references.iter().any(|reference| {
             reference.kind == ReferenceKind::Opaque && reference.target == Rva::new(target)
         })
@@ -748,7 +748,7 @@ mod tests {
         }
         let references = pe.metadata_references().unwrap();
         for (source, target) in [(0x1405, 0x1110), (0x1505, 0x1150), (0x1605, 0x1190)] {
-            assert!(references.contains(&Reference {
+            assert!(references.contains(&HostReference {
                 source: Rva::new(source),
                 target: Rva::new(target),
                 kind: ReferenceKind::ImageRelative,
@@ -1037,7 +1037,7 @@ mod tests {
         put32(&mut pe, 0x1408, 0x10);
         pe.bytes[0x40c..0x410].copy_from_slice(b"f\0\0\0");
         let references = pe.metadata_references().unwrap();
-        assert!(references.contains(&Reference {
+        assert!(references.contains(&HostReference {
             source: Rva::new(0x1404),
             target: Rva::new(0x1100),
             kind: ReferenceKind::ImageRelative,

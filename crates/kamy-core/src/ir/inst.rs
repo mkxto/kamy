@@ -19,6 +19,7 @@ pub struct Phi {
 #[derive(Clone, Debug)]
 pub enum IrTerminator {
     Ret,
+    NoReturn,
     Jump(BlockId),
     Branch {
         cond: ValueId,
@@ -26,7 +27,7 @@ pub enum IrTerminator {
         not_taken: BlockId,
     },
     Tail {
-        target: u64,
+        target: crate::Reference,
     },
     Unreachable,
 }

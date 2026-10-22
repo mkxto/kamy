@@ -55,27 +55,30 @@ enum Command {
     Protect {
         /// Input PE to protect.
         input: PathBuf,
-        /// Protection profile (YAML). Omit with --no-transform or --ssa-identity.
+        /// Protection profile (YAML), also applied with semantic identity flags.
         #[arg(long)]
         profile: Option<PathBuf>,
         /// Protected output path.
         #[arg(short, long)]
         output: PathBuf,
-        /// Write sorted old_rva,new_rva CSV using actual final RVAs.
+        /// Write source-qualified kamy-debug-map version 2 CSV with final RVAs.
         #[arg(long)]
         debug_map: Option<PathBuf>,
-        /// Run canonical SSA identity without semantic transforms (same as --ssa-identity).
-        /// Resident bodies stay in place; their references to moved code may be patched.
+        /// Write versioned JSON function outcomes, placements and directory ownership.
+        #[arg(long)]
+        link_report: Option<PathBuf>,
+        /// Suppress semantic passes; retain profile injection, selection and naming.
+        /// Without a profile, run canonical SSA identity (same as --ssa-identity).
         #[arg(long)]
         no_transform: bool,
-        /// Run canonical SSA identity without semantic transforms (same as --no-transform).
-        /// Resident bodies stay in place; their references to moved code may be patched.
+        /// Suppress semantic passes; retain profile injection, selection and naming.
+        /// Without a profile, run canonical SSA identity (same as --no-transform).
         #[arg(long)]
         ssa_identity: bool,
-        /// SSA-lower ONLY these function RVAs (hex, comma-separated).
+        /// SSA-lower ONLY these host RVAs (hex, comma-separated; conflicts with --profile).
         #[arg(long)]
         only_rva: Option<String>,
-        /// SSA-lower every function EXCEPT these RVAs (hex, comma-separated).
+        /// Exclude these host RVAs (hex, comma-separated; conflicts with --profile).
         #[arg(long)]
         reject_rva: Option<String>,
     },
@@ -202,6 +205,7 @@ fn main() -> anyhow::Result<()> {
             profile,
             output,
             debug_map,
+            link_report,
             no_transform,
             ssa_identity,
             only_rva,
@@ -211,6 +215,7 @@ fn main() -> anyhow::Result<()> {
             profile,
             output,
             debug_map,
+            link_report,
             no_transform,
             ssa_identity,
             only_rva,

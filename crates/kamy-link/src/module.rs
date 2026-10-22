@@ -1,15 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use anyhow::{Context, bail, ensure};
-use iced_x86::{
-    Code, Decoder, DecoderOptions, Encoder, Instruction, MemoryOperand, Mnemonic, OpKind, Register,
+use iced_x86::{Code, Decoder, DecoderOptions, Instruction, MemoryOperand, OpKind, Register};
+use kamy_codegen::SelectedInstructions;
+use kamy_core::ir::{CallingConvLookup, FnSignature, IrFunction};
+use kamy_core::{
+    LinkField, Module, OperandReference, Reference, RelocKind, Relocation, Rva, SymbolId,
+    SymbolicExpression,
 };
-use kamy_core::ir::{CallingConvLookup, IrFunction};
-use kamy_core::{Function, Module, RelocKind, Relocation, Rva};
-use kamy_pe::module::{AuthoredModule, ModuleReferenceKind, ModuleTarget};
-use kamy_pe::{DirectoryUpdate, NewSection, PeEdits, PeFile};
+use kamy_pe::module::AuthoredModule;
+use kamy_pe::{NewSection, PeFile};
 
-use crate::{Options, Report};
+use crate::{
+    FunctionReport, LoweringError, Options, Ownership, Placement, Report, TransformOutcome,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EntryMode {
@@ -32,24 +36,54 @@ pub struct Injection<'a> {
 pub struct PlannedFunction {
     pub plugin: String,
     pub name: String,
-    pub rva: Rva,
+    pub symbol: SymbolId,
 }
 
-struct Namespace {
-    start: u32,
-    module: Module,
-    retired: HashSet<usize>,
+pub fn planned_functions(plugins: &[Plugin]) -> anyhow::Result<Vec<PlannedFunction>> {
+    let mut names = HashSet::new();
+    let mut result = Vec::new();
+    for plugin in plugins {
+        ensure!(
+            !plugin.name.is_empty() && !plugin.name.contains("::") && names.insert(&plugin.name),
+            "plugin names must be nonempty, unique and unqualified: {}",
+            plugin.name
+        );
+        ensure!(
+            plugin.module.identity == plugin.name,
+            "plugin {} artifact identity does not match its instance",
+            plugin.name
+        );
+        for symbol in &plugin.module.code {
+            ensure!(
+                matches!(&symbol.symbol, SymbolId::Authored { module, .. } if module.as_ref() == plugin.name),
+                "plugin {} contains a symbol from another instance",
+                plugin.name
+            );
+            result.push(PlannedFunction {
+                plugin: plugin.name.clone(),
+                name: symbol.name.clone(),
+                symbol: symbol.symbol.clone(),
+            });
+        }
+    }
+    Ok(result)
+}
+
+struct Input<'a> {
+    source: AuthoredSource<'a>,
+    references: Vec<Reference>,
 }
 
 struct Compiled {
     plugin: usize,
-    symbol: usize,
+    symbol: SymbolId,
     source: Rva,
-    instructions: Vec<Instruction>,
-    references: Vec<crate::Operand>,
-    body: Vec<u8>,
+    selected: SelectedInstructions,
+    indirect: Vec<(usize, Register)>,
     slot: u32,
     rva: u32,
+    body: Vec<u8>,
+    report: FunctionReport,
 }
 
 struct PlacedData {
@@ -58,523 +92,58 @@ struct PlacedData {
     section: NewSection,
 }
 
-/// These RVAs identify transform/profile targets, not their final output placement.
-/// A plugin function's qualified name is `plugin::symbol`.
-pub fn planned_functions(
-    host: &Module,
-    plugins: &[Plugin],
-) -> anyhow::Result<Vec<PlannedFunction>> {
-    let namespaces = namespaces(host, plugins)?;
-    let mut planned = Vec::new();
-    for (plugin, namespace) in plugins.iter().zip(namespaces) {
-        for symbol in &plugin.module.code {
-            planned.push(PlannedFunction {
-                plugin: plugin.name.clone(),
-                name: symbol.name.clone(),
-                rva: add(namespace.start, symbol.start.get())?.into(),
-            });
-        }
-    }
-    Ok(planned)
+pub struct AuthoredSource<'a> {
+    plugin: &'a Plugin,
+    module: Module,
+    source_positions: BTreeMap<SymbolId, Rva>,
+    retired: BTreeSet<usize>,
+    boundaries: BTreeSet<u32>,
+    signatures: BTreeMap<SymbolId, &'a FnSignature>,
 }
 
-pub fn protect_with_modules(
-    pe: &PeFile,
-    host: &Module,
-    functions: &[Function],
-    opts: &Options,
-    cc: &dyn CallingConvLookup,
-    transform: &mut dyn FnMut(Rva, &mut IrFunction, f32),
-    injection: Injection<'_>,
-) -> anyhow::Result<(Vec<u8>, Report)> {
-    let Injection { plugins, mode } = injection;
-    if plugins.is_empty() {
-        return crate::protect_with_transforms(pe, host, functions, opts, cc, transform);
-    }
-    ensure!(
-        pe.subsystem() != 1,
-        "SDK module injection is prohibited for kernel images"
-    );
-    ensure!(
-        host.entry_point.is_some(),
-        "SDK module injection requires an original entry point"
-    );
-    let has_table = mode == EntryMode::InitTable
-        || plugins.iter().any(|plugin| {
-            plugin.module.data.iter().any(|symbol| {
-                matches!(
-                    symbol.name.as_str(),
-                    "SYMBOL_init_table_start" | "SYMBOL_init_table_end"
-                )
-            })
-        });
-    let has_startup = has_table && !pe.is_dll();
-    let mut namespaces = namespaces(host, plugins)?;
-    let (image, mut report) =
-        crate::protect_with_transforms(pe, host, functions, opts, cc, transform)?;
-    let output = PeFile::parse(&image).context("parsing transformed host for module placement")?;
-    let transformed = output.to_module();
-    let original_entry = transformed
-        .entry_point
-        .context("transformed host lost its entry point")?;
-    let base = host.image_base;
-    let alignment = output.section_alignment();
-    let mut cursor = crate::align_up(image_end(&transformed)?, alignment)?;
-    let mut data = Vec::new();
-    let mut addresses = BTreeMap::new();
-    for (index, namespace) in namespaces.iter().enumerate() {
-        for (section_index, section) in namespace.module.sections.iter().enumerate() {
-            if section.virtual_size == 0
-                || section.flags.execute
-                || namespace.retired.contains(&section_index)
-            {
-                continue;
-            }
-            cursor = crate::align_up(cursor, alignment)?;
-            let mut bytes = section.data.clone();
-            bytes.resize(section.virtual_size as usize, 0);
-            data.push(PlacedData {
-                plugin: index,
-                source: Rva::new(add(namespace.start, section.rva.get())?),
-                section: NewSection {
-                    name: opts.metadata_section.clone(),
-                    rva: Rva::new(cursor),
-                    flags: section.flags,
-                    data: bytes,
-                },
-            });
-            cursor = add(cursor, section.virtual_size)?;
-        }
-    }
-    let code_rva = crate::align_up(cursor, alignment)?;
-    let mut compiled =
-        Vec::with_capacity(plugins.iter().map(|plugin| plugin.module.code.len()).sum());
-    for (index, namespace) in namespaces.iter_mut().enumerate() {
-        prepare_view(&plugins[index], namespace, base)
-            .with_context(|| format!("preparing plugin {}", plugins[index].name))?;
-        let starts: BTreeSet<_> = plugins[index]
-            .module
-            .code
-            .iter()
-            .flat_map(|symbol| {
-                [
-                    namespace.start + symbol.start.get(),
-                    namespace.start + symbol.end.get(),
-                ]
-            })
-            .collect();
-        for (symbol_index, symbol) in plugins[index].module.code.iter().enumerate() {
-            let source = Rva::new(add(namespace.start, symbol.start.get())?);
-            let end = add(namespace.start, symbol.end.get())?;
-            let function =
-                kamy_disasm::recover_function(&namespace.module, source, &starts, &BTreeSet::new());
-            ensure!(
-                !function.blocks.is_empty()
-                    && function.blocks.iter().all(|block| {
-                        block.start.get() >= source.get() && block.end.get() <= end
-                    }),
-                "plugin {}::{} has control flow outside its authored range",
-                plugins[index].name,
-                symbol.name
-            );
-            let mut instructions =
-                crate::ssa_instructions(&namespace.module, &function, cc, transform).map_err(
-                    |reason| {
-                        anyhow::anyhow!(
-                            "plugin {}::{} cannot pass SSA/codegen: {reason:?}",
-                            plugins[index].name,
-                            symbol.name
-                        )
-                    },
-                )?;
-            ensure!(
-                !instructions.is_empty(),
-                "plugin {}::{} generated no code",
-                plugins[index].name,
-                symbol.name
-            );
-            instructions.insert(0, Instruction::with(Code::Endbr64));
-            let mut references = Vec::new();
-            for (index, instruction) in instructions.iter().enumerate() {
-                if instruction.op0_kind() == OpKind::NearBranch64 {
-                    references.push(crate::Operand::Branch(
-                        index,
-                        instruction.near_branch_target(),
-                    ));
-                }
-                if instruction.is_ip_rel_memory_operand() {
-                    references.push(crate::Operand::Rip(
-                        index,
-                        instruction.ip_rel_memory_address(),
-                    ));
-                }
-            }
-            let body =
-                kamy_codegen::relocate(&instructions, va(base, code_rva)?).with_context(|| {
-                    format!("encoding plugin {}::{}", plugins[index].name, symbol.name)
-                })?;
-            let slot = u32::try_from(body.len()).context("module function exceeds RVA space")?;
-            compiled.push(Compiled {
-                plugin: index,
-                symbol: symbol_index,
-                source,
-                instructions,
-                references,
-                body,
-                slot,
-                rva: code_rva,
-            });
-        }
-    }
-    for placed in &data {
-        let namespace = &namespaces[placed.plugin];
-        for reference in &plugins[placed.plugin].module.references {
-            if let ModuleTarget::Rva(target) = reference.target {
-                let virtual_target = add(namespace.start, target.get())?;
-                if virtual_target >= placed.source.get()
-                    && virtual_target <= add(placed.source.get(), placed.section.data.len() as u32)?
-                {
-                    addresses.insert(
-                        va(base, virtual_target)?,
-                        va(
-                            base,
-                            add(
-                                placed.section.rva.get(),
-                                virtual_target - placed.source.get(),
-                            )?,
-                        )?,
-                    );
-                }
-            }
-        }
-        addresses.insert(
-            va(base, placed.source.get())?,
-            va(base, placed.section.rva.get())?,
-        );
-    }
-    let (loader_rva, table_rva, table_end, startup_rva, code_end, loader, startup) = loop {
-        cursor = code_rva;
-        for function in &mut compiled {
-            cursor = crate::align_up(cursor, crate::FUNCTION_ALIGN)?;
-            function.rva = cursor;
-            addresses.insert(va(base, function.source.get())?, va(base, cursor)?);
-            cursor = add(cursor, function.slot)?;
-        }
-        let loader_rva = crate::align_up(cursor, crate::FUNCTION_ALIGN)?;
-        let plugin_entries = plugin_entries(plugins, &namespaces, &addresses, base)?;
-        let probe = entry_loader(
-            base,
-            loader_rva,
-            &plugin_entries,
-            original_entry,
-            pe.is_dll(),
-            mode,
-            0..0,
-        )?;
-        let loader_end = add(loader_rva, probe.len() as u32)?;
-        let (startup_rva, startup) = if has_startup {
-            let rva = crate::align_up(loader_end, crate::FUNCTION_ALIGN)?;
-            (rva, startup_thunk(base, rva, original_entry)?)
-        } else {
-            (loader_end, Vec::new())
-        };
-        let code_end = add(startup_rva, startup.len() as u32)?;
-        let table_rva = crate::align_up(code_end, alignment)?;
-        let count = if has_table {
-            plugins
-                .len()
-                .checked_add(usize::from(!pe.is_dll()))
-                .context("init table count overflow")?
-        } else {
-            0
-        };
-        let table_end = add(
-            table_rva,
-            u32::try_from(count.checked_mul(8).context("init table size overflow")?)?,
-        )?;
-        let loader = entry_loader(
-            base,
-            loader_rva,
-            &plugin_entries,
-            original_entry,
-            pe.is_dll(),
-            mode,
-            table_rva..table_end,
-        )?;
-        ensure!(
-            loader.len() == probe.len(),
-            "entry loader layout depends on table placement"
-        );
-        let mut grew = false;
-        for function in &mut compiled {
-            for reference in &function.references {
-                match *reference {
-                    crate::Operand::Branch(index, original) => {
-                        function.instructions[index].set_near_branch64(
-                            addresses.get(&original).copied().unwrap_or(original),
-                        );
-                    }
-                    crate::Operand::Rip(index, original) => {
-                        let target =
-                            placed_rip_target(original, &addresses, &data, &namespaces, base)
-                                .with_context(|| {
-                                    format!(
-                                        "plugin {}::{} RIP target",
-                                        plugins[function.plugin].name,
-                                        plugins[function.plugin].module.code[function.symbol].name
-                                    )
-                                })?;
-                        function.instructions[index].set_memory_displacement64(target);
-                    }
-                }
-            }
-            function.body = kamy_codegen::relocate(&function.instructions, va(base, function.rva)?)
-                .with_context(|| {
-                    format!(
-                        "placing plugin {}::{}",
-                        plugins[function.plugin].name,
-                        plugins[function.plugin].module.code[function.symbol].name
-                    )
-                })?;
-            let len =
-                u32::try_from(function.body.len()).context("module function exceeds RVA space")?;
-            if len > function.slot {
-                function.slot = len;
-                grew = true;
-            }
-        }
-        if !grew {
-            break (
-                loader_rva,
-                table_rva,
-                table_end,
-                startup_rva,
-                code_end,
-                loader,
-                startup,
-            );
-        }
-    };
-    for (plugin, namespace) in plugins.iter().zip(&namespaces) {
-        for reference in &plugin.module.references {
-            let source = Rva::new(add(namespace.start, reference.source.get())?);
-            let section = namespace
-                .module
-                .sections
-                .iter()
-                .position(|section| section.contains(source))
-                .context("authored reference source has no section")?;
-            if namespace.retired.contains(&section)
-                || !namespace.module.sections[section].flags.execute
-            {
-                continue;
-            }
-            target_rva(reference.target, namespace, &addresses, base).with_context(|| {
-                format!("plugin {} code reference {}", plugin.name, reference.source)
-            })?;
-        }
-    }
-    let mut relocations = transformed.relocations.clone();
-    rebase_data(
-        plugins,
-        &namespaces,
-        &mut data,
-        &addresses,
-        base,
-        table_rva..table_end,
-        &mut relocations,
-    )?;
-    let mut table = Vec::with_capacity((table_end - table_rva) as usize);
-    if has_table {
-        for entry in plugin_entries(plugins, &namespaces, &addresses, base)?
-            .into_iter()
-            .chain(has_startup.then_some(startup_rva))
-        {
-            relocations.push(Relocation {
-                rva: Rva::new(add(table_rva, table.len() as u32)?),
-                kind: RelocKind::Dir64,
-            });
-            table.extend_from_slice(&va(base, entry)?.to_le_bytes());
-        }
-    }
-    ensure!(
-        add(table_rva, table.len() as u32)? == table_end,
-        "invalid init-table bounds"
-    );
-    let xdata_rva = crate::align_up(table_end, alignment)?;
-    let mut xdata = Vec::new();
-    let mut entries: Vec<_> = output
-        .runtime_functions()
-        .iter()
-        .map(|function| {
-            (
-                function.begin.get(),
-                function.end.get(),
-                function.unwind.get(),
-            )
-        })
-        .collect();
-    let mut code = Vec::with_capacity((code_end - code_rva) as usize);
-    for function in &compiled {
-        crate::append_code(&mut code, code_rva, function.rva, &function.body)?;
-        append_generated_unwind(
-            base,
-            &mut xdata,
-            &mut entries,
-            xdata_rva,
-            function.rva,
-            &function.body,
-        )
-        .with_context(|| {
-            format!(
-                "unwind for plugin {}::{}",
-                plugins[function.plugin].name,
-                plugins[function.plugin].module.code[function.symbol].name
-            )
-        })?;
-        report.moved.push(function.source);
-        report.ssa_lowered_rvas.push(function.source);
-        report
-            .address_map
-            .insert(function.source, Rva::new(function.rva));
-        tracing::debug!(plugin = %plugins[function.plugin].name, source = %function.source, rva = function.rva, "linked SDK function");
-    }
-    crate::append_code(&mut code, code_rva, loader_rva, &loader)?;
-    append_generated_unwind(
-        base,
-        &mut xdata,
-        &mut entries,
-        xdata_rva,
-        loader_rva,
-        &loader,
-    )?;
-    if has_startup {
-        crate::append_code(&mut code, code_rva, startup_rva, &startup)?;
-        append_generated_unwind(
-            base,
-            &mut xdata,
-            &mut entries,
-            xdata_rva,
-            startup_rva,
-            &startup,
-        )?;
-    }
-    ensure!(
-        add(code_rva, code.len() as u32)? == code_end,
-        "invalid module code extent"
-    );
-    let relocation_rva = add(xdata_rva, crate::align_up(xdata.len() as u32, 4)?)?;
-    let relocation_bytes = kamy_pe::encode_base_relocations(&relocations)?;
-    xdata.resize((relocation_rva - xdata_rva) as usize, 0);
-    xdata.extend_from_slice(&relocation_bytes);
-    let pdata_rva = crate::align_up(add(xdata_rva, xdata.len() as u32)?, alignment)?;
-    let pdata = crate::encode_pdata(&mut entries)?;
-    let pdata_len = u32::try_from(pdata.len())?;
-    let mut sections = Vec::with_capacity(data.len() + 3 + usize::from(has_table));
-    sections.extend(data.into_iter().map(|placed| placed.section));
-    sections.push(crate::section(
-        opts.code_section.clone(),
-        code_rva,
-        true,
-        code,
-    ));
-    if has_table {
-        sections.push(crate::section(
-            opts.metadata_section.clone(),
-            table_rva,
-            false,
-            table,
-        ));
-    }
-    sections.extend([
-        crate::section(opts.metadata_section.clone(), xdata_rva, false, xdata),
-        crate::section(opts.pdata_section.clone(), pdata_rva, false, pdata),
-    ]);
-    let edits = PeEdits {
-        new_sections: sections,
-        directories: vec![
-            DirectoryUpdate {
-                index: 3,
-                rva: Rva::new(pdata_rva),
-                size: pdata_len,
-            },
-            DirectoryUpdate {
-                index: 5,
-                rva: if relocation_bytes.is_empty() {
-                    Rva::ZERO
-                } else {
-                    Rva::new(relocation_rva)
-                },
-                size: u32::try_from(relocation_bytes.len())?,
-            },
-        ],
-        entry_point: Some(Rva::new(loader_rva)),
-        ..Default::default()
-    };
-    report.ssa_lowered = report.ssa_lowered_rvas.len();
-    tracing::info!(
-        plugins = plugins.len(),
-        functions = compiled.len(),
-        "linked SDK modules"
-    );
-    Ok((
-        output
-            .rebuild(&edits)
-            .context("rebuilding PE with SDK modules")?,
-        report,
-    ))
+pub struct AuthoredFunction<'a> {
+    pub symbol: &'a kamy_pe::module::CodeSymbol,
+    pub function: kamy_core::Function,
+    pub references: Vec<OperandReference>,
 }
 
-fn namespaces(host: &Module, plugins: &[Plugin]) -> anyhow::Result<Vec<Namespace>> {
-    let mut cursor = crate::align_up(image_end(host)?, 0x1_0000)?;
-    let host_targets: Vec<_> = plugins
-        .iter()
-        .flat_map(|plugin| &plugin.module.references)
-        .filter_map(|reference| {
-            if reference.target != ModuleTarget::ImageBase {
-                return None;
-            }
-            // An x64 instruction has at most 15 bytes, including any COFF-unbiased tail.
-            let (bias, trailing) = match reference.kind {
-                ModuleReferenceKind::Relative32 { bias } => (i128::from(bias), 15),
-                _ => (0, 0),
-            };
-            let start = i128::from(reference.addend) - bias;
-            Some((start, start + trailing))
-        })
-        .collect();
-    let mut names = HashSet::new();
-    let mut result = Vec::new();
-    for plugin in plugins {
-        ensure!(
-            !plugin.name.is_empty() && names.insert(plugin.name.as_str()),
-            "plugin names must be nonempty and unique: {}",
-            plugin.name
-        );
+impl<'a> AuthoredSource<'a> {
+    pub fn new(plugin: &'a Plugin) -> anyhow::Result<Self> {
         let pe = PeFile::parse(&plugin.module.image)
             .with_context(|| format!("parsing plugin {}", plugin.name))?;
         ensure!(
-            pe.is_dll(),
-            "plugin {} is not a specialized DLL",
+            pe.is_dll() && pe.subsystem() != 1,
+            "plugin {} is not a user-mode specialized DLL",
             plugin.name
         );
+        let mut module = pe.to_module();
+        module.symbols = plugin.module.symbols.clone();
+        let source_positions: BTreeMap<_, _> = module
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.id.clone(), symbol.rva))
+            .collect();
         ensure!(
-            pe.subsystem() != 1,
-            "plugin {} is a kernel image",
+            source_positions.len() == module.symbols.len(),
+            "plugin {} has duplicate compiler symbol identities",
             plugin.name
         );
-        let module = pe.to_module();
-        let retired = retired_sections(&pe, &module)
-            .with_context(|| format!("plugin {} directories", plugin.name))?;
         ensure!(
             !plugin.module.code.is_empty(),
             "plugin {} has no authored functions",
             plugin.name
         );
         let mut previous_end = 0;
+        let mut previous_start = None;
         let mut code: Vec<_> = plugin.module.code.iter().collect();
         code.sort_by_key(|symbol| symbol.start);
         for symbol in code {
+            ensure!(
+                previous_start != Some(symbol.start),
+                "plugin {} has ambiguous authored code symbols at local RVA {}",
+                plugin.name,
+                symbol.start
+            );
             ensure!(
                 symbol.start.get() >= previous_end && symbol.end > symbol.start,
                 "plugin {} has overlapping/empty authored function {}",
@@ -583,15 +152,22 @@ fn namespaces(host: &Module, plugins: &[Plugin]) -> anyhow::Result<Vec<Namespace
             );
             let section = module
                 .section_at(symbol.start)
-                .context("authored function lies outside module")?;
+                .context("authored function outside module")?;
             ensure!(
                 section.flags.execute
                     && symbol.end.get() <= add(section.rva.get(), section.virtual_size)?,
-                "plugin {} function {} crosses an executable section",
+                "plugin {} function {} crosses executable storage",
+                plugin.name,
+                symbol.name
+            );
+            ensure!(
+                source_positions.get(&symbol.symbol) == Some(&symbol.start),
+                "plugin {} function {} has no compiler symbol binding",
                 plugin.name,
                 symbol.name
             );
             previous_end = symbol.end.get();
+            previous_start = Some(symbol.start);
         }
         ensure!(
             plugin
@@ -602,45 +178,1176 @@ fn namespaces(host: &Module, plugins: &[Plugin]) -> anyhow::Result<Vec<Namespace
             "plugin {} entry has no authored function",
             plugin.name
         );
-        let extent = image_end(&module)?;
-        let end = loop {
-            let end = add(cursor, extent)
-                .with_context(|| format!("plugin {} synthetic namespace extent", plugin.name))?;
-            let target = host_targets
+        let retired = retired_sections(&pe, &module)
+            .with_context(|| format!("plugin {} directories", plugin.name))?;
+        Ok(Self {
+            plugin,
+            module,
+            source_positions,
+            retired,
+            boundaries: plugin
+                .module
+                .code
                 .iter()
-                .filter(|&&(start, target_end)| {
-                    start <= i128::from(end) && target_end >= i128::from(cursor)
-                })
-                .map(|&(_, end)| end)
-                .max();
-            let Some(target) = target else {
-                break end;
-            };
-            cursor = u32::try_from(target)
-                .context("host-base-relative target exceeds RVA range")
-                .and_then(|target| add(target, 1))
-                .and_then(|after| crate::align_up(after, 0x1_0000))
-                .with_context(|| {
-                    format!(
-                        "plugin {} synthetic namespace above host-base-relative target {target:#x}",
+                .flat_map(|symbol| [symbol.start.get(), symbol.end.get()])
+                .collect(),
+            signatures: plugin
+                .module
+                .code
+                .iter()
+                .map(|symbol| (symbol.symbol.clone(), &symbol.signature))
+                .collect(),
+        })
+    }
+
+    pub fn module(&self) -> &Module {
+        &self.module
+    }
+
+    /// Select an exact compiler entry in source-local coordinates. Without a
+    /// host, host-image-base expressions remain unbound symbolic references.
+    pub fn function_at(
+        &self,
+        rva: Rva,
+        host: Option<&Module>,
+    ) -> anyhow::Result<AuthoredFunction<'_>> {
+        let mut matches = self
+            .plugin
+            .module
+            .code
+            .iter()
+            .filter(|symbol| symbol.start == rva);
+        let symbol = matches.next().with_context(|| {
+            format!(
+                "plugin {} has no authored code symbol at local RVA {rva}",
+                self.plugin.name
+            )
+        })?;
+        ensure!(
+            matches.next().is_none(),
+            "plugin {} has ambiguous authored code symbols at local RVA {rva}",
+            self.plugin.name
+        );
+        let function = kamy_disasm::recover_function(
+            &self.module,
+            symbol.start,
+            &self.boundaries,
+            &BTreeSet::new(),
+        );
+        ensure!(
+            !function.blocks.is_empty()
+                && function
+                    .blocks
+                    .iter()
+                    .all(|block| block.start >= symbol.start && block.end <= symbol.end),
+            "plugin {}::{} has control flow outside its authored range",
+            self.plugin.name,
+            symbol.name
+        );
+        let references = operand_references(self.plugin, self, symbol, host)
+            .with_context(|| format!("plugin {}::{} operands", self.plugin.name, symbol.name))?;
+        Ok(AuthoredFunction {
+            symbol,
+            function,
+            references,
+        })
+    }
+}
+
+impl CallingConvLookup for AuthoredSource<'_> {
+    fn lookup(&self, _: u64) -> Option<FnSignature> {
+        None
+    }
+    fn lookup_symbol(&self, symbol: &SymbolId) -> Option<FnSignature> {
+        if let Some(signature) = self.signatures.get(symbol) {
+            return Some((*signature).clone());
+        }
+        let expression =
+            canonical_expression(SymbolicExpression::symbol(symbol.clone()), self.plugin).ok()?;
+        let SymbolicExpression::Symbol { symbol, addend: 0 } = expression else {
+            return None;
+        };
+        self.signatures
+            .get(&symbol)
+            .map(|signature| (*signature).clone())
+    }
+}
+
+pub(crate) struct Plan<'a> {
+    plugins: &'a [Plugin],
+    inputs: Vec<Input<'a>>,
+    compiled: Vec<Compiled>,
+    data: Vec<PlacedData>,
+    bindings: BTreeMap<SymbolId, u64>,
+    placements: Vec<Placement>,
+    base: u64,
+    alignment: u32,
+    mode: EntryMode,
+    dll: bool,
+    original_entry: Option<Rva>,
+    has_table: bool,
+    code_name: String,
+    metadata_name: String,
+    loader_rva: u32,
+    loader: Vec<u8>,
+    startup_rva: u32,
+    startup: Vec<u8>,
+    table_rva: u32,
+    table_end: u32,
+    table: Vec<u8>,
+    relocations: Vec<Relocation>,
+    pinned_host: BTreeSet<Rva>,
+}
+
+impl<'a> Plan<'a> {
+    pub(crate) fn prepare(
+        pe: &PeFile,
+        host: &Module,
+        opts: &Options,
+        transform: &mut dyn FnMut(
+            &SymbolId,
+            &mut IrFunction,
+            f32,
+        ) -> anyhow::Result<TransformOutcome>,
+        injection: Injection<'a>,
+    ) -> anyhow::Result<Self> {
+        let Injection { plugins, mode } = injection;
+        planned_functions(plugins)?;
+        if !plugins.is_empty() {
+            ensure!(
+                pe.subsystem() != 1,
+                "SDK module injection is prohibited for kernel images"
+            );
+            ensure!(
+                host.entry_point.is_some(),
+                "SDK module injection requires an original entry point"
+            );
+        }
+        let has_table = !plugins.is_empty()
+            && (mode == EntryMode::InitTable
+                || plugins.iter().any(|plugin| {
+                    plugin
+                        .module
+                        .data
+                        .iter()
+                        .any(|symbol| is_bound(&symbol.name))
+                }));
+        let mut plan = Self {
+            plugins,
+            inputs: Vec::new(),
+            compiled: Vec::new(),
+            data: Vec::new(),
+            bindings: BTreeMap::new(),
+            placements: Vec::new(),
+            base: host.image_base,
+            alignment: pe.section_alignment(),
+            mode,
+            dll: pe.is_dll(),
+            original_entry: host.entry_point,
+            has_table,
+            code_name: opts.code_section.clone(),
+            metadata_name: opts.metadata_section.clone(),
+            loader_rva: 0,
+            loader: Vec::new(),
+            startup_rva: 0,
+            startup: Vec::new(),
+            table_rva: 0,
+            table_end: 0,
+            table: Vec::new(),
+            relocations: Vec::new(),
+            pinned_host: BTreeSet::new(),
+        };
+        for (index, plugin) in plugins.iter().enumerate() {
+            let source = AuthoredSource::new(plugin)?;
+            let module = &source.module;
+            let retired = &source.retired;
+            let source_positions = &source.source_positions;
+            let mut references = Vec::new();
+            for reference in &plugin.module.references {
+                let source = reference_source(source_positions, reference)?;
+                let section = module
+                    .sections
+                    .iter()
+                    .position(|section| section.contains(source))
+                    .context("authored reference source outside storage")?;
+                if retired.contains(&section) || module.sections[section].flags.execute {
+                    continue;
+                }
+                let mut reference = reference.clone();
+                reference.expression = canonical_expression(reference.expression, plugin)?;
+                validate_code_expression(&reference.expression, plugin)?;
+                reference.expression = identify_host_object(reference.expression, host)?;
+                pin_interior_host(&reference.expression, host, &mut plan.pinned_host);
+                references.push(reference);
+            }
+            for symbol in &plugin.module.data {
+                let section = module
+                    .section_at(symbol.start)
+                    .context("authored data outside module")?;
+                ensure!(
+                    !section.flags.execute
+                        && add(symbol.start.get(), symbol.size)?
+                            <= add(section.rva.get(), section.virtual_size)?,
+                    "plugin {} data {} crosses its storage",
+                    plugin.name,
+                    symbol.name
+                );
+                ensure!(
+                    module
+                        .symbols
+                        .iter()
+                        .any(|binding| binding.id == symbol.symbol && binding.rva == symbol.start),
+                    "plugin {} data {} has no compiler symbol binding",
+                    plugin.name,
+                    symbol.name
+                );
+                if is_bound(&symbol.name) {
+                    ensure!(
+                        symbol.size == 8
+                            && add(symbol.start.get() - section.rva.get(), symbol.size)?
+                                <= u32::try_from(section.data.len())?,
+                        "plugin {} SDK bound {} requires initialized pointer-sized storage; rebuild with the current kamy-sdk",
+                        plugin.name,
+                        symbol.name
+                    );
+                }
+            }
+            let mut fields = Vec::with_capacity(plugin.module.references.len());
+            for reference in &plugin.module.references {
+                let source = reference_source(source_positions, reference)?;
+                let section_index = module
+                    .sections
+                    .iter()
+                    .position(|section| section.contains(source))
+                    .context("reference outside storage")?;
+                if retired.contains(&section_index) {
+                    continue;
+                }
+                let section = &module.sections[section_index];
+                let end = add(source.get(), reference.field.width())?;
+                ensure!(
+                    end <= add(section.rva.get(), section.virtual_size)?,
+                    "plugin {} reference crosses storage",
+                    plugin.name
+                );
+                if section.flags.execute {
+                    ensure!(
+                        plugin
+                            .module
+                            .code
+                            .iter()
+                            .any(|symbol| symbol.start <= source && end <= symbol.end.get()),
+                        "plugin {} reference has no authored function owner",
                         plugin.name
+                    );
+                }
+                fields.push((source.get(), end));
+            }
+            fields.sort_unstable();
+            ensure!(
+                fields.windows(2).all(|pair| pair[0].1 <= pair[1].0),
+                "plugin {} has overlapping authored reference fields",
+                plugin.name
+            );
+            for (section_index, section) in module.sections.iter().enumerate() {
+                if section.virtual_size == 0
+                    || section.flags.execute
+                    || retired.contains(&section_index)
+                {
+                    continue;
+                }
+                let initialized = section.data.len().min(section.virtual_size as usize);
+                plan.data.push(PlacedData {
+                    plugin: index,
+                    source: section.rva,
+                    section: NewSection {
+                        name: opts.metadata_section.clone(),
+                        rva: Rva::ZERO,
+                        virtual_size: section.virtual_size,
+                        flags: section.flags,
+                        data: section.data[..initialized].to_vec(),
+                    },
+                });
+            }
+            plan.inputs.push(Input { source, references });
+        }
+        for (index, plugin) in plugins.iter().enumerate() {
+            let input = &plan.inputs[index];
+            for symbol in &plugin.module.code {
+                let prepared = input.source.function_at(symbol.start, Some(host))?;
+                let selected = opts
+                    .selected_symbols
+                    .as_ref()
+                    .is_none_or(|symbols| symbols.contains(&symbol.symbol));
+                let mut identity =
+                    |_: &SymbolId, _: &mut IrFunction, _: f32| Ok(TransformOutcome::default());
+                let callback = if selected {
+                    &mut *transform
+                } else {
+                    &mut identity
+                };
+                let mut lowered = match crate::ssa_instructions(
+                    &input.source.module,
+                    host,
+                    &prepared.function,
+                    &symbol.symbol,
+                    &prepared.references,
+                    &input.source,
+                    callback,
+                ) {
+                    Ok(lowered) => lowered,
+                    Err(LoweringError::Rejected(reason)) => bail!(
+                        "plugin {}::{} cannot pass SSA/codegen: {reason:?}",
+                        plugin.name,
+                        symbol.name
+                    ),
+                    Err(LoweringError::Callback(error)) => return Err(error),
+                };
+                plan.pinned_host.extend(lowered.pinned_host.iter().copied());
+                ensure!(
+                    !lowered.selected.instructions.is_empty(),
+                    "plugin {}::{} generated no code",
+                    plugin.name,
+                    symbol.name
+                );
+                lowered
+                    .selected
+                    .instructions
+                    .insert(0, Instruction::with(Code::Endbr64));
+                for reference in &mut lowered.selected.references {
+                    reference.instruction += 1;
+                }
+                let indirect = crate::translation::instrument(&mut lowered.selected.instructions)
+                    .with_context(|| {
+                    format!(
+                        "plugin {}::{} indirect references",
+                        plugin.name, symbol.name
                     )
                 })?;
-        };
-        let start = cursor;
-        cursor = crate::align_up(end, 0x1_0000)
-            .with_context(|| format!("plugin {} synthetic namespace end", plugin.name))?;
-        result.push(Namespace {
-            start,
-            module,
-            retired,
-        });
+                plan.compiled.push(Compiled {
+                    plugin: index,
+                    symbol: symbol.symbol.clone(),
+                    source: symbol.start,
+                    selected: lowered.selected,
+                    indirect,
+                    slot: 1,
+                    rva: 0,
+                    body: Vec::new(),
+                    report: FunctionReport {
+                        symbol: symbol.symbol.clone(),
+                        selected,
+                        eligible: true,
+                        lowered: true,
+                        transformed: lowered.transformed,
+                        intensity: lowered.intensity,
+                    },
+                });
+            }
+        }
+        Ok(plan)
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.plugins.is_empty()
+    }
+    pub(crate) fn pins(&self, rva: Rva) -> bool {
+        self.pinned_host.contains(&rva)
+    }
+    pub(crate) fn helper_registers(&self) -> impl Iterator<Item = Register> + '_ {
+        self.compiled
+            .iter()
+            .flat_map(|function| function.indirect.iter().map(|&(_, register)| register))
+    }
+
+    pub(crate) fn place(
+        &mut self,
+        start: u32,
+        host: &BTreeMap<Rva, Rva>,
+        helpers: &BTreeMap<u32, (Register, u32)>,
+    ) -> anyhow::Result<u32> {
+        if self.is_empty() {
+            return Ok(start);
+        }
+        let original = self.original_entry.context("missing original entry")?;
+        let original = host.get(&original).copied().unwrap_or(original);
+        let mut cursor = crate::align_up(start, self.alignment)?;
+        for placed in &mut self.data {
+            cursor = crate::align_up(cursor, self.alignment)?;
+            placed.section.rva = Rva::new(cursor);
+            cursor = add(cursor, placed.section.virtual_size)?;
+        }
+        let code_start = crate::align_up(cursor, self.alignment)?;
+        for iteration in 0..4096 {
+            self.bindings.clear();
+            for placed in &self.data {
+                for symbol in &self.plugins[placed.plugin].module.symbols {
+                    if self.plugins[placed.plugin]
+                        .module
+                        .bindings
+                        .contains_key(&symbol.id)
+                    {
+                        continue;
+                    }
+                    if placed.source <= symbol.rva
+                        && symbol.rva.get() < add(placed.source.get(), placed.section.virtual_size)?
+                    {
+                        self.bindings.insert(
+                            symbol.id.clone(),
+                            va(
+                                self.base,
+                                add(
+                                    placed.section.rva.get(),
+                                    symbol.rva.get() - placed.source.get(),
+                                )?,
+                            )?,
+                        );
+                    }
+                }
+            }
+            cursor = code_start;
+            for function in &mut self.compiled {
+                cursor = crate::align_up(cursor, crate::FUNCTION_ALIGN)?;
+                function.rva = cursor;
+                self.bindings
+                    .insert(function.symbol.clone(), va(self.base, cursor)?);
+                cursor = add(cursor, function.slot)?;
+            }
+            for plugin in self.plugins {
+                for symbol in plugin.module.bindings.keys() {
+                    let expression =
+                        canonical_expression(SymbolicExpression::symbol(symbol.clone()), plugin)?;
+                    // Interior code labels and retired metadata have no post-SSA storage map.
+                    if validate_code_expression(&expression, plugin).is_err() {
+                        continue;
+                    }
+                    let Some(value) = expression.evaluate(|root| {
+                        self.bindings
+                            .get(root)
+                            .copied()
+                            .or_else(|| crate::resolve_host(root, host, self.base))
+                    }) else {
+                        continue;
+                    };
+                    self.bindings.insert(
+                        symbol.clone(),
+                        u64::try_from(value).context("authored alias exceeds address space")?,
+                    );
+                }
+            }
+            self.loader_rva = crate::align_up(cursor, crate::FUNCTION_ALIGN)?;
+            let entries = self
+                .plugins
+                .iter()
+                .enumerate()
+                .map(|(index, plugin)| {
+                    self.compiled
+                        .iter()
+                        .find(|function| {
+                            function.plugin == index && function.source == plugin.module.entry
+                        })
+                        .map(|function| function.rva)
+                        .context("module entry has no final placement")
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let probe = entry_loader(
+                self.base,
+                self.loader_rva,
+                &entries,
+                original,
+                self.dll,
+                self.mode,
+                0..0,
+            )?;
+            let loader_end = add(self.loader_rva, u32::try_from(probe.len())?)?;
+            self.startup_rva = crate::align_up(loader_end, crate::FUNCTION_ALIGN)?;
+            self.startup = if self.has_table && !self.dll {
+                startup_thunk(self.base, self.startup_rva, original)?
+            } else {
+                Vec::new()
+            };
+            let code_end = if self.startup.is_empty() {
+                loader_end
+            } else {
+                add(self.startup_rva, u32::try_from(self.startup.len())?)?
+            };
+            self.table_rva = crate::align_up(code_end, self.alignment)?;
+            let count = if self.has_table {
+                self.plugins
+                    .len()
+                    .checked_add(usize::from(!self.dll))
+                    .context("table count overflow")?
+            } else {
+                0
+            };
+            self.table_end = add(
+                self.table_rva,
+                u32::try_from(count.checked_mul(8).context("table size overflow")?)?,
+            )?;
+            self.loader = entry_loader(
+                self.base,
+                self.loader_rva,
+                &entries,
+                original,
+                self.dll,
+                self.mode,
+                self.table_rva..self.table_end,
+            )?;
+            ensure!(
+                self.loader.len() == probe.len(),
+                "entry loader size depends on table placement"
+            );
+            let mut grew = false;
+            for function in &mut self.compiled {
+                kamy_codegen::bind_references(&mut function.selected, self.base, |symbol| {
+                    self.bindings
+                        .get(symbol)
+                        .copied()
+                        .or_else(|| crate::resolve_host(symbol, host, self.base))
+                })
+                .with_context(|| {
+                    format!(
+                        "binding plugin {} symbol {:?}",
+                        self.plugins[function.plugin].name, function.symbol
+                    )
+                })?;
+                for &(index, register) in &function.indirect {
+                    let rva = helpers
+                        .get(&(register as u32))
+                        .context("missing authored indirect translator")?
+                        .1;
+                    function.selected.instructions[index].set_near_branch64(va(self.base, rva)?);
+                }
+                function.body = kamy_codegen::relocate(
+                    &function.selected.instructions,
+                    va(self.base, function.rva)?,
+                )
+                .with_context(|| {
+                    format!(
+                        "encoding plugin {} symbol {:?}",
+                        self.plugins[function.plugin].name, function.symbol
+                    )
+                })?;
+                let size = u32::try_from(function.body.len())?;
+                if size > function.slot {
+                    function.slot = size;
+                    grew = true;
+                }
+            }
+            if grew {
+                ensure!(
+                    iteration < 4095,
+                    "module layout failed to converge after 4096 monotone iterations"
+                );
+                continue;
+            }
+            self.table.clear();
+            self.relocations.clear();
+            if self.has_table {
+                for entry in entries
+                    .into_iter()
+                    .chain((!self.dll).then_some(self.startup_rva))
+                {
+                    self.relocations.push(Relocation {
+                        rva: Rva::new(add(self.table_rva, u32::try_from(self.table.len())?)?),
+                        kind: RelocKind::Dir64,
+                    });
+                    self.table
+                        .extend_from_slice(&va(self.base, entry)?.to_le_bytes());
+                }
+            }
+            self.rebase_data(host)?;
+            self.record_placements()?;
+            return Ok(if self.has_table {
+                self.table_end
+            } else {
+                code_end
+            });
+        }
+        unreachable!()
+    }
+
+    fn rebase_data(&mut self, host: &BTreeMap<Rva, Rva>) -> anyhow::Result<()> {
+        for placed in &mut self.data {
+            let plugin = &self.plugins[placed.plugin];
+            let source_end = add(placed.source.get(), placed.section.virtual_size)?;
+            for reference in &self.inputs[placed.plugin].references {
+                let source = reference_source(
+                    &self.inputs[placed.plugin].source.source_positions,
+                    reference,
+                )?;
+                if source < placed.source || source.get() >= source_end {
+                    continue;
+                }
+                if plugin
+                    .module
+                    .data
+                    .iter()
+                    .any(|symbol| is_bound(&symbol.name) && symbol.start == source)
+                {
+                    continue;
+                }
+                let offset = usize::try_from(source.get() - placed.source.get())?;
+                let end = offset
+                    .checked_add(reference.field.width() as usize)
+                    .context("reference size overflow")?;
+                ensure!(
+                    end <= placed.section.virtual_size as usize,
+                    "plugin {} reference crosses data storage",
+                    plugin.name
+                );
+                ensure!(
+                    end <= placed.section.data.len(),
+                    "plugin {} reference {:?} requires initialized data storage; rebuild the module producer",
+                    plugin.name,
+                    reference.source
+                );
+                let value = reference
+                    .expression
+                    .evaluate(|symbol| {
+                        self.bindings
+                            .get(symbol)
+                            .copied()
+                            .or_else(|| crate::resolve_host(symbol, host, self.base))
+                    })
+                    .with_context(|| {
+                        format!(
+                            "plugin {} reference {:?} has no final target",
+                            plugin.name, reference.source
+                        )
+                    })?;
+                reference
+                    .field
+                    .encode_into(
+                        value,
+                        va(self.base, add(placed.section.rva.get(), offset as u32)?)?,
+                        self.base,
+                        &mut placed.section.data[offset..end],
+                    )
+                    .with_context(|| {
+                        format!(
+                            "plugin {} reference {:?} exceeds {:?} range",
+                            plugin.name, reference.source, reference.field
+                        )
+                    })?;
+                if reference.field == LinkField::Absolute64
+                    && matches!(reference.expression, SymbolicExpression::Symbol { .. })
+                {
+                    self.relocations.push(Relocation {
+                        rva: Rva::new(add(placed.section.rva.get(), offset as u32)?),
+                        kind: RelocKind::Dir64,
+                    });
+                }
+            }
+            for symbol in plugin
+                .module
+                .data
+                .iter()
+                .filter(|symbol| is_bound(&symbol.name))
+            {
+                if symbol.start < placed.source || symbol.start.get() >= source_end {
+                    continue;
+                }
+                ensure!(
+                    symbol.size == 8,
+                    "plugin {} SDK bound {} is not pointer-sized",
+                    plugin.name,
+                    symbol.name
+                );
+                let offset = usize::try_from(symbol.start.get() - placed.source.get())?;
+                let end = offset.checked_add(8).context("bound offset overflow")?;
+                ensure!(
+                    end <= placed.section.virtual_size as usize,
+                    "SDK bound crosses data storage"
+                );
+                ensure!(
+                    end <= placed.section.data.len(),
+                    "plugin {} SDK bound {} requires initialized data storage; rebuild with the current kamy-sdk",
+                    plugin.name,
+                    symbol.name
+                );
+                let target = if symbol.name == "SYMBOL_init_table_start" {
+                    self.table_rva
+                } else {
+                    self.table_end
+                };
+                placed.section.data[offset..end]
+                    .copy_from_slice(&va(self.base, target)?.to_le_bytes());
+                self.relocations.push(Relocation {
+                    rva: Rva::new(add(placed.section.rva.get(), offset as u32)?),
+                    kind: RelocKind::Dir64,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn record_placements(&mut self) -> anyhow::Result<()> {
+        self.placements.clear();
+        for function in &self.compiled {
+            self.placements.push(Placement {
+                symbol: function.symbol.clone(),
+                source_rva: Some(function.source),
+                rva: Rva::new(function.rva),
+                size: u32::try_from(function.body.len())?,
+                ownership: Ownership::Generated,
+            });
+        }
+        for placed in &self.data {
+            for symbol in &self.plugins[placed.plugin].module.symbols {
+                if let Some(&target) = self.bindings.get(&symbol.id) {
+                    if placed.source <= symbol.rva
+                        && symbol.rva.get() < add(placed.source.get(), placed.section.virtual_size)?
+                        && va(self.base, placed.section.rva.get())? <= target
+                        && target
+                            < va(
+                                self.base,
+                                add(placed.section.rva.get(), placed.section.virtual_size)?,
+                            )?
+                    {
+                        let size = self.plugins[placed.plugin]
+                            .module
+                            .data
+                            .iter()
+                            .find(|data| data.symbol == symbol.id)
+                            .map_or(
+                                placed.section.virtual_size
+                                    - (symbol.rva.get() - placed.source.get()),
+                                |data| data.size,
+                            );
+                        self.placements.push(Placement {
+                            symbol: symbol.id.clone(),
+                            source_rva: Some(symbol.rva),
+                            rva: Rva::new(u32::try_from(target - self.base)?),
+                            size,
+                            ownership: Ownership::Generated,
+                        });
+                    }
+                }
+            }
+        }
+        for (name, rva, size) in [
+            ("entry-loader", self.loader_rva, self.loader.len()),
+            ("startup", self.startup_rva, self.startup.len()),
+            ("init-table", self.table_rva, self.table.len()),
+        ] {
+            if size != 0 {
+                self.placements.push(Placement {
+                    symbol: SymbolId::Generated { name: name.into() },
+                    source_rva: None,
+                    rva: Rva::new(rva),
+                    size: u32::try_from(size)?,
+                    ownership: Ownership::Generated,
+                });
+            }
+        }
+        for (index, input) in self.inputs.iter().enumerate() {
+            for &retired in &input.source.retired {
+                let section = &input.source.module.sections[retired];
+                for symbol in &self.plugins[index].module.symbols {
+                    if section.contains(symbol.rva) {
+                        self.placements.push(Placement {
+                            symbol: symbol.id.clone(),
+                            source_rva: Some(symbol.rva),
+                            rva: symbol.rva,
+                            size: section.virtual_size - (symbol.rva.get() - section.rva.get()),
+                            ownership: Ownership::Retired,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn emit(
+        &mut self,
+        sections: &mut Vec<NewSection>,
+        relocations: &mut Vec<Relocation>,
+        xdata: &mut Vec<u8>,
+        entries: &mut Vec<(u32, u32, u32)>,
+        xdata_rva: u32,
+    ) -> anyhow::Result<()> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        let code_rva = self.compiled.first().context("no module code")?.rva;
+        let mut code = Vec::new();
+        for function in &self.compiled {
+            ensure!(
+                function.body.len() <= function.slot as usize,
+                "module body exceeds reserved slot"
+            );
+            crate::append_code(&mut code, code_rva, function.rva, &function.body)?;
+            append_generated_unwind(
+                self.base,
+                xdata,
+                entries,
+                xdata_rva,
+                function.rva,
+                &function.body,
+            )?;
+        }
+        crate::append_code(&mut code, code_rva, self.loader_rva, &self.loader)?;
+        append_generated_unwind(
+            self.base,
+            xdata,
+            entries,
+            xdata_rva,
+            self.loader_rva,
+            &self.loader,
+        )?;
+        if !self.startup.is_empty() {
+            crate::append_code(&mut code, code_rva, self.startup_rva, &self.startup)?;
+            append_generated_unwind(
+                self.base,
+                xdata,
+                entries,
+                xdata_rva,
+                self.startup_rva,
+                &self.startup,
+            )?;
+        }
+        sections.extend(self.data.drain(..).map(|placed| placed.section));
+        sections.push(crate::section(self.code_name.clone(), code_rva, true, code));
+        if self.has_table {
+            sections.push(crate::section(
+                self.metadata_name.clone(),
+                self.table_rva,
+                false,
+                std::mem::take(&mut self.table),
+            ));
+        }
+        relocations.append(&mut self.relocations);
+        Ok(())
+    }
+
+    pub(crate) fn entry_point(&self) -> Option<Rva> {
+        (!self.is_empty()).then_some(Rva::new(self.loader_rva))
+    }
+
+    pub(crate) fn finish_report(&self, report: &mut Report) {
+        report.placements.extend(self.placements.iter().cloned());
+        report
+            .address_map
+            .extend(self.bindings.iter().filter_map(|(symbol, &target)| {
+                u32::try_from(target.checked_sub(self.base)?)
+                    .ok()
+                    .map(|rva| (symbol.clone(), Rva::new(rva)))
+            }));
+        for function in &self.compiled {
+            report.moved.push(function.symbol.clone());
+            report.ssa_lowered_symbols.push(function.symbol.clone());
+            report.functions.push(function.report.clone());
+        }
+        report.ssa_lowered = report.ssa_lowered_symbols.len();
+    }
+}
+
+fn is_bound(name: &str) -> bool {
+    matches!(name, "SYMBOL_init_table_start" | "SYMBOL_init_table_end")
+}
+
+fn reference_source(
+    positions: &BTreeMap<SymbolId, Rva>,
+    reference: &Reference,
+) -> anyhow::Result<Rva> {
+    let source = positions.get(&reference.source).with_context(|| {
+        format!(
+            "authored reference source {:?}+0x{:x} has no compiler symbol",
+            reference.source, reference.offset
+        )
+    })?;
+    Ok(Rva::new(add(source.get(), reference.offset)?))
+}
+
+fn operand_references(
+    plugin: &Plugin,
+    input: &AuthoredSource<'_>,
+    symbol: &kamy_pe::module::CodeSymbol,
+    host: Option<&Module>,
+) -> anyhow::Result<Vec<OperandReference>> {
+    let module = &input.module;
+    let mut result = Vec::new();
+    let section = module
+        .section_at(symbol.start)
+        .context("authored function has no storage")?;
+    let bytes = module
+        .bytes_at(symbol.start)
+        .and_then(|bytes| bytes.get(..(symbol.end.get() - symbol.start.get()) as usize))
+        .context("truncated authored function")?;
+    let mut decoder = Decoder::with_ip(
+        64,
+        bytes,
+        va(module.image_base, symbol.start.get())?,
+        DecoderOptions::NONE,
+    );
+    let mut matched = BTreeSet::new();
+    let mut fields = BTreeMap::new();
+    for (index, reference) in plugin.module.references.iter().enumerate() {
+        let source = reference_source(&input.source_positions, reference)?;
+        if symbol.start <= source && source < symbol.end {
+            ensure!(
+                fields.insert(source, (index, reference)).is_none(),
+                "duplicate authored field at {source}"
+            );
+        }
+    }
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        let constants = decoder.get_constant_offsets(&instruction);
+        let instruction_rva = u32::try_from(instruction.ip() - module.image_base)?;
+        let next_rva = u32::try_from(instruction.next_ip() - module.image_base)?;
+        for (&source, &(index, reference)) in
+            fields.range(Rva::new(instruction_rva)..Rva::new(next_rva))
+        {
+            let displacement = instruction_rva.checked_add(constants.displacement_offset() as u32);
+            let immediate = instruction_rva.checked_add(constants.immediate_offset() as u32);
+            let operand =
+                if constants.displacement_size() != 0 && displacement == Some(source.get()) {
+                    ensure!(
+                        instruction.is_ip_rel_memory_operand(),
+                        "authored address displacement is not RIP-relative"
+                    );
+                    (0..instruction.op_count())
+                        .find(|&operand| instruction.op_kind(operand) == OpKind::Memory)
+                        .context("missing memory operand")?
+                } else if constants.immediate_size() != 0 && immediate == Some(source.get()) {
+                    (0..instruction.op_count())
+                        .find(|&operand| {
+                            matches!(
+                                instruction.op_kind(operand),
+                                OpKind::Immediate64
+                                    | OpKind::Immediate32
+                                    | OpKind::Immediate32to64
+                                    | OpKind::NearBranch64
+                            )
+                        })
+                        .context("missing immediate operand")?
+                } else {
+                    continue;
+                };
+            ensure!(
+                reference.field.width() as usize
+                    == if displacement == Some(source.get()) {
+                        constants.displacement_size()
+                    } else {
+                        constants.immediate_size()
+                    },
+                "authored field width disagrees with its instruction operand"
+            );
+            let mut reference = reference.clone();
+            if let LinkField::Relative32 { bias } = reference.field {
+                let origin = va(module.image_base, add(source.get(), 4 + u32::from(bias))?)?;
+                let correction =
+                    i64::try_from(i128::from(instruction.next_ip()) - i128::from(origin))?;
+                reference.expression = reference
+                    .expression
+                    .with_addend(correction)
+                    .context("authored RIP addend overflow")?;
+            }
+            reference.expression = canonical_expression(reference.expression, plugin)?;
+            validate_code_expression(&reference.expression, plugin)?;
+            if let Some(host) = host {
+                reference.expression = identify_host_object(reference.expression, host)?;
+            }
+            if reference.field == LinkField::ImageRelative32 {
+                reference.expression = match reference.expression {
+                    SymbolicExpression::Symbol { symbol, addend } => {
+                        SymbolicExpression::Difference {
+                            left: symbol,
+                            right: SymbolId::HostImageBase,
+                            addend,
+                        }
+                    }
+                    SymbolicExpression::Difference { .. } => {
+                        bail!("image-relative composite operand needs an unsupported third symbol")
+                    }
+                };
+                reference.field = LinkField::Absolute64;
+            }
+            reference.source = symbol.symbol.clone();
+            reference.offset = source.get() - symbol.start.get();
+            result.push(OperandReference {
+                instruction: Rva::new(instruction_rva),
+                operand,
+                reference,
+            });
+            ensure!(
+                matched.insert(index),
+                "authored reference matches multiple operands"
+            );
+        }
+    }
+    for (&source, &(index, _)) in &fields {
+        ensure!(
+            matched.contains(&index),
+            "plugin {} function {} reference {} is not an exact instruction operand",
+            plugin.name,
+            symbol.name,
+            source
+        );
+    }
+    ensure!(
+        section.flags.execute,
+        "authored function storage is not executable"
+    );
     Ok(result)
 }
 
-fn retired_sections(pe: &PeFile, module: &Module) -> anyhow::Result<HashSet<usize>> {
-    let mut retired = HashSet::new();
+fn canonical_expression(
+    expression: SymbolicExpression,
+    plugin: &Plugin,
+) -> anyhow::Result<SymbolicExpression> {
+    fn root(symbol: SymbolId, plugin: &Plugin) -> anyhow::Result<(SymbolId, i64)> {
+        let mut symbol = symbol;
+        let mut offset = 0i64;
+        for _ in 0..=plugin.module.bindings.len() {
+            let Some(binding) = plugin.module.bindings.get(&symbol) else {
+                return Ok((symbol, offset));
+            };
+            let SymbolicExpression::Symbol {
+                symbol: target,
+                addend,
+            } = binding
+            else {
+                bail!(
+                    "plugin {} alias {:?} is not a storage binding",
+                    plugin.name,
+                    symbol
+                );
+            };
+            offset = offset
+                .checked_add(*addend)
+                .context("authored alias addend overflow")?;
+            symbol = target.clone();
+        }
+        bail!("plugin {} has cyclic authored symbol bindings", plugin.name)
+    }
+    match expression {
+        SymbolicExpression::Symbol { symbol, addend } => {
+            let (symbol, offset) = root(symbol, plugin)?;
+            let addend = addend
+                .checked_add(offset)
+                .context("authored expression addend overflow")?;
+            Ok(SymbolicExpression::Symbol { symbol, addend })
+        }
+        SymbolicExpression::Difference {
+            left,
+            right,
+            addend,
+        } => {
+            let (left, left_offset) = root(left, plugin)?;
+            let (right, right_offset) = root(right, plugin)?;
+            ensure!(
+                (left_offset == 0
+                    || !plugin
+                        .module
+                        .code
+                        .iter()
+                        .any(|function| function.symbol == left))
+                    && (right_offset == 0
+                        || !plugin
+                            .module
+                            .code
+                            .iter()
+                            .any(|function| function.symbol == right)),
+                "plugin {} has unsupported interior code labels in a difference",
+                plugin.name
+            );
+            let addend = addend
+                .checked_add(left_offset)
+                .and_then(|value| value.checked_sub(right_offset))
+                .context("authored difference addend overflow")?;
+            Ok(SymbolicExpression::Difference {
+                left,
+                right,
+                addend,
+            })
+        }
+    }
+}
+
+fn validate_code_expression(
+    expression: &SymbolicExpression,
+    plugin: &Plugin,
+) -> anyhow::Result<()> {
+    if let SymbolicExpression::Symbol { symbol, addend } = expression {
+        ensure!(
+            *addend == 0
+                || !plugin
+                    .module
+                    .code
+                    .iter()
+                    .any(|function| function.symbol == *symbol),
+            "plugin {} has an unsupported interior code expression",
+            plugin.name
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn identify_host_object(
+    expression: SymbolicExpression,
+    host: &Module,
+) -> anyhow::Result<SymbolicExpression> {
+    if let SymbolicExpression::Symbol {
+        symbol: SymbolId::HostImageBase,
+        addend,
+    } = &expression
+    {
+        if let Ok(rva) = u32::try_from(*addend) {
+            if let Some(function) = host.functions.iter().find(|function| {
+                function
+                    .blocks
+                    .iter()
+                    .any(|block| block.start.get() <= rva && rva < block.end.get())
+            }) {
+                return SymbolicExpression::symbol(SymbolId::Host {
+                    rva: function.entry,
+                })
+                .with_addend(i64::from(rva) - i64::from(function.entry.get()))
+                .context("host object offset overflow");
+            }
+        }
+    }
+    Ok(expression)
+}
+
+pub(crate) fn pin_interior_host(
+    expression: &SymbolicExpression,
+    host: &Module,
+    pinned: &mut BTreeSet<Rva>,
+) {
+    let mut visit = |symbol: &SymbolId, addend: i64| {
+        if let SymbolId::Host { rva } = symbol {
+            if let Some(function) = host.functions.iter().find(|function| {
+                function.entry == *rva
+                    || function
+                        .blocks
+                        .iter()
+                        .any(|block| block.start <= *rva && *rva < block.end)
+            }) {
+                if *rva != function.entry || addend != 0 {
+                    pinned.insert(function.entry);
+                }
+            }
+        }
+    };
+    match expression {
+        SymbolicExpression::Symbol { symbol, addend } => visit(symbol, *addend),
+        SymbolicExpression::Difference {
+            left,
+            right,
+            addend,
+        } => {
+            visit(left, *addend);
+            visit(right, 0);
+        }
+    }
+}
+
+fn retired_sections(pe: &PeFile, module: &Module) -> anyhow::Result<BTreeSet<usize>> {
+    let mut retired = BTreeSet::new();
     for index in 0..16 {
         let Some((rva, size)) = pe.data_directory(index) else {
             continue;
@@ -650,17 +1357,17 @@ fn retired_sections(pe: &PeFile, module: &Module) -> anyhow::Result<HashSet<usiz
         }
         ensure!(
             matches!(index, 3 | 5),
-            "unsupported authored module directory {index}; imports/TLS and other loader metadata must be explicitly supported by the SDK producer"
+            "unsupported authored module directory {index}; imports/TLS require producer support"
         );
         let section = module
             .sections
             .iter()
             .position(|section| section.contains(rva))
-            .context("module directory outside sections")?;
+            .context("module directory outside storage")?;
         let record = &module.sections[section];
         ensure!(
-            !record.flags.execute && rva.get() == record.rva.get() && size <= record.virtual_size,
-            "module directory {index} is not in a dedicated section"
+            !record.flags.execute && rva == record.rva && size <= record.virtual_size,
+            "module directory {index} is not dedicated storage"
         );
         retired.insert(section);
     }
@@ -673,326 +1380,14 @@ fn retired_sections(pe: &PeFile, module: &Module) -> anyhow::Result<HashSet<usiz
         let header = module
             .bytes_at(function.unwind)
             .and_then(|bytes| bytes.first())
-            .context("invalid module unwind record")?;
+            .context("invalid module unwind")?;
         ensure!(
             header & 0xf8 == 0,
-            "module function {} uses language handlers or chained unwind unsupported by SSA regeneration",
+            "module function {} uses unsupported language/chained unwind",
             function.begin
         );
     }
     Ok(retired)
-}
-
-fn prepare_view(plugin: &Plugin, namespace: &mut Namespace, base: u64) -> anyhow::Result<()> {
-    let start = namespace.start;
-    for reference in &plugin.module.references {
-        let section_index = namespace
-            .module
-            .sections
-            .iter()
-            .position(|section| section.contains(reference.source))
-            .context("reference source outside module")?;
-        if namespace.retired.contains(&section_index)
-            || !namespace.module.sections[section_index].flags.execute
-        {
-            continue;
-        }
-        let target = match reference.target {
-            ModuleTarget::Rva(rva) => va(base, add(start, rva.get())?)?,
-            ModuleTarget::ImageBase => base,
-        }
-        .checked_add_signed(reference.addend)
-        .with_context(|| format!("reference {} VA overflow", reference.source))?;
-        let section = &mut namespace.module.sections[section_index];
-        let offset = (reference.source.get() - section.rva.get()) as usize;
-        match reference.kind {
-            ModuleReferenceKind::Relative32 { bias } => {
-                let origin = va(
-                    base,
-                    add(add(start, reference.source.get())?, 4 + u32::from(bias))?,
-                )?;
-                let displacement = i32::try_from(i128::from(target) - i128::from(origin))
-                    .context("authored relative reference exceeds rel32 range")?;
-                section
-                    .data
-                    .get_mut(offset..offset + 4)
-                    .context("truncated code reference")?
-                    .copy_from_slice(&displacement.to_le_bytes());
-            }
-            ModuleReferenceKind::Absolute64 => {
-                let symbol = plugin
-                    .module
-                    .code
-                    .iter()
-                    .find(|symbol| {
-                        symbol.start <= reference.source && reference.source < symbol.end
-                    })
-                    .context("absolute code reference has no authored function")?;
-                let function_offset = (symbol.start.get() - section.rva.get()) as usize;
-                let function_end = (symbol.end.get() - section.rva.get()) as usize;
-                let function_bytes = section
-                    .data
-                    .get(function_offset..function_end)
-                    .context("truncated authored function")?;
-                let ip = va(base, add(start, symbol.start.get())?)?;
-                let mut decoder = Decoder::with_ip(64, function_bytes, ip, DecoderOptions::NONE);
-                let mut replacement = None;
-                while decoder.can_decode() {
-                    let instruction = decoder.decode();
-                    let constants = decoder.get_constant_offsets(&instruction);
-                    let instruction_offset =
-                        usize::try_from(instruction.ip() - ip)? + function_offset;
-                    if instruction_offset + constants.immediate_offset() != offset {
-                        continue;
-                    }
-                    ensure!(
-                        instruction.mnemonic() == Mnemonic::Mov
-                            && instruction.op0_kind() == OpKind::Register
-                            && instruction.op1_kind() == OpKind::Immediate64
-                            && constants.immediate_size() == 8,
-                        "unsupported authored absolute code operand at {}",
-                        reference.source
-                    );
-                    let mut lea = Instruction::with2(
-                        Code::Lea_r64_m,
-                        instruction.op0_register(),
-                        MemoryOperand::with_base(Register::RIP),
-                    )?;
-                    lea.set_memory_displacement64(target);
-                    let mut encoder = Encoder::new(64);
-                    encoder.encode(&lea, instruction.ip())?;
-                    let mut bytes = encoder.take_buffer();
-                    ensure!(
-                        bytes.len() <= instruction.len(),
-                        "authored movabs cannot normalize to RIP-relative LEA"
-                    );
-                    let padding = instruction.len() - bytes.len();
-                    crate::append_nops(&mut bytes, padding);
-                    replacement = Some((instruction_offset, bytes));
-                    break;
-                }
-                let (offset, bytes) =
-                    replacement.context("absolute reference is not an instruction immediate")?;
-                section.data[offset..offset + bytes.len()].copy_from_slice(&bytes);
-            }
-            ModuleReferenceKind::ImageRelative32 => bail!(
-                "unsupported image-relative code operand at {}",
-                reference.source
-            ),
-        }
-    }
-    namespace.module.image_base = base;
-    namespace.module.entry_point = Some(Rva::new(add(start, plugin.module.entry.get())?));
-    for section in &mut namespace.module.sections {
-        section.rva = Rva::new(add(start, section.rva.get())?);
-    }
-    for symbol in &mut namespace.module.symbols {
-        symbol.rva = Rva::new(add(start, symbol.rva.get())?);
-    }
-    for relocation in &mut namespace.module.relocations {
-        relocation.rva = Rva::new(add(start, relocation.rva.get())?);
-    }
-    Ok(())
-}
-
-fn target_rva(
-    target: ModuleTarget,
-    namespace: &Namespace,
-    addresses: &BTreeMap<u64, u64>,
-    base: u64,
-) -> anyhow::Result<u32> {
-    match target {
-        ModuleTarget::ImageBase => Ok(0),
-        ModuleTarget::Rva(target) => {
-            let source = va(base, add(namespace.start, target.get())?)?;
-            let mapped = addresses.get(&source).with_context(|| format!("authored target {target} has no final placement (interior code pointers and retired metadata are unsupported)"))?;
-            u32::try_from(mapped.checked_sub(base).context("target below host base")?)
-                .context("target RVA overflow")
-        }
-    }
-}
-
-fn placed_rip_target(
-    original: u64,
-    addresses: &BTreeMap<u64, u64>,
-    data: &[PlacedData],
-    namespaces: &[Namespace],
-    base: u64,
-) -> anyhow::Result<u64> {
-    if let Some(&target) = addresses.get(&original) {
-        return Ok(target);
-    }
-    let Some(rva) = original
-        .checked_sub(base)
-        .and_then(|rva| u32::try_from(rva).ok())
-    else {
-        return Ok(original);
-    };
-    for placed in data {
-        if rva >= placed.source.get()
-            && rva <= add(placed.source.get(), placed.section.data.len() as u32)?
-        {
-            return va(
-                base,
-                add(placed.section.rva.get(), rva - placed.source.get())?,
-            );
-        }
-    }
-    ensure!(
-        !namespaces.iter().any(|namespace| namespace
-            .module
-            .section_at(Rva::new(rva))
-            .is_some_and(|section| section.flags.execute)),
-        "authored code target {rva:#x} has no final placement (interior code pointers are unsupported)"
-    );
-    Ok(original)
-}
-
-fn rebase_data(
-    plugins: &[Plugin],
-    namespaces: &[Namespace],
-    data: &mut [PlacedData],
-    addresses: &BTreeMap<u64, u64>,
-    base: u64,
-    table: std::ops::Range<u32>,
-    relocations: &mut Vec<Relocation>,
-) -> anyhow::Result<()> {
-    for placed in data {
-        let plugin = &plugins[placed.plugin];
-        let namespace = &namespaces[placed.plugin];
-        let original_start = placed.source.get() - namespace.start;
-        let original_end = add(original_start, placed.section.data.len() as u32)?;
-        let is_bound =
-            |name: &str| matches!(name, "SYMBOL_init_table_start" | "SYMBOL_init_table_end");
-        for reference in &plugin.module.references {
-            if reference.source.get() < original_start || reference.source.get() >= original_end {
-                continue;
-            }
-            if plugin
-                .module
-                .data
-                .iter()
-                .any(|symbol| is_bound(&symbol.name) && symbol.start == reference.source)
-            {
-                continue;
-            }
-            let target =
-                target_rva(reference.target, namespace, addresses, base).with_context(|| {
-                    format!("plugin {} reference {}", plugin.name, reference.source)
-                })?;
-            if let ModuleTarget::Rva(symbol) = reference.target {
-                let symbol = Rva::new(add(namespace.start, symbol.get())?);
-                ensure!(
-                    reference.addend == 0
-                        || !namespace
-                            .module
-                            .section_at(symbol)
-                            .is_some_and(|section| section.flags.execute),
-                    "plugin {} reference {} has an unsupported interior code pointer",
-                    plugin.name,
-                    reference.source
-                );
-            }
-            let target = va(base, target)?
-                .checked_add_signed(reference.addend)
-                .with_context(|| {
-                    format!(
-                        "plugin {} reference {} VA overflow",
-                        plugin.name, reference.source
-                    )
-                })?;
-            let offset = (reference.source.get() - original_start) as usize;
-            let source = add(placed.section.rva.get(), offset as u32)?;
-            let mut bytes = [0; 8];
-            let len = match reference.kind {
-                ModuleReferenceKind::Absolute64 => {
-                    relocations.push(Relocation {
-                        rva: Rva::new(source),
-                        kind: RelocKind::Dir64,
-                    });
-                    bytes.copy_from_slice(&target.to_le_bytes());
-                    8
-                }
-                ModuleReferenceKind::ImageRelative32 => {
-                    let target = u32::try_from(i128::from(target) - i128::from(base))
-                        .with_context(|| {
-                            format!(
-                                "plugin {} reference {} image-relative target exceeds RVA range",
-                                plugin.name, reference.source
-                            )
-                        })?;
-                    bytes[..4].copy_from_slice(&target.to_le_bytes());
-                    4
-                }
-                ModuleReferenceKind::Relative32 { bias } => {
-                    let origin = va(base, add(source, 4 + u32::from(bias))?)?;
-                    let displacement = i32::try_from(i128::from(target) - i128::from(origin))
-                        .context("data relative reference exceeds rel32 range")?;
-                    bytes[..4].copy_from_slice(&displacement.to_le_bytes());
-                    4
-                }
-            };
-            placed
-                .section
-                .data
-                .get_mut(offset..offset + len)
-                .context("reference crosses module data section")?
-                .copy_from_slice(&bytes[..len]);
-        }
-        for symbol in plugin
-            .module
-            .data
-            .iter()
-            .filter(|symbol| is_bound(&symbol.name))
-        {
-            if symbol.start.get() < original_start || symbol.start.get() >= original_end {
-                continue;
-            }
-            ensure!(
-                symbol.size >= 8,
-                "plugin {} SDK bound {} is not pointer-sized",
-                plugin.name,
-                symbol.name
-            );
-            let offset = (symbol.start.get() - original_start) as usize;
-            let target = if symbol.name == "SYMBOL_init_table_start" {
-                table.start
-            } else {
-                table.end
-            };
-            placed
-                .section
-                .data
-                .get_mut(offset..offset + 8)
-                .context("SDK bound crosses data section")?
-                .copy_from_slice(&va(base, target)?.to_le_bytes());
-            relocations.push(Relocation {
-                rva: Rva::new(add(placed.section.rva.get(), offset as u32)?),
-                kind: RelocKind::Dir64,
-            });
-        }
-    }
-    Ok(())
-}
-
-fn plugin_entries(
-    plugins: &[Plugin],
-    namespaces: &[Namespace],
-    addresses: &BTreeMap<u64, u64>,
-    base: u64,
-) -> anyhow::Result<Vec<u32>> {
-    plugins
-        .iter()
-        .zip(namespaces)
-        .map(|(plugin, namespace)| {
-            target_rva(
-                ModuleTarget::Rva(plugin.module.entry),
-                namespace,
-                addresses,
-                base,
-            )
-        })
-        .collect()
 }
 
 fn append_generated_unwind(
@@ -1184,12 +1579,6 @@ fn entry_loader(
     kamy_codegen::relocate(&instructions, va(base, rva)?)
 }
 
-fn image_end(module: &Module) -> anyhow::Result<u32> {
-    module.sections.iter().try_fold(0u32, |end, section| {
-        Ok(end.max(add(section.rva.get(), section.virtual_size)?))
-    })
-}
-
 fn add(a: u32, b: u32) -> anyhow::Result<u32> {
     a.checked_add(b).context("module RVA overflow")
 }
@@ -1202,8 +1591,10 @@ fn va(base: u64, rva: u32) -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kamy_core::ir::Win64Default;
-    use kamy_pe::module::{CodeSymbol, DataSymbol, ModuleReference};
+    use iced_x86::Mnemonic;
+    use kamy_core::ir::{AbiValue, Gpr, PhysReg, Win64Default};
+    use kamy_core::{ReferenceOrigin, Symbol, SymbolKind};
+    use kamy_pe::module::{CodeSymbol, DataSymbol};
 
     const BASE: u64 = 0x1_4000_0000;
 
@@ -1246,20 +1637,201 @@ mod tests {
     }
 
     fn plugin(code: &[u8]) -> Plugin {
+        named_plugin("example", code)
+    }
+
+    fn id(module: &str, name: &str) -> SymbolId {
+        SymbolId::Authored {
+            module: module.into(),
+            symbol: name.into(),
+        }
+    }
+
+    fn named_plugin(name: &str, code: &[u8]) -> Plugin {
+        let function = id(name, "coff:fixture:symbol:1:init");
+        let data = id(name, "coff:fixture:section:2:piece:0");
+        let readonly = id(name, "coff:fixture:section:3:piece:0");
         Plugin {
-            name: "example".into(),
+            name: name.into(),
             module: AuthoredModule {
+                identity: name.into(),
                 image: fixture(code, true),
                 entry: Rva::new(0x1000),
+                bindings: BTreeMap::new(),
+                symbols: vec![
+                    Symbol {
+                        id: function.clone(),
+                        name: "init".into(),
+                        rva: Rva::new(0x1000),
+                        kind: SymbolKind::Function,
+                    },
+                    Symbol {
+                        id: data,
+                        name: "data".into(),
+                        rva: Rva::new(0x2000),
+                        kind: SymbolKind::Data,
+                    },
+                    Symbol {
+                        id: readonly,
+                        name: "readonly".into(),
+                        rva: Rva::new(0x3000),
+                        kind: SymbolKind::Data,
+                    },
+                ],
                 code: vec![CodeSymbol {
+                    symbol: function,
                     name: "init".into(),
                     start: Rva::new(0x1000),
                     end: Rva::new(0x1000 + code.len() as u32),
+                    signature: FnSignature {
+                        args: [Gpr::Rcx, Gpr::Rdx, Gpr::R8]
+                            .into_iter()
+                            .map(|reg| AbiValue::register(PhysReg::Gpr(reg)))
+                            .collect(),
+                        returns: vec![AbiValue::register(PhysReg::Gpr(Gpr::Rax))],
+                        clobbers: vec![
+                            PhysReg::Gpr(Gpr::Rax),
+                            PhysReg::Gpr(Gpr::Rcx),
+                            PhysReg::Gpr(Gpr::Rdx),
+                        ],
+                        noreturn: false,
+                    },
                 }],
                 data: Vec::new(),
                 references: Vec::new(),
             },
         }
+    }
+
+    fn reference(
+        source: SymbolId,
+        offset: u32,
+        target: SymbolId,
+        addend: i64,
+        field: LinkField,
+    ) -> Reference {
+        Reference {
+            source,
+            offset,
+            expression: SymbolicExpression::Symbol {
+                symbol: target,
+                addend,
+            },
+            field,
+            origin: ReferenceOrigin::Authored,
+        }
+    }
+
+    #[test]
+    fn authored_source_preserves_exact_operands_and_native_abi_without_a_host() {
+        use kamy_core::ir::{AbiClass, XmmReg};
+
+        let mut code = vec![0x48, 0xb8];
+        code.extend_from_slice(&BASE.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xb9]);
+        code.extend_from_slice(&(BASE + 0x2007).to_le_bytes());
+        code.push(0xc3);
+        let mut plugin = plugin(&code);
+        let function = plugin.module.code[0].symbol.clone();
+        let data = plugin.module.symbols[1].id.clone();
+        let alias = id(&plugin.name, "callback-alias");
+        plugin
+            .module
+            .bindings
+            .insert(alias.clone(), SymbolicExpression::symbol(function.clone()));
+        plugin.module.code[0].signature.args.push(AbiValue {
+            class: AbiClass::Float,
+            bits: 64,
+            ..AbiValue::register(PhysReg::Xmm(XmmReg::Xmm1))
+        });
+        plugin.module.code[0].signature.returns.push(AbiValue {
+            class: AbiClass::Float,
+            bits: 64,
+            ..AbiValue::register(PhysReg::Xmm(XmmReg::Xmm0))
+        });
+        plugin.module.references.extend([
+            reference(
+                function.clone(),
+                2,
+                SymbolId::HostImageBase,
+                0,
+                LinkField::Absolute64,
+            ),
+            reference(function.clone(), 12, data.clone(), 7, LinkField::Absolute64),
+        ]);
+        let source = AuthoredSource::new(&plugin).unwrap();
+        let prepared = source.function_at(Rva::new(0x1000), None).unwrap();
+        assert_eq!(prepared.symbol.symbol, function);
+        assert_eq!(prepared.function.entry, Rva::new(0x1000));
+        assert!(prepared.function.blocks.iter().all(|block| {
+            block.start >= prepared.symbol.start && block.end <= prepared.symbol.end
+        }));
+        assert_eq!(prepared.references.len(), 2);
+        assert_eq!(prepared.references[0].instruction, Rva::new(0x1000));
+        assert_eq!(prepared.references[0].operand, 1);
+        assert_eq!(
+            prepared.references[0].reference.expression,
+            SymbolicExpression::symbol(SymbolId::HostImageBase)
+        );
+        assert_eq!(prepared.references[1].reference.source, function);
+        assert_eq!(prepared.references[1].reference.offset, 12);
+        assert_eq!(
+            prepared.references[1].reference.expression,
+            SymbolicExpression::Symbol {
+                symbol: data,
+                addend: 7,
+            }
+        );
+        assert_eq!(
+            source.lookup_symbol(&alias),
+            Some(prepared.symbol.signature.clone())
+        );
+        assert_eq!(source.lookup(BASE + 0x1000), None);
+        assert_eq!(source.lookup_symbol(&id(&plugin.name, "unknown")), None);
+    }
+
+    #[test]
+    fn authored_source_reports_missing_and_ambiguous_local_entries() {
+        let mut plugin = plugin(&[0x31, 0xc0, 0xc3]);
+        let source = AuthoredSource::new(&plugin).unwrap();
+        assert!(source.function_at(Rva::new(0x1001), None).is_err());
+        plugin.module.code.push(plugin.module.code[0].clone());
+        assert!(AuthoredSource::new(&plugin).is_err());
+    }
+
+    fn add_bounds(plugin: &mut Plugin) {
+        for (name, offset) in [("SYMBOL_init_table_start", 0), ("SYMBOL_init_table_end", 8)] {
+            let symbol = id(&plugin.name, name);
+            plugin.module.symbols.push(Symbol {
+                id: symbol.clone(),
+                name: name.into(),
+                rva: Rva::new(0x2000 + offset),
+                kind: SymbolKind::Data,
+            });
+            plugin.module.data.push(DataSymbol {
+                symbol,
+                name: name.into(),
+                start: Rva::new(0x2000 + offset),
+                size: 8,
+            });
+        }
+    }
+
+    fn link(
+        pe: &PeFile,
+        host: &Module,
+        plugins: &[Plugin],
+        mode: EntryMode,
+    ) -> anyhow::Result<(Vec<u8>, Report)> {
+        crate::protect(
+            pe,
+            host,
+            &host.functions,
+            &Options::default(),
+            &Win64Default,
+            &mut |_, _, _| Ok(TransformOutcome::default()),
+            Injection { plugins, mode },
+        )
     }
 
     fn put16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -1475,121 +2047,119 @@ mod tests {
     }
 
     #[test]
-    fn exact_movabs_normalization_does_not_rewrite_equal_literals() {
+    fn exact_movabs_operand_preserves_equal_valued_integer() {
         let pointer = BASE + 0x2000;
         let mut code = vec![0x48, 0xb8];
         code.extend_from_slice(&pointer.to_le_bytes());
         code.extend_from_slice(&[0x48, 0xba]);
         code.extend_from_slice(&pointer.to_le_bytes());
-        code.push(0xc3);
+        code.extend_from_slice(&[0x48, 0x89, 0x01, 0x48, 0x89, 0x51, 8, 0x31, 0xc0, 0xc3]);
         let mut plugin = plugin(&code);
-        plugin.module.references.push(ModuleReference {
-            source: Rva::new(0x1002),
-            target: ModuleTarget::Rva(Rva::new(0x2000)),
-            addend: 0,
-            kind: ModuleReferenceKind::Absolute64,
-        });
-        let host = PeFile::parse(&fixture(&[0xc3], false)).unwrap().to_module();
+        plugin.module.references.push(reference(
+            plugin.module.code[0].symbol.clone(),
+            2,
+            plugin.module.symbols[1].id.clone(),
+            0,
+            LinkField::Absolute64,
+        ));
+        let original = plugin.module.image.clone();
+        let pe = PeFile::parse(&fixture(&[0xc3], false)).unwrap();
+        let host = pe.to_module();
         let plugins = [plugin];
-        let mut namespaces = namespaces(&host, &plugins).unwrap();
-        prepare_view(&plugins[0], &mut namespaces[0], BASE).unwrap();
-        let bytes = namespaces[0]
-            .module
-            .bytes_at(Rva::new(namespaces[0].start + 0x1000))
-            .unwrap();
+        let planned = planned_functions(&plugins).unwrap();
+        let (image, report) = link(&pe, &host, &plugins, EntryMode::Inline).unwrap();
+        assert_eq!(plugins[0].module.image, original);
+        let output = PeFile::parse(&image).unwrap().to_module();
+        let entry = report.address_map[&planned[0].symbol];
+        let data = report.address_map[&plugins[0].module.symbols[1].id];
         let instructions: Vec<_> = Decoder::with_ip(
             64,
-            bytes,
-            BASE + u64::from(namespaces[0].start) + 0x1000,
+            output.bytes_at(entry).unwrap(),
+            BASE + u64::from(entry.get()),
             DecoderOptions::NONE,
         )
         .into_iter()
+        .take_while(|instruction| instruction.mnemonic() != Mnemonic::Ret)
         .collect();
-        assert_eq!(instructions[0].mnemonic(), Mnemonic::Lea);
-        assert_eq!(
-            instructions[0].ip_rel_memory_address(),
-            BASE + u64::from(namespaces[0].start) + 0x2000
+        assert!(
+            instructions
+                .iter()
+                .any(|instruction| instruction.mnemonic() == Mnemonic::Lea
+                    && instruction.ip_rel_memory_address() == BASE + u64::from(data.get()))
         );
         assert!(
             instructions
                 .iter()
                 .any(|instruction| instruction.code() == Code::Mov_r64_imm64
-                    && instruction.op0_register() == Register::RDX
                     && instruction.immediate64() == pointer)
         );
     }
 
     #[test]
-    fn authored_image_base_code_references_track_addends_after_placement_and_aslr() {
+    fn authored_image_base_signed_offsets_and_module_interiors_are_source_qualified() {
         let pe = PeFile::parse(&fixture(&[0xc3], false)).unwrap();
         let host = pe.to_module();
-        let old_namespace = crate::align_up(image_end(&host).unwrap(), 0x1_0000).unwrap();
-        for addend in [
-            0,
-            -2,
-            0x2345,
-            0x2_1180,
-            i64::from(old_namespace) + 0x1000,
-            i64::from(old_namespace) + 0x2000,
-        ] {
+        for addend in [0, -2, 0x2345, 0x1_1000, 0x1_2000] {
             for absolute in [false, true] {
-                let (mut code, source, kind) = if absolute {
+                let (mut code, offset, field) = if absolute {
                     let mut code = vec![0x48, 0xb8];
                     code.extend_from_slice(&BASE.checked_add_signed(addend).unwrap().to_le_bytes());
-                    (code, 0x1002, ModuleReferenceKind::Absolute64)
+                    (code, 2, LinkField::Absolute64)
                 } else {
                     let mut code = vec![0x48, 0x8d, 0x05];
-                    let displacement = i32::try_from(addend - 0x1007).unwrap();
-                    code.extend_from_slice(&displacement.to_le_bytes());
-                    (code, 0x1003, ModuleReferenceKind::Relative32 { bias: 0 })
+                    code.extend_from_slice(&i32::try_from(addend - 0x1007).unwrap().to_le_bytes());
+                    (code, 3, LinkField::Relative32 { bias: 0 })
                 };
                 code.extend_from_slice(&[0x48, 0x89, 0x01]);
-                let local_source = 0x1000 + code.len() as u32 + 3;
+                let local_offset = code.len() as u32 + 3;
                 code.extend_from_slice(&[0x48, 0x8d, 0x05]);
-                let displacement = i32::try_from(0x2008i64 - i64::from(local_source + 4)).unwrap();
-                code.extend_from_slice(&displacement.to_le_bytes());
+                code.extend_from_slice(
+                    &i32::try_from(0x2008i64 - i64::from(0x1000 + local_offset + 4))
+                        .unwrap()
+                        .to_le_bytes(),
+                );
                 code.extend_from_slice(&[0x48, 0x89, 0x41, 8, 0x31, 0xc0, 0xc3]);
                 let mut plugin = plugin(&code);
+                let function = plugin.module.code[0].symbol.clone();
+                let data = plugin.module.symbols[1].id.clone();
                 plugin.module.references.extend([
-                    ModuleReference {
-                        source: Rva::new(source),
-                        target: ModuleTarget::ImageBase,
+                    reference(
+                        function.clone(),
+                        offset,
+                        SymbolId::HostImageBase,
                         addend,
-                        kind,
-                    },
-                    ModuleReference {
-                        source: Rva::new(local_source),
-                        target: ModuleTarget::Rva(Rva::new(0x2010)),
-                        addend: -8,
-                        kind: ModuleReferenceKind::Relative32 { bias: 0 },
-                    },
+                        field,
+                    ),
+                    reference(
+                        function.clone(),
+                        local_offset,
+                        data.clone(),
+                        8,
+                        LinkField::Relative32 { bias: 0 },
+                    ),
                 ]);
                 let plugins = [plugin];
-                let planned = planned_functions(&host, &plugins).unwrap();
-                let mut transformed = Vec::new();
-                let (image, report) = protect_with_modules(
+                let mut callbacks = Vec::new();
+                let (image, report) = crate::protect(
                     &pe,
                     &host,
                     &[],
                     &Options::default(),
                     &Win64Default,
-                    &mut |rva, _, _| transformed.push(rva),
+                    &mut |symbol, _, _| {
+                        callbacks.push(symbol.clone());
+                        Ok(TransformOutcome::default())
+                    },
                     Injection {
                         plugins: &plugins,
                         mode: EntryMode::Inline,
                     },
                 )
                 .unwrap();
-                assert!(!transformed.is_empty());
-                assert!(transformed.iter().all(|&rva| rva == planned[0].rva));
+                assert!(callbacks.iter().all(|symbol| *symbol == function));
                 let output = PeFile::parse(&image).unwrap().to_module();
-                let entry = report.address_map[&planned[0].rva];
-                let data = output
-                    .sections
-                    .iter()
-                    .find(|section| section.flags.write && section.rva.get() >= 0x4000)
-                    .unwrap();
-                for slide in [0, 0x1234_0000u64] {
+                let entry = report.address_map[&function];
+                for slide in [0, 0x1234_0000] {
                     let pointers: Vec<_> = Decoder::with_ip(
                         64,
                         output.bytes_at(entry).unwrap(),
@@ -1605,341 +2175,291 @@ mod tests {
                     .map(|instruction| instruction.ip_rel_memory_address())
                     .collect();
                     assert!(pointers.contains(&(BASE + slide).checked_add_signed(addend).unwrap()));
-                    assert!(pointers.contains(&(BASE + slide + u64::from(data.rva.get()) + 8)));
+                    assert!(pointers.contains(
+                        &(BASE + slide + u64::from(report.address_map[&data].get()) + 8)
+                    ));
                 }
             }
         }
     }
 
     #[test]
-    fn signed_rel32_addends_preserve_trailing_immediates_and_data_interiors() {
+    fn signed_rel32_addends_keep_trailing_immediate_bias() {
         let pe = PeFile::parse(&fixture(&[0xc3], false)).unwrap();
         let host = pe.to_module();
-        for (target, addend) in [
-            (ModuleTarget::ImageBase, -2),
-            (ModuleTarget::Rva(Rva::new(0x2000)), 0x10),
-            (ModuleTarget::Rva(Rva::new(0x2020)), -0x10),
-        ] {
-            let symbol = match target {
-                ModuleTarget::ImageBase => 0,
-                ModuleTarget::Rva(symbol) => i64::from(symbol.get()),
-            };
-            let displacement = i32::try_from(symbol + addend - 0x1009).unwrap();
+        for (host_base, addend, interior) in [(true, -2, 0), (false, 0x10, 0), (false, -0x10, 0x20)]
+        {
+            let target = if host_base { 0 } else { 0x2000 + interior };
             let mut code = vec![0x31, 0xc0, 0x66, 0x81, 0x3d];
-            code.extend_from_slice(&displacement.to_le_bytes());
+            code.extend_from_slice(
+                &i32::try_from(i64::from(target) + addend - 0x1009)
+                    .unwrap()
+                    .to_le_bytes(),
+            );
             code.extend_from_slice(&[0x4d, 0x5a, 0x0f, 0x95, 0xc0, 0xc3]);
             let mut plugin = plugin(&code);
-            plugin.module.image[0x612..0x614].copy_from_slice(&0x5a4du16.to_le_bytes());
-            plugin.module.references.push(ModuleReference {
-                source: Rva::new(0x1005),
-                target,
-                addend,
-                kind: ModuleReferenceKind::Relative32 { bias: 0 },
-            });
-            let plugins = [plugin];
-            let planned = planned_functions(&host, &plugins).unwrap();
-            let (image, report) = protect_with_modules(
-                &pe,
-                &host,
-                &[],
-                &Options::default(),
-                &Win64Default,
-                &mut |_, _, _| {},
-                Injection {
-                    plugins: &plugins,
-                    mode: EntryMode::Inline,
-                },
-            )
-            .unwrap();
-            let output = PeFile::parse(&image).unwrap().to_module();
-            let entry = report.address_map[&planned[0].rva];
-            let expected = match target {
-                ModuleTarget::ImageBase => 0,
-                ModuleTarget::Rva(_) => {
-                    output
-                        .sections
-                        .iter()
-                        .find(|section| section.flags.write && section.rva.get() >= 0x4000)
-                        .unwrap()
-                        .rva
-                        .get()
-                        + 0x12
-                }
+            let target = if host_base {
+                SymbolId::HostImageBase
+            } else if interior == 0 {
+                plugin.module.symbols[1].id.clone()
+            } else {
+                let target = id("example", "coff:fixture:symbol:7:data-interior");
+                plugin.module.symbols.push(Symbol {
+                    id: target.clone(),
+                    name: "data-interior".into(),
+                    rva: Rva::new(0x2000 + interior),
+                    kind: SymbolKind::Data,
+                });
+                plugin.module.bindings.insert(
+                    target.clone(),
+                    SymbolicExpression::Symbol {
+                        symbol: plugin.module.symbols[1].id.clone(),
+                        addend: i64::from(interior),
+                    },
+                );
+                target
             };
-            for slide in [0, 0x1234_0000u64] {
-                let actual = Decoder::with_ip(
-                    64,
-                    output.bytes_at(entry).unwrap(),
-                    BASE + slide + u64::from(entry.get()),
-                    DecoderOptions::NONE,
-                )
-                .into_iter()
-                .take_while(|instruction| instruction.mnemonic() != Mnemonic::Ret)
-                .filter(|instruction| instruction.is_ip_rel_memory_operand())
-                .map(|instruction| instruction.ip_rel_memory_address())
-                .find(|&address| address == BASE + slide + u64::from(expected))
-                .unwrap();
-                let rva = u32::try_from(actual - (BASE + slide)).unwrap();
-                let bytes = if rva == 0 {
-                    &image[..2]
-                } else {
-                    &output.bytes_at(Rva::new(rva)).unwrap()[..2]
-                };
-                assert_eq!(u16::from_le_bytes(bytes.try_into().unwrap()), 0x5a4d);
-            }
-        }
-    }
-
-    #[test]
-    fn image_relative_data_expressions_reject_signed_rva_overflow_contextually() {
-        let pe = PeFile::parse(&fixture(&[0xc3], false)).unwrap();
-        let host = pe.to_module();
-        for addend in [-1, i64::from(u32::MAX) + 1] {
-            let mut plugin = plugin(&[0x31, 0xc0, 0xc3]);
-            plugin.module.references.push(ModuleReference {
-                source: Rva::new(0x2000),
-                target: ModuleTarget::ImageBase,
+            plugin.module.references.push(reference(
+                plugin.module.code[0].symbol.clone(),
+                5,
+                target.clone(),
                 addend,
-                kind: ModuleReferenceKind::ImageRelative32,
-            });
-            let error = protect_with_modules(
-                &pe,
-                &host,
-                &[],
-                &Options::default(),
-                &Win64Default,
-                &mut |_, _, _| {},
-                Injection {
-                    plugins: &[plugin],
-                    mode: EntryMode::Inline,
-                },
+                LinkField::Relative32 { bias: 0 },
+            ));
+            let plugins = [plugin];
+            let (image, report) = link(&pe, &host, &plugins, EntryMode::Inline).unwrap();
+            let output = PeFile::parse(&image).unwrap().to_module();
+            let entry = report.address_map[&plugins[0].module.code[0].symbol];
+            let expected = if host_base {
+                BASE
+            } else {
+                (BASE + u64::from(report.address_map[&target].get()))
+                    .checked_add_signed(addend + 2)
+                    .unwrap()
+            };
+            let references: Vec<_> = Decoder::with_ip(
+                64,
+                output.bytes_at(entry).unwrap(),
+                BASE + u64::from(entry.get()),
+                DecoderOptions::NONE,
             )
-            .err()
-            .unwrap();
-            let message = format!("{error:#}");
-            assert!(message.contains("plugin example reference"));
-            assert!(message.contains("image-relative target exceeds RVA range"));
+            .into_iter()
+            .take_while(|instruction| instruction.mnemonic() != Mnemonic::Ret)
+            .filter(|instruction| instruction.is_ip_rel_memory_operand())
+            .map(|instruction| instruction.ip_rel_memory_address())
+            .collect();
+            assert!(references.contains(&expected));
         }
     }
 
     #[test]
-    fn injected_functions_use_callback_and_preserve_data_fixups() {
-        let host_pe = PeFile::parse(&fixture(&[0x31, 0xc0, 0xc3], false)).unwrap();
-        let host = host_pe.to_module();
-        let old_namespace = crate::align_up(image_end(&host).unwrap(), 0x1_0000).unwrap();
-        let image_base_offset = old_namespace + 0x1000;
-        let image_relative_offset = 0x2345;
-        let relative_offset = old_namespace + 0x2000;
+    fn data_fixups_bounds_and_directory_contributions_share_final_placement() {
+        let pe = PeFile::parse(&fixture(&[0x31, 0xc0, 0xc3], false)).unwrap();
+        let host = pe.to_module();
         let mut plugin = plugin(&[0x31, 0xc0, 0xc3]);
-        plugin.module.image[0x620..0x628]
-            .copy_from_slice(&(BASE + u64::from(image_base_offset)).to_le_bytes());
-        put32(&mut plugin.module.image, 0x628, image_relative_offset);
-        let displacement = i32::try_from(i64::from(relative_offset) - 0x2030).unwrap();
-        plugin.module.image[0x62c..0x630].copy_from_slice(&displacement.to_le_bytes());
-        plugin.module.image[0x630..0x638].copy_from_slice(&(BASE - 2).to_le_bytes());
-        plugin.module.data.extend([
-            DataSymbol {
-                name: "SYMBOL_init_table_start".into(),
-                start: Rva::new(0x2000),
-                size: 8,
-            },
-            DataSymbol {
-                name: "SYMBOL_init_table_end".into(),
-                start: Rva::new(0x2008),
-                size: 8,
-            },
-        ]);
+        add_bounds(&mut plugin);
+        let source = plugin.module.symbols[1].id.clone();
+        let readonly = plugin.module.symbols[2].id.clone();
+        let function = plugin.module.code[0].symbol.clone();
         plugin.module.references.extend([
-            ModuleReference {
-                source: Rva::new(0x2010),
-                target: ModuleTarget::Rva(Rva::new(0x1000)),
-                addend: 0,
-                kind: ModuleReferenceKind::Absolute64,
-            },
-            ModuleReference {
-                source: Rva::new(0x2018),
-                target: ModuleTarget::Rva(Rva::new(0x3008)),
-                addend: -8,
-                kind: ModuleReferenceKind::ImageRelative32,
-            },
-            ModuleReference {
-                source: Rva::new(0x2020),
-                target: ModuleTarget::ImageBase,
-                addend: i64::from(image_base_offset),
-                kind: ModuleReferenceKind::Absolute64,
-            },
-            ModuleReference {
-                source: Rva::new(0x2028),
-                target: ModuleTarget::ImageBase,
-                addend: i64::from(image_relative_offset),
-                kind: ModuleReferenceKind::ImageRelative32,
-            },
-            ModuleReference {
-                source: Rva::new(0x202c),
-                target: ModuleTarget::ImageBase,
-                addend: i64::from(relative_offset),
-                kind: ModuleReferenceKind::Relative32 { bias: 0 },
-            },
-            ModuleReference {
-                source: Rva::new(0x2030),
-                target: ModuleTarget::ImageBase,
-                addend: -2,
-                kind: ModuleReferenceKind::Absolute64,
-            },
+            reference(
+                source.clone(),
+                16,
+                function.clone(),
+                0,
+                LinkField::Absolute64,
+            ),
+            reference(
+                source.clone(),
+                24,
+                readonly.clone(),
+                0,
+                LinkField::ImageRelative32,
+            ),
+            reference(
+                source.clone(),
+                32,
+                SymbolId::HostImageBase,
+                0x1_1000,
+                LinkField::Absolute64,
+            ),
+            reference(
+                source.clone(),
+                40,
+                SymbolId::HostImageBase,
+                0x2345,
+                LinkField::ImageRelative32,
+            ),
+            reference(
+                source.clone(),
+                44,
+                SymbolId::HostImageBase,
+                0x1_2000,
+                LinkField::Relative32 { bias: 0 },
+            ),
+            reference(
+                source.clone(),
+                48,
+                SymbolId::HostImageBase,
+                -2,
+                LinkField::Absolute64,
+            ),
         ]);
         let plugins = [plugin];
-        let planned = planned_functions(&host, &plugins).unwrap();
-        let (image, report) = protect_with_modules(
-            &host_pe,
-            &host,
-            &[],
-            &Options::default(),
-            &Win64Default,
-            &mut |_, _, _| {},
-            Injection {
-                plugins: &plugins,
-                mode: EntryMode::InitTable,
-            },
-        )
-        .unwrap();
-        let pe = PeFile::parse(&image).unwrap();
-        let output = pe.to_module();
-        let writable: Vec<_> = output
-            .sections
-            .iter()
-            .filter(|section| section.flags.write && section.rva.get() >= 0x4000)
-            .collect();
-        assert_eq!(writable.len(), 1);
-        let data = writable[0];
-        assert!(!data.flags.execute);
-        assert!(data.data[0x38..].iter().all(|byte| *byte == 0));
-        let read_only = Rva::new(u32::from_le_bytes(
-            data.data[0x18..0x1c].try_into().unwrap(),
-        ));
-        let read_only = output.section_at(read_only).unwrap();
-        assert!(read_only.flags.read && !read_only.flags.write && !read_only.flags.execute);
-        let read64 = |offset| u64::from_le_bytes(data.data[offset..offset + 8].try_into().unwrap());
-        let table_start = read64(0);
-        let table_end = read64(8);
-        assert_eq!(table_end - table_start, 16);
+        let (image, report) = link(&pe, &host, &plugins, EntryMode::InitTable).unwrap();
+        let output_pe = PeFile::parse(&image).unwrap();
+        let output = output_pe.to_module();
+        let data_rva = report.address_map[&source];
+        let data = output.bytes_at(data_rva).unwrap();
+        let read64 = |offset| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        assert_eq!(read64(8) - read64(0), 16);
         assert_eq!(
             read64(16),
-            BASE + u64::from(report.address_map[&planned[0].rva].get())
+            BASE + u64::from(report.address_map[&function].get())
         );
-        assert_eq!(read64(32), BASE + u64::from(image_base_offset));
-        for slide in [0, 0x1234_0000u64] {
-            let mut rebased = data.data.clone();
-            for relocation in output.relocations.iter().filter(|relocation| {
-                relocation.kind == RelocKind::Dir64
-                    && relocation.rva >= data.rva
-                    && relocation.rva.get() < data.rva.get() + data.data.len() as u32
-            }) {
-                let offset = (relocation.rva.get() - data.rva.get()) as usize;
-                let pointer = u64::from_le_bytes(rebased[offset..offset + 8].try_into().unwrap());
-                rebased[offset..offset + 8].copy_from_slice(&(pointer + slide).to_le_bytes());
-            }
-            let read64 =
-                |offset| u64::from_le_bytes(rebased[offset..offset + 8].try_into().unwrap());
-            assert_eq!(read64(0), table_start + slide);
-            assert_eq!(read64(8), table_end + slide);
-            assert_eq!(
-                read64(16),
-                BASE + slide + u64::from(report.address_map[&planned[0].rva].get())
-            );
-            assert_eq!(read64(32), BASE + slide + u64::from(image_base_offset));
-            assert_eq!(read64(48), BASE + slide - 2);
-            assert_eq!(
-                u32::from_le_bytes(rebased[0x18..0x1c].try_into().unwrap()),
-                read_only.rva.get()
-            );
-            assert_eq!(
-                u32::from_le_bytes(rebased[0x28..0x2c].try_into().unwrap()),
-                image_relative_offset
-            );
-            let displacement = i32::from_le_bytes(rebased[0x2c..0x30].try_into().unwrap());
-            assert_eq!(
-                (BASE + slide + u64::from(data.rva.get()) + 0x30)
-                    .checked_add_signed(i64::from(displacement)),
-                Some(BASE + slide + u64::from(relative_offset))
-            );
-        }
-        let table = output
-            .bytes_at(Rva::new((table_start - BASE) as u32))
+        assert_eq!(read64(32), BASE + 0x1_1000);
+        assert_eq!(read64(48), BASE - 2);
+        assert_eq!(
+            u32::from_le_bytes(data[24..28].try_into().unwrap()),
+            report.address_map[&readonly].get()
+        );
+        assert_eq!(u32::from_le_bytes(data[40..44].try_into().unwrap()), 0x2345);
+        assert_eq!(
+            (BASE + u64::from(data_rva.get()) + 48).checked_add_signed(i64::from(
+                i32::from_le_bytes(data[44..48].try_into().unwrap())
+            )),
+            Some(BASE + 0x1_2000)
+        );
+        let exception = report
+            .directories
+            .iter()
+            .find(|directory| directory.index == 3)
             .unwrap();
         assert_eq!(
-            u64::from_le_bytes(table[..8].try_into().unwrap()),
-            read64(16)
+            output_pe.data_directory(3),
+            Some((exception.rva, exception.size))
         );
-        let last = u64::from_le_bytes(table[8..16].try_into().unwrap());
-        let startup = output.bytes_at(Rva::new((last - BASE) as u32)).unwrap();
-        let startup: Vec<_> = Decoder::with_ip(64, startup, last, DecoderOptions::NONE)
-            .into_iter()
-            .take(2)
+        assert_eq!(
+            exception
+                .contributions
+                .iter()
+                .map(|range| (range.rva, range.size))
+                .collect::<Vec<_>>(),
+            output_pe
+                .runtime_functions()
+                .iter()
+                .map(|range| (range.begin, range.end.get() - range.begin.get()))
+                .collect::<Vec<_>>()
+        );
+        let relocations = report
+            .directories
+            .iter()
+            .find(|directory| directory.index == 5)
+            .unwrap();
+        let fields: BTreeSet<_> = relocations
+            .contributions
+            .iter()
+            .map(|range| range.rva)
             .collect();
-        assert_eq!(startup[0].code(), Code::Endbr64);
-        assert_eq!(startup[1].near_branch_target(), BASE + 0x1000);
+        assert_eq!(
+            fields,
+            output
+                .relocations
+                .iter()
+                .filter(|relocation| relocation.kind == RelocKind::Dir64)
+                .map(|relocation| relocation.rva)
+                .collect()
+        );
         for offset in [0, 8, 16, 32, 48] {
-            assert!(
-                output
-                    .relocations
-                    .iter()
-                    .any(|relocation| relocation.rva.get() == data.rva.get() + offset
-                        && relocation.kind == RelocKind::Dir64)
-            );
+            assert!(fields.contains(&Rva::new(data_rva.get() + offset)));
         }
-        assert!(
-            pe.runtime_functions()
-                .iter()
-                .any(|function| function.begin == report.address_map[&planned[0].rva])
-        );
-        assert!(
-            pe.runtime_functions()
-                .iter()
-                .any(|function| Some(function.begin) == output.entry_point)
-        );
+        let startup = report.address_map[&SymbolId::Generated {
+            name: "startup".into(),
+        }];
+        let instructions: Vec<_> = Decoder::with_ip(
+            64,
+            output.bytes_at(startup).unwrap(),
+            BASE + u64::from(startup.get()),
+            DecoderOptions::NONE,
+        )
+        .into_iter()
+        .take(2)
+        .collect();
+        assert_eq!(instructions[1].near_branch_target(), BASE + 0x1000);
     }
 
     #[test]
-    fn dll_init_table_excludes_original_and_tails_to_its_bool_return() {
-        let mut host_image = fixture(&[0xb8, 1, 0, 0, 0, 0xc3], true);
-        put32(&mut host_image, 0xa8, 0x1000);
-        let pe = PeFile::parse(&host_image).unwrap();
+    fn duplicate_source_rvas_and_compiler_symbols_do_not_alias_module_instances() {
+        let pe = PeFile::parse(&fixture(&[0xc3], false)).unwrap();
+        let host = pe.to_module();
+        let mut plugins = [
+            named_plugin("first", &[0x31, 0xc0, 0xc3]),
+            named_plugin("second", &[0x31, 0xc0, 0xc3]),
+        ];
+        for plugin in &mut plugins {
+            plugin.module.references.push(reference(
+                plugin.module.symbols[1].id.clone(),
+                0,
+                plugin.module.code[0].symbol.clone(),
+                0,
+                LinkField::Absolute64,
+            ));
+            plugin.module.image[0x608..0x610].copy_from_slice(&(BASE + 0x1000).to_le_bytes());
+        }
+        let planned = planned_functions(&plugins).unwrap();
+        assert_ne!(planned[0].symbol, planned[1].symbol);
+        let (first, report) = link(&pe, &host, &plugins, EntryMode::InitTable).unwrap();
+        let (second, _) = link(&pe, &host, &plugins, EntryMode::InitTable).unwrap();
+        assert_eq!(first, second);
+        assert_ne!(
+            report.address_map[&planned[0].symbol],
+            report.address_map[&planned[1].symbol]
+        );
+        assert!(report.functions.iter().all(|function| function.lowered
+            && !function.transformed
+            && function.intensity == 0.0));
+        let output = PeFile::parse(&first).unwrap().to_module();
+        for plugin in &plugins {
+            let data = report.address_map[&plugin.module.symbols[1].id];
+            let bytes = output.bytes_at(data).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                BASE + u64::from(report.address_map[&plugin.module.code[0].symbol].get())
+            );
+            assert_eq!(
+                u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+                BASE + 0x1000
+            );
+            assert!(
+                !output
+                    .relocations
+                    .iter()
+                    .any(|relocation| relocation.rva.get() == data.get() + 8)
+            );
+        }
+    }
+
+    #[test]
+    fn dll_init_table_excludes_original_entry_and_preserves_bool_tail_return() {
+        let mut image = fixture(&[0xb8, 1, 0, 0, 0, 0xc3], true);
+        put32(&mut image, 0xa8, 0x1000);
+        let pe = PeFile::parse(&image).unwrap();
         let host = pe.to_module();
         let mut plugin = plugin(&[0x31, 0xc0, 0xc3]);
-        plugin.module.data.extend([
-            DataSymbol {
-                name: "SYMBOL_init_table_start".into(),
-                start: Rva::new(0x2000),
-                size: 8,
-            },
-            DataSymbol {
-                name: "SYMBOL_init_table_end".into(),
-                start: Rva::new(0x2008),
-                size: 8,
-            },
-        ]);
-        let (image, _) = protect_with_modules(
-            &pe,
-            &host,
-            &[],
-            &Options::default(),
-            &Win64Default,
-            &mut |_, _, _| {},
-            Injection {
-                plugins: &[plugin],
-                mode: EntryMode::InitTable,
-            },
-        )
-        .unwrap();
+        add_bounds(&mut plugin);
+        let (image, report) = link(&pe, &host, &[plugin], EntryMode::InitTable).unwrap();
         let output = PeFile::parse(&image).unwrap().to_module();
-        let data = output
-            .sections
+        let table = report
+            .placements
             .iter()
-            .find(|section| section.flags.write && section.rva.get() >= 0x4000)
+            .find(|placement| {
+                placement.symbol
+                    == (SymbolId::Generated {
+                        name: "init-table".into(),
+                    })
+            })
             .unwrap();
-        let start = u64::from_le_bytes(data.data[..8].try_into().unwrap());
-        let end = u64::from_le_bytes(data.data[8..16].try_into().unwrap());
-        assert_eq!(end - start, 8);
+        assert_eq!(table.size, 8);
         let entry = output.entry_point.unwrap();
         let instructions: Vec<_> = Decoder::with_ip(
             64,
@@ -1960,12 +2480,204 @@ mod tests {
     }
 
     #[test]
-    fn kernel_injection_fails_before_running_transforms() {
+    fn zero_fill_storage_preserves_virtual_size_permissions_and_no_raw_bytes() {
+        let pe = PeFile::parse(&fixture(&[0xc3], false)).unwrap();
+        let host = pe.to_module();
+        let mut plugin = plugin(&[0x31, 0xc0, 0xc3]);
+        put32(&mut plugin.module.image, 0x188 + 40 + 16, 0);
+        put32(&mut plugin.module.image, 0x188 + 40 + 20, 0);
+        let data = plugin.module.symbols[1].id.clone();
+        let (image, report) = link(&pe, &host, &[plugin], EntryMode::Inline).unwrap();
+        let output = PeFile::parse(&image).unwrap();
+        let module = output.to_module();
+        let section = module.section_at(report.address_map[&data]).unwrap();
+        assert_eq!(section.virtual_size, 128);
+        assert!(section.flags.read && section.flags.write && !section.flags.execute);
+        let header = output
+            .section_headers()
+            .iter()
+            .find(|header| header.rva == section.rva.get())
+            .unwrap();
+        assert_eq!(header.raw_size, 0);
+    }
+
+    fn plugin_with_large_bss() -> Plugin {
+        let mut plugin = plugin(&[0x31, 0xc0, 0xc3]);
+        put32(&mut plugin.module.image, 0x188 + 40 + 8, 0x2018);
+        put32(&mut plugin.module.image, 0x188 + 2 * 40 + 12, 0x5000);
+        put32(&mut plugin.module.image, 0xd0, 0x6000);
+        plugin.module.symbols[2].rva = Rva::new(0x5000);
+        let bss = id(&plugin.name, "large-bss");
+        plugin.module.symbols.push(Symbol {
+            id: bss.clone(),
+            name: "large-bss".into(),
+            rva: Rva::new(0x2018),
+            kind: SymbolKind::Data,
+        });
+        plugin.module.data.push(DataSymbol {
+            symbol: bss,
+            name: "large-bss".into(),
+            start: Rva::new(0x2018),
+            size: 8192,
+        });
+        add_bounds(&mut plugin);
+        plugin
+    }
+
+    #[test]
+    fn later_linker_bound_cells_preserve_large_bss_virtual_tail_and_aliases() {
+        for dll in [false, true] {
+            for mode in [EntryMode::Inline, EntryMode::InitTable] {
+                let mut host_image = fixture(&[0x31, 0xc0, 0xc3], dll);
+                put32(&mut host_image, 0xa8, 0x1000);
+                let pe = PeFile::parse(&host_image).unwrap();
+                let host = pe.to_module();
+                let mut plugin = plugin_with_large_bss();
+                let source = plugin.module.symbols[1].id.clone();
+                let readonly = plugin.module.symbols[2].id.clone();
+                let bss = plugin.module.data[0].symbol.clone();
+                let interior = id(&plugin.name, "bss-interior");
+                let one_past = id(&plugin.name, "bss-one-past");
+                for (alias, offset) in [(interior.clone(), 37), (one_past.clone(), 8192)] {
+                    plugin.module.symbols.push(Symbol {
+                        id: alias.clone(),
+                        name: format!("bss+{offset}"),
+                        rva: Rva::new(0x2018 + offset),
+                        kind: SymbolKind::Data,
+                    });
+                    plugin.module.bindings.insert(
+                        alias,
+                        SymbolicExpression::Symbol {
+                            symbol: bss.clone(),
+                            addend: i64::from(offset),
+                        },
+                    );
+                }
+                plugin.module.references.extend([
+                    reference(
+                        source.clone(),
+                        16,
+                        interior.clone(),
+                        0,
+                        LinkField::Absolute64,
+                    ),
+                    reference(
+                        readonly.clone(),
+                        0,
+                        one_past.clone(),
+                        0,
+                        LinkField::Absolute64,
+                    ),
+                ]);
+                let (image, report) = link(&pe, &host, &[plugin], mode).unwrap();
+                let output = PeFile::parse(&image).unwrap();
+                let output_module = output.to_module();
+                let data_rva = report.address_map[&source].get();
+                let bss_rva = report.address_map[&bss].get();
+                let section = output
+                    .section_headers()
+                    .iter()
+                    .find(|section| section.rva == data_rva)
+                    .unwrap();
+                assert_eq!(section.virtual_size, 24 + 8192);
+                assert_eq!(section.raw_size, 0x200);
+                assert_eq!(section.characteristics & 0xe000_0000, 0xc000_0000);
+                assert_eq!(bss_rva, data_rva + 24);
+                assert_eq!(bss_rva + 8192, section.rva + section.virtual_size);
+                assert!(bss_rva + 8192 > section.rva + section.raw_size);
+                assert_eq!(report.address_map[&interior].get(), bss_rva + 37);
+                assert_eq!(report.address_map[&one_past].get(), bss_rva + 8192);
+                let read_pointer = |rva| {
+                    u64::from_le_bytes(
+                        output_module.bytes_at(Rva::new(rva)).unwrap()[..8]
+                            .try_into()
+                            .unwrap(),
+                    )
+                };
+                assert_eq!(read_pointer(data_rva + 16), BASE + u64::from(bss_rva + 37));
+                assert_eq!(
+                    read_pointer(report.address_map[&readonly].get()),
+                    BASE + u64::from(bss_rva + 8192)
+                );
+                let table = report
+                    .placements
+                    .iter()
+                    .find(|placement| {
+                        placement.symbol
+                            == (SymbolId::Generated {
+                                name: "init-table".into(),
+                            })
+                    })
+                    .unwrap();
+                assert_eq!(read_pointer(data_rva), BASE + u64::from(table.rva.get()));
+                assert_eq!(
+                    read_pointer(data_rva + 8),
+                    BASE + u64::from(table.rva.get() + table.size)
+                );
+                let relocations = &output_module.relocations;
+                for field in [
+                    data_rva,
+                    data_rva + 8,
+                    data_rva + 16,
+                    report.address_map[&readonly].get(),
+                ] {
+                    assert!(relocations.iter().any(|relocation| {
+                        relocation.rva.get() == field && relocation.kind == RelocKind::Dir64
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn initialized_writes_cannot_extend_raw_storage_across_bss() {
+        let pe = PeFile::parse(&fixture(&[0xc3], false)).unwrap();
+        let host = pe.to_module();
+        for bound_cell in [false, true] {
+            let mut plugin = plugin_with_large_bss();
+            if bound_cell {
+                let bound = plugin
+                    .module
+                    .data
+                    .iter_mut()
+                    .find(|data| is_bound(&data.name))
+                    .unwrap();
+                bound.start = Rva::new(0x4010);
+                plugin
+                    .module
+                    .symbols
+                    .iter_mut()
+                    .find(|symbol| symbol.id == bound.symbol)
+                    .unwrap()
+                    .rva = bound.start;
+            } else {
+                plugin.module.references.push(reference(
+                    plugin.module.symbols[1].id.clone(),
+                    0x2010,
+                    plugin.module.code[0].symbol.clone(),
+                    0,
+                    LinkField::Absolute64,
+                ));
+            }
+            let error = format!(
+                "{:#}",
+                link(&pe, &host, &[plugin], EntryMode::Inline)
+                    .err()
+                    .unwrap()
+            );
+            assert!(error.contains("initialized"), "{error}");
+            assert!(error.contains("example"), "{error}");
+            assert!(error.contains("rebuild"), "{error}");
+        }
+    }
+
+    #[test]
+    fn kernel_injection_fails_before_transformation() {
         let mut image = fixture(&[0xc3], false);
         put16(&mut image, 0xdc, 1);
         let pe = PeFile::parse(&image).unwrap();
         let host = pe.to_module();
-        let error = protect_with_modules(
+        let error = crate::protect(
             &pe,
             &host,
             &[],
@@ -1983,122 +2695,24 @@ mod tests {
     }
 
     #[test]
-    fn zero_fill_module_storage_keeps_writable_nonexecutable_permissions() {
+    fn image_relative_signed_overflow_fails_contextually() {
         let pe = PeFile::parse(&fixture(&[0xc3], false)).unwrap();
         let host = pe.to_module();
-        let mut plugin = plugin(&[0x31, 0xc0, 0xc3]);
-        put32(&mut plugin.module.image, 0x188 + 40 + 16, 0);
-        put32(&mut plugin.module.image, 0x188 + 40 + 20, 0);
-        let (image, _) = protect_with_modules(
-            &pe,
-            &host,
-            &[],
-            &Options::default(),
-            &Win64Default,
-            &mut |_, _, _| {},
-            Injection {
-                plugins: &[plugin],
-                mode: EntryMode::Inline,
-            },
-        )
-        .unwrap();
-        let output = PeFile::parse(&image).unwrap().to_module();
-        let data = output
-            .sections
-            .iter()
-            .find(|section| section.flags.write && section.rva.get() >= 0x4000)
-            .unwrap();
-        assert_eq!(data.virtual_size, 128);
-        assert!(data.flags.read && !data.flags.execute);
-        assert_eq!(data.data, vec![0; 128]);
-    }
-
-    #[test]
-    fn planned_namespaces_exclude_host_plugins_and_all_host_base_targets() {
-        let host = PeFile::parse(&fixture(&[0xc3], false)).unwrap().to_module();
-        let first = plugin(&[0x31, 0xc0, 0xc3]);
-        let extent = image_end(&PeFile::parse(&first.module.image).unwrap().to_module()).unwrap();
-        let old_namespace = crate::align_up(image_end(&host).unwrap(), 0x1_0000).unwrap();
-        let targets = [
-            old_namespace,
-            old_namespace + 0x1000,
-            old_namespace + 0x2000,
-            old_namespace + extent,
-            old_namespace + 0x1_0000 + 0x1000,
-            u32::MAX,
-        ];
-        let mut second = plugin(&[0x31, 0xc0, 0xc3]);
-        second.name = "second".into();
-        second
-            .module
-            .references
-            .extend(
-                targets
-                    .iter()
-                    .enumerate()
-                    .map(|(index, &offset)| ModuleReference {
-                        source: Rva::new(0x2000 + index as u32 * 8),
-                        target: ModuleTarget::ImageBase,
-                        addend: i64::from(offset),
-                        kind: ModuleReferenceKind::Absolute64,
-                    }),
-            );
-        let plugins = [first, second];
-        let namespaces = namespaces(&host, &plugins).unwrap();
-        let planned = planned_functions(&host, &plugins).unwrap();
-        assert_eq!(planned[0].name, "init");
-        for (index, namespace) in namespaces.iter().enumerate() {
-            let end = namespace.start + image_end(&namespace.module).unwrap();
-            assert!(namespace.start >= image_end(&host).unwrap());
-            assert!(
-                targets
-                    .iter()
-                    .all(|&target| target < namespace.start || target > end)
-            );
-            assert_eq!(
-                planned[index].rva.get(),
-                namespace.start + plugins[index].module.code[0].start.get()
-            );
+        for addend in [-1, i64::from(u32::MAX) + 1] {
+            let mut plugin = plugin(&[0x31, 0xc0, 0xc3]);
+            plugin.module.references.push(reference(
+                plugin.module.symbols[1].id.clone(),
+                0,
+                SymbolId::HostImageBase,
+                addend,
+                LinkField::ImageRelative32,
+            ));
+            let error = link(&pe, &host, &[plugin], EntryMode::Inline)
+                .err()
+                .unwrap();
+            let message = format!("{error:#}");
+            assert!(message.contains("plugin example reference") && message.contains("range"));
         }
-        assert!(planned[1].rva.get() > planned[0].rva.get() + extent);
-    }
-
-    #[test]
-    fn namespace_reservations_include_effective_rip_trailing_bytes() {
-        let host = PeFile::parse(&fixture(&[0xc3], false)).unwrap().to_module();
-        let old_namespace = crate::align_up(image_end(&host).unwrap(), 0x1_0000).unwrap();
-        let mut plugin = plugin(&[0x31, 0xc0, 0xc3]);
-        plugin.module.references.push(ModuleReference {
-            source: Rva::new(0x2000),
-            target: ModuleTarget::ImageBase,
-            addend: i64::from(old_namespace) - 2,
-            kind: ModuleReferenceKind::Relative32 { bias: 0 },
-        });
-        let plugins = [plugin];
-        let namespaces = namespaces(&host, &plugins).unwrap();
-        let planned = planned_functions(&host, &plugins).unwrap();
-        assert!(namespaces[0].start > old_namespace + 13);
-        assert_eq!(planned[0].rva.get(), namespaces[0].start + 0x1000);
-    }
-
-    #[test]
-    fn host_base_target_namespace_overflow_identifies_plugin_and_target() {
-        let mut host = PeFile::parse(&fixture(&[0xc3], false)).unwrap().to_module();
-        let section = host.sections.last_mut().unwrap();
-        section.rva = Rva::new(0xfffe_0000);
-        section.virtual_size = 0x1_0000;
-        let mut plugin = plugin(&[0x31, 0xc0, 0xc3]);
-        plugin.module.references.push(ModuleReference {
-            source: Rva::new(0x2000),
-            target: ModuleTarget::ImageBase,
-            addend: 0xffff_1000,
-            kind: ModuleReferenceKind::Absolute64,
-        });
-        let error = planned_functions(&host, &[plugin]).unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains("plugin example synthetic namespace"));
-        assert!(message.contains("0xffff1000"));
-        assert!(message.contains("RVA overflow"));
     }
 
     #[test]
@@ -2106,18 +2720,11 @@ mod tests {
         let mut bytes = fixture(&[0xb8, 1, 0, 0, 0, 0xc3], true);
         put32(&mut bytes, 0xa8, 0x1000);
         let pe = PeFile::parse(&bytes).unwrap();
-        let host = pe.to_module();
-        let (image, _) = protect_with_modules(
+        let (image, _) = link(
             &pe,
-            &host,
-            &[],
-            &Options::default(),
-            &Win64Default,
-            &mut |_, _, _| {},
-            Injection {
-                plugins: &[plugin(&[0x31, 0xc0, 0xc3])],
-                mode: EntryMode::Inline,
-            },
+            &pe.to_module(),
+            &[plugin(&[0x31, 0xc0, 0xc3])],
+            EntryMode::Inline,
         )
         .unwrap();
         let rebuilt = PeFile::parse(&image).unwrap();
@@ -2129,5 +2736,479 @@ mod tests {
                 .iter()
                 .all(|section| section.virtual_size != 0)
         );
+    }
+
+    fn host_function(entry: u32, end: u32) -> kamy_core::Function {
+        kamy_core::Function {
+            entry: Rva::new(entry),
+            blocks: vec![kamy_core::BasicBlock {
+                start: Rva::new(entry),
+                end: Rva::new(end),
+                successors: Vec::new(),
+                terminator: kamy_core::Terminator::Return,
+            }],
+        }
+    }
+
+    #[test]
+    fn authored_host_object_retargets_mover_without_touching_equal_integer() {
+        for arithmetic in [false, true] {
+            let pe = PeFile::parse(&fixture(&[0x31, 0xc0, 0xc3], false)).unwrap();
+            let mut host = pe.to_module();
+            host.functions.push(host_function(0x1000, 0x1003));
+            let mut code = vec![0x48, 0xb8];
+            let raw = if arithmetic { BASE } else { BASE + 0x1000 };
+            code.extend_from_slice(&raw.to_le_bytes());
+            if arithmetic {
+                code.extend_from_slice(&[0x48, 0x05, 0x00, 0x10, 0x00, 0x00]);
+            }
+            code.extend_from_slice(&[0x48, 0x89, 0x01, 0x48, 0xba]);
+            code.extend_from_slice(&(BASE + 0x1000).to_le_bytes());
+            code.extend_from_slice(&[0x48, 0x89, 0x51, 8, 0x31, 0xc0, 0xc3]);
+            let mut plugin = plugin(&code);
+            plugin.module.references.push(reference(
+                plugin.module.code[0].symbol.clone(),
+                2,
+                SymbolId::HostImageBase,
+                if arithmetic { 0 } else { 0x1000 },
+                LinkField::Absolute64,
+            ));
+            let function = plugin.module.code[0].symbol.clone();
+            let (image, report) = link(&pe, &host, &[plugin], EntryMode::Inline).unwrap();
+            let moved = report.address_map[&SymbolId::Host {
+                rva: Rva::new(0x1000),
+            }];
+            assert_ne!(moved, Rva::new(0x1000));
+            let output = PeFile::parse(&image).unwrap().to_module();
+            let entry = report.address_map[&function];
+            for slide in [0, 0x1234_0000] {
+                let instructions: Vec<_> = Decoder::with_ip(
+                    64,
+                    output.bytes_at(entry).unwrap(),
+                    BASE + slide + u64::from(entry.get()),
+                    DecoderOptions::NONE,
+                )
+                .into_iter()
+                .take_while(|instruction| instruction.mnemonic() != Mnemonic::Ret)
+                .collect();
+                assert!(
+                    instructions
+                        .iter()
+                        .any(|instruction| instruction.mnemonic() == Mnemonic::Lea
+                            && instruction.ip_rel_memory_address()
+                                == BASE + slide + u64::from(moved.get()))
+                );
+                assert!(
+                    instructions
+                        .iter()
+                        .any(|instruction| instruction.code() == Code::Mov_r64_imm64
+                            && instruction.immediate64() == BASE + 0x1000)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retained_host_and_lowered_sources_share_one_active_exception_table() {
+        let mut code = vec![0x90; 0x11];
+        code[..3].copy_from_slice(&[0x31, 0xc0, 0xc3]);
+        code[0x10] = 0xc3;
+        let mut bytes = fixture(&code, false);
+        put32(&mut bytes, 0x108 + 3 * 8, 0x3000);
+        put32(&mut bytes, 0x10c + 3 * 8, 24);
+        put32(&mut bytes, 0x188 + 2 * 40 + 8, 24);
+        bytes[0x600] = 1;
+        for (offset, value) in [
+            (0x800, 0x1000),
+            (0x804, 0x1003),
+            (0x808, 0x2000),
+            (0x80c, 0x1010),
+            (0x810, 0x1011),
+            (0x814, 0x2000),
+        ] {
+            put32(&mut bytes, offset, value);
+        }
+        let pe = PeFile::parse(&bytes).unwrap();
+        let mut host = pe.to_module();
+        host.functions = vec![host_function(0x1000, 0x1003), host_function(0x1010, 0x1011)];
+        let plugins = [plugin(&[0x31, 0xc0, 0xc3])];
+        let opts = Options {
+            selected_symbols: Some(
+                [
+                    SymbolId::Host {
+                        rva: Rva::new(0x1000),
+                    },
+                    plugins[0].module.code[0].symbol.clone(),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..Options::default()
+        };
+        for injected in [false, true] {
+            let (image, report) = crate::protect(
+                &pe,
+                &host,
+                &host.functions,
+                &opts,
+                &Win64Default,
+                &mut |_, _, _| Ok(TransformOutcome::default()),
+                Injection {
+                    plugins: if injected { &plugins } else { &[] },
+                    mode: EntryMode::InitTable,
+                },
+            )
+            .unwrap();
+            let output = PeFile::parse(&image).unwrap();
+            let active = report
+                .directories
+                .iter()
+                .find(|directory| directory.index == 3)
+                .unwrap();
+            let tables: Vec<_> = report
+                .placements
+                .iter()
+                .filter(|placement| {
+                    placement.ownership == Ownership::Generated
+                        && placement.symbol
+                            == (SymbolId::Generated {
+                                name: "directory-3".into(),
+                            })
+                })
+                .collect();
+            assert_eq!(tables.len(), 1);
+            assert_eq!((tables[0].rva, tables[0].size), (active.rva, active.size));
+            assert_eq!(output.data_directory(3), Some((active.rva, active.size)));
+            assert!(active.contributions.iter().any(
+                |range| range.rva == Rva::new(0x1010) && range.ownership == Ownership::Resident
+            ));
+            assert!(active.contributions.iter().any(|range| range.symbol
+                == (SymbolId::Host {
+                    rva: Rva::new(0x1000)
+                })
+                && range.ownership == Ownership::Generated));
+            assert_eq!(
+                active
+                    .contributions
+                    .iter()
+                    .any(|range| matches!(range.symbol, SymbolId::Authored { .. })),
+                injected
+            );
+            assert_eq!(active.contributions.len(), output.runtime_functions().len());
+            assert!(
+                output
+                    .runtime_functions()
+                    .windows(2)
+                    .all(|pair| pair[0].end <= pair[1].begin)
+            );
+            assert!(
+                report
+                    .placements
+                    .iter()
+                    .any(|placement| placement.rva == Rva::new(0x3000)
+                        && placement.ownership == Ownership::Retired)
+            );
+        }
+    }
+
+    #[test]
+    fn image_relative_instruction_is_a_scalar_difference_not_a_pointer() {
+        let code = [0xb8, 0x00, 0x20, 0x00, 0x00, 0x89, 0x01, 0x31, 0xc0, 0xc3];
+        let mut plugin = plugin(&code);
+        let function = plugin.module.code[0].symbol.clone();
+        let data = plugin.module.symbols[1].id.clone();
+        plugin.module.references.push(reference(
+            function.clone(),
+            1,
+            data.clone(),
+            0,
+            LinkField::ImageRelative32,
+        ));
+        let pe = PeFile::parse(&fixture(&[0xc3], false)).unwrap();
+        let (image, report) = link(&pe, &pe.to_module(), &[plugin], EntryMode::Inline).unwrap();
+        let output = PeFile::parse(&image).unwrap().to_module();
+        let entry = report.address_map[&function];
+        let target = u64::from(report.address_map[&data].get());
+        let instructions: Vec<_> = Decoder::with_ip(
+            64,
+            output.bytes_at(entry).unwrap(),
+            BASE + u64::from(entry.get()),
+            DecoderOptions::NONE,
+        )
+        .into_iter()
+        .take_while(|instruction| instruction.mnemonic() != Mnemonic::Ret)
+        .collect();
+        assert!(
+            instructions
+                .iter()
+                .any(|instruction| match instruction.op1_kind() {
+                    OpKind::Immediate64 => instruction.immediate64() == target,
+                    OpKind::Immediate32 => u64::from(instruction.immediate32()) == target,
+                    _ => false,
+                })
+        );
+        assert!(
+            !instructions
+                .iter()
+                .any(|instruction| instruction.mnemonic() == Mnemonic::Lea
+                    && instruction.ip_rel_memory_address() == BASE + target)
+        );
+    }
+
+    #[test]
+    fn authored_alias_bindings_and_negative_differences_preserve_storage_identity() {
+        let pe = PeFile::parse(&fixture(&[0xc3], false)).unwrap();
+        let mut plugin = plugin(&[0x31, 0xc0, 0xc3]);
+        let storage = plugin.module.symbols[1].id.clone();
+        let readonly = plugin.module.symbols[2].id.clone();
+        let alias = id("example", "coff:fixture:symbol:9:one-past");
+        plugin.module.symbols.push(Symbol {
+            id: alias.clone(),
+            name: "one-past".into(),
+            rva: Rva::new(0x2080),
+            kind: SymbolKind::Data,
+        });
+        plugin.module.bindings.insert(
+            alias.clone(),
+            SymbolicExpression::Symbol {
+                symbol: storage.clone(),
+                addend: 128,
+            },
+        );
+        plugin.module.references.push(reference(
+            storage.clone(),
+            0,
+            alias.clone(),
+            -8,
+            LinkField::Absolute64,
+        ));
+        plugin.module.references.push(Reference {
+            source: storage.clone(),
+            offset: 8,
+            expression: SymbolicExpression::Difference {
+                left: storage.clone(),
+                right: readonly.clone(),
+                addend: -7,
+            },
+            field: LinkField::Absolute64,
+            origin: ReferenceOrigin::Authored,
+        });
+        let (image, report) = link(&pe, &pe.to_module(), &[plugin], EntryMode::Inline).unwrap();
+        let output = PeFile::parse(&image).unwrap().to_module();
+        let data = report.address_map[&storage];
+        assert_eq!(report.address_map[&alias].get(), data.get() + 128);
+        let bytes = output.bytes_at(data).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            BASE + u64::from(data.get()) + 120
+        );
+        let expected = i64::from(data.get()) - i64::from(report.address_map[&readonly].get()) - 7;
+        assert_eq!(
+            i64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            expected
+        );
+        assert!(
+            output
+                .relocations
+                .iter()
+                .any(|relocation| relocation.rva == data && relocation.kind == RelocKind::Dir64)
+        );
+        assert!(
+            !output
+                .relocations
+                .iter()
+                .any(|relocation| relocation.rva.get() == data.get() + 8)
+        );
+    }
+
+    #[test]
+    fn module_selection_does_not_remove_required_identity_lowering() {
+        let pe = PeFile::parse(&fixture(&[0xc3], false)).unwrap();
+        let host = pe.to_module();
+        let plugins = [plugin(&[0x31, 0xc0, 0xc3])];
+        let opts = Options {
+            selected_symbols: Some(BTreeSet::new()),
+            ..Options::default()
+        };
+        let (_, report) = crate::protect(
+            &pe,
+            &host,
+            &[],
+            &opts,
+            &Win64Default,
+            &mut |_, _, _| panic!("unselected semantic callback must not run"),
+            Injection {
+                plugins: &plugins,
+                mode: EntryMode::Inline,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.ssa_lowered, 1);
+        assert!(report.functions.iter().all(|function| !function.selected
+            && function.eligible
+            && function.lowered
+            && !function.transformed
+            && function.intensity == 0.0));
+    }
+
+    #[test]
+    fn layout_overflow_fails_without_neighbor_storage() {
+        let pe = PeFile::parse(&fixture(&[0xc3], false)).unwrap();
+        let host = pe.to_module();
+        let plugins = [plugin(&[0x31, 0xc0, 0xc3])];
+        let mut plan = Plan::prepare(
+            &pe,
+            &host,
+            &Options::default(),
+            &mut |_, _, _| Ok(TransformOutcome::default()),
+            Injection {
+                plugins: &plugins,
+                mode: EntryMode::Inline,
+            },
+        )
+        .unwrap();
+        let error = plan
+            .place(u32::MAX - 15, &BTreeMap::new(), &BTreeMap::new())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("overflow"));
+    }
+
+    #[test]
+    fn distant_symbolic_pointer_rejects_encoding_with_source_context() {
+        let addend = 0x10_0000_0000i64;
+        let mut code = vec![0x48, 0xb8];
+        code.extend_from_slice(&BASE.checked_add_signed(addend).unwrap().to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x89, 0x01, 0x31, 0xc0, 0xc3]);
+        let mut plugin = plugin(&code);
+        plugin.module.references.push(reference(
+            plugin.module.code[0].symbol.clone(),
+            2,
+            SymbolId::HostImageBase,
+            addend,
+            LinkField::Absolute64,
+        ));
+        let pe = PeFile::parse(&fixture(&[0xc3], false)).unwrap();
+        let error = link(&pe, &pe.to_module(), &[plugin], EntryMode::Inline)
+            .err()
+            .unwrap();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("encoding plugin example") && message.contains("instruction encode")
+        );
+    }
+
+    #[test]
+    fn overlapping_authored_fields_fail_before_any_transform() {
+        let mut plugin = plugin(&[0x31, 0xc0, 0xc3]);
+        let data = plugin.module.symbols[1].id.clone();
+        plugin.module.references.extend([
+            reference(
+                data.clone(),
+                0,
+                SymbolId::HostImageBase,
+                0,
+                LinkField::Absolute64,
+            ),
+            reference(
+                data,
+                4,
+                SymbolId::HostImageBase,
+                0,
+                LinkField::ImageRelative32,
+            ),
+        ]);
+        let pe = PeFile::parse(&fixture(&[0xc3], false)).unwrap();
+        let host = pe.to_module();
+        let error = crate::protect(
+            &pe,
+            &host,
+            &[],
+            &Options::default(),
+            &Win64Default,
+            &mut |_, _, _| panic!("overlapping reference transform must not run"),
+            Injection {
+                plugins: &[plugin],
+                mode: EntryMode::Inline,
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("overlapping authored reference fields")
+        );
+    }
+
+    #[test]
+    fn unresolved_host_base_computation_keeps_host_targets_resident() {
+        let pe = PeFile::parse(&fixture(&[0x31, 0xc0, 0xc3], false)).unwrap();
+        let mut host = pe.to_module();
+        host.functions.push(host_function(0x1000, 0x1003));
+        let mut code = vec![0x48, 0xb8];
+        code.extend_from_slice(&BASE.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x01, 0xd0, 0x48, 0x89, 0x01, 0x31, 0xc0, 0xc3]);
+        let mut plugin = plugin(&code);
+        plugin.module.references.push(reference(
+            plugin.module.code[0].symbol.clone(),
+            2,
+            SymbolId::HostImageBase,
+            0,
+            LinkField::Absolute64,
+        ));
+        let (image, report) = link(&pe, &host, &[plugin], EntryMode::Inline).unwrap();
+        let source = SymbolId::Host {
+            rva: Rva::new(0x1000),
+        };
+        assert!(!report.moved.contains(&source));
+        assert!(
+            report
+                .rejected
+                .iter()
+                .any(|(symbol, reason)| *symbol == source
+                    && *reason == kamy_core::RejectionReason::InvalidReference)
+        );
+        let output = PeFile::parse(&image).unwrap().to_module();
+        assert_eq!(
+            &output.bytes_at(Rva::new(0x1000)).unwrap()[..3],
+            &[0x31, 0xc0, 0xc3]
+        );
+    }
+
+    #[test]
+    fn certificate_and_overlay_keep_final_file_coordinates_out_of_image_maps() {
+        let mut bytes = fixture(&[0xc3], false);
+        let certificate_offset = bytes.len() as u32;
+        let certificate = [16, 0, 0, 0, 0, 2, 2, 0, 0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4];
+        bytes.extend_from_slice(&certificate);
+        bytes.extend_from_slice(b"retained-overlay");
+        put32(&mut bytes, 0x108 + 4 * 8, certificate_offset);
+        put32(&mut bytes, 0x10c + 4 * 8, certificate.len() as u32);
+        let pe = PeFile::parse(&bytes).unwrap();
+        let (image, report) = link(
+            &pe,
+            &pe.to_module(),
+            &[plugin(&[0x31, 0xc0, 0xc3])],
+            EntryMode::Inline,
+        )
+        .unwrap();
+        let directory = report
+            .directories
+            .iter()
+            .find(|directory| directory.index == 4)
+            .unwrap();
+        assert_eq!(directory.rva, Rva::ZERO);
+        let offset = directory.file_offset.unwrap() as usize;
+        assert_ne!(offset, certificate_offset as usize);
+        assert_eq!(&image[offset..offset + certificate.len()], &certificate);
+        assert!(image.ends_with(b"retained-overlay"));
+        assert!(
+            directory.contributions.iter().all(
+                |source| source.source_rva.is_none() && source.ownership == Ownership::Retained
+            )
+        );
+        assert!(!report.address_map.contains_key(&SymbolId::Generated {
+            name: "certificate".into()
+        }));
     }
 }

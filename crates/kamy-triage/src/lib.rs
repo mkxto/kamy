@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use kamy_core::ir::{IrBlock, IrFunction};
-use kamy_core::{FunctionSelector, Rva};
+use kamy_core::{FunctionSelector, Rva, SymbolId};
 use kamy_disasm::discover_functions;
 use kamy_lift::LiftResult;
 use kamy_link::Report;
@@ -22,10 +22,9 @@ use kamy_pe::PeFile;
 
 /// Canonical SSA-identity protect: lift → SSA → optimize → regalloc → isel →
 /// encode with an identity transform (no obfuscation). `selector` restricts
-/// which functions are SSA-lowered; deselected functions are rejected in place
-/// (left byte-identical), never relocated verbatim. The protected image is
-/// written to `output`; the raw linker
-/// [`Report`] is returned.
+/// which host functions are SSA-lowered. Deselected bodies remain resident;
+/// their known references to moved code may still be patched. Writes the image
+/// to `output` and returns its linker [`Report`].
 pub fn protect_identity(
     input: &Path,
     output: &Path,
@@ -39,18 +38,23 @@ pub fn protect_identity(
     module.functions = discover_functions(&module, &seeds);
 
     let cc = kamy_link::build_callconv(&module);
-    let mut identity = |_: kamy_core::Rva, _: &mut IrFunction, _: f32| {};
+    let mut identity =
+        |_: &SymbolId, _: &mut IrFunction, _: f32| Ok(kamy_link::TransformOutcome::default());
     let opts = kamy_link::Options {
         selector: selector.cloned(),
         ..Default::default()
     };
-    let (image, report) = kamy_link::protect_with_transforms(
+    let (image, report) = kamy_link::protect(
         &pe,
         &module,
         &module.functions,
         &opts,
         &cc,
         &mut identity,
+        kamy_link::module::Injection {
+            plugins: &[],
+            mode: kamy_link::module::EntryMode::InitTable,
+        },
     )?;
     std::fs::write(output, &image).with_context(|| format!("writing {}", output.display()))?;
     Ok(report)
@@ -65,12 +69,45 @@ pub enum Stage {
     Regalloc,
 }
 
-/// Run the per-function pipeline up to `stage` for the function whose entry RVA
-/// equals `rva`, returning a readable textual dump of the IR (and, for
-/// [`Stage::Regalloc`], the register assignments and copies).
+/// Run the per-function pipeline up to `stage` at an exact source-local entry.
+/// Authored inputs use compiler symbols, operand provenance and native ABI;
+/// ordinary host inputs retain conservative discovery.
 pub fn dump_function(input: &Path, rva: Rva, stage: Stage) -> anyhow::Result<String> {
     let bytes = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
     let pe = PeFile::parse(&bytes).with_context(|| format!("parsing {}", input.display()))?;
+    if pe
+        .section_headers()
+        .iter()
+        .any(|section| section.name == ".kmod")
+    {
+        let identity = input.display().to_string();
+        let plugin = kamy_link::module::Plugin {
+            name: identity.clone(),
+            module: kamy_pe::module::AuthoredModule::parse(&bytes, &identity)
+                .with_context(|| format!("authored provenance in {}", input.display()))?,
+        };
+        let source = kamy_link::module::AuthoredSource::new(&plugin)?;
+        let prepared = source.function_at(rva, None)?;
+        let result = kamy_lift::lift_function(
+            source.module(),
+            &prepared.function,
+            &source,
+            &prepared.references,
+        );
+        let mut out = String::new();
+        writeln!(out, "source: {:?}", prepared.symbol.symbol)?;
+        writeln!(
+            out,
+            "source_range: {}..{}",
+            prepared.symbol.start, prepared.symbol.end
+        )?;
+        writeln!(out, "native_abi: {:?}", prepared.symbol.signature)?;
+        writeln!(out, "operand_references:")?;
+        for reference in &prepared.references {
+            writeln!(out, "  {reference:?}")?;
+        }
+        return dump_result(result, rva, stage, out, true);
+    }
 
     let mut module = pe.to_module();
     let seeds = pe.seeds();
@@ -83,31 +120,53 @@ pub fn dump_function(input: &Path, rva: Rva, stage: Stage) -> anyhow::Result<Str
         .with_context(|| format!("no function with entry {rva}"))?;
 
     let cc = kamy_link::build_callconv(&module);
-    let mut result: LiftResult = kamy_lift::lift_function(&module, func, &cc);
+    let result = kamy_lift::lift_function(&module, func, &cc, &[]);
+    dump_result(result, rva, stage, String::new(), false)
+}
+
+fn dump_result(
+    mut result: LiftResult,
+    rva: Rva,
+    stage: Stage,
+    mut out: String,
+    authored: bool,
+) -> anyhow::Result<String> {
     if matches!(stage, Stage::Ssa | Stage::Optimize | Stage::Regalloc) {
         kamy_lift::ssa::construct_ssa(&mut result);
+        if authored {
+            kamy_transforms::resolve_image_base_uses(&mut result.func, |offset| {
+                Some(kamy_core::SymbolicExpression::Symbol {
+                    symbol: SymbolId::HostImageBase,
+                    addend: offset,
+                })
+            });
+        }
     }
     if matches!(stage, Stage::Optimize | Stage::Regalloc) {
         kamy_transforms::optimize(&mut result.func);
     }
 
-    let mut out = String::new();
     writeln!(out, "function {rva} @ {stage:?}")?;
     if result.unsupported {
         writeln!(out, "unsupported: true")?;
+        if authored {
+            writeln!(out, "lowering rejection: UnsupportedInstruction")?;
+        }
     }
     write_header(&mut out, &result)?;
     write_ir(&mut out, &result.func)?;
 
     if stage == Stage::Regalloc {
-        let alloc = kamy_codegen::allocate_registers(
+        match kamy_codegen::allocate_registers(
             &result.func,
             &kamy_codegen::CALLEE_SAVED_GPRS,
             &result.rsp_chain,
             &result.reg_pins,
-        )
-        .map_err(|r| anyhow::anyhow!("register allocation failed: {r}"))?;
-        write_regalloc(&mut out, &alloc)?;
+        ) {
+            Ok(alloc) => write_regalloc(&mut out, &alloc)?,
+            Err(reason) if authored => bail!("{out}register allocation failed: {reason}"),
+            Err(reason) => bail!("register allocation failed: {reason}"),
+        }
     }
 
     Ok(out)
@@ -304,7 +363,14 @@ pub fn bisect(
     steps += 1;
     let res_b = is_pass(&out_b);
     let _ = std::fs::remove_file(&out_b);
-    let candidates = report.ssa_lowered_rvas.clone();
+    let candidates: Vec<_> = report
+        .ssa_lowered_symbols
+        .iter()
+        .filter_map(|symbol| match symbol {
+            SymbolId::Host { rva } => Some(*rva),
+            _ => None,
+        })
+        .collect();
     if res_b? {
         bail!("all-lowered passes, nothing to bisect");
     }

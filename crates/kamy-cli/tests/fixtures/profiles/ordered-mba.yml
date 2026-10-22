@@ -1,0 +1,14 @@
+version: 1.0.0
+profiles:
+- name: ordered-mba
+  passes:
+  - type: MixedBooleanArithmetic
+    iterations: 1
+    probability: 100
+    semantics: { sub: true }
+    bitwidths: { bit8: true, bit16: true, bit32: true, bit64: true }
+  - type: MixedBooleanArithmetic
+    iterations: 1
+    probability: 100
+    semantics: { add: true }
+    bitwidths: { bit8: true, bit16: true, bit32: true, bit64: true }

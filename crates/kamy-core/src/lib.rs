@@ -17,8 +17,11 @@ mod symbol;
 pub use addr::Rva;
 pub use cfg::{BasicBlock, Function, SwitchTable, Terminator};
 pub use module::{Machine, Module, Section, SectionFlags};
-pub use references::{Reference, ReferenceKind};
+pub use references::{
+    HostReference, LinkField, OperandReference, Reference, ReferenceKind, ReferenceOrigin,
+    SymbolicExpression,
+};
 pub use reject::RejectionReason;
 pub use reloc::{RelocKind, Relocation};
 pub use selector::FunctionSelector;
-pub use symbol::{Symbol, SymbolKind};
+pub use symbol::{Symbol, SymbolId, SymbolKind};

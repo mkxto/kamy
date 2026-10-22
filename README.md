@@ -79,7 +79,7 @@ profiles:
 kamy analyze input.exe --pdb input.pdb -o report.json
 
 # Protect: apply transforms per profile
-kamy protect input.exe --profile kamy.yml -o protected.exe --debug-map debug.json
+kamy protect input.exe --profile kamy.yml -o protected.exe --debug-map debug.csv
 
 # Verify: test-vector equivalence check
 kamy verify input.exe protected.exe --vectors 1000

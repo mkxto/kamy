@@ -4,7 +4,7 @@ Binary-to-binary protection engine. 100% Rust.
 Composable, per-function, per-layer protections with scriptable configuration.
 Targets Windows x86-64 PE32+ only. x86/PE32 support is explicitly out of scope; no 32-bit pipeline is planned. ELF and ARM64 remain future targets.
 
-This document specifies the approved target, not completed implementation or verification. The relocation cutover is [#17](https://github.com/mkxto/kamy/issues/17), governed by grilling D37–D38; those decisions supersede D2/D29/D30's original-VA thunk/runtime assumptions.
+This document separates the approved target from current contracts. D40 and the ordered [repair handoffs](handoffs/00-master.md) govern the symbol/rebuild cutover and its successors. Source interfaces below do not establish runtime acceptance; exercised results belong in [STATUS.md](STATUS.md). D37–D38 supersede D2/D29/D30's original-VA thunk/runtime assumptions.
 
 ---
 
@@ -49,10 +49,10 @@ A "light" profile runs fewer/simpler passes on the same IR as a "heavy" profile.
 - `MutationEngine` — instruction mutation (SSE-aware), same config shape
 - `LoopEncodeSemantics` — encode `add`/`sub`/`and`/`xor` as an iterative loop (ripple-carry / per-bit)
 
-**Compiler settings** (always present, not opt-in):
-- Lifter: `lift_calls`, `calling_convention`, `max_stack_copy_size`, `split_on_calls_fallback`
-- Optimizer: `constant_propagation`, `instruction_combine`, `dead_code_elim`, `prune_useless_block_params`
-- Assembler: `shuffle_basic_blocks`, `instruction_prefix`, `random_prefix_chance`
+**Compiler-setting target surface:**
+- Lifter: `lift_calls`, `calling_convention`; stack-copy/split-on-call knobs remain unimplemented and MUST be omitted from executable profiles.
+- Optimizer: `constant_propagation`, `instruction_combine`, `dead_code_elim`, `prune_useless_block_params`.
+- Assembler diversification remains target work; unsupported explicit requests MUST fail. See [tooling.md](tooling.md) for accepted values, not the vendor catalog.
 
 **Properties:**
 - Per-function selection via symbol names, patterns, addresses, PDB symbols.
@@ -81,7 +81,7 @@ Program
 
 **Key invariant:** layout-sensitive references are symbolic, not untracked absolute addresses. Movement is permitted only after reference completeness and rewriteability are established (D37). Opaque consumers pin their targets; a symbolic overlay alone does not prove arbitrary host code movable.
 
-**SymbolicExpression overlay:** every operand that could be a reference carries a typed symbolic annotation: `Absolute(symbol, offset)`, `PcRelative(symbol, offset)`, `LabelDiff(sym1, sym2, offset)`. Classified per KAIST Type I-VII taxonomy.
+Layout-sensitive operands carry a `SymbolicExpression`, not an integer later recognized as an address. `Symbol { symbol, addend }` preserves a signed symbol-relative value; `Difference { left, right, addend }` preserves a relationship between two identified symbols. The relocation field separately specifies absolute, image-relative or PC-relative encoding. Ordinary integer constants remain ordinary constants, including values equal to an address.
 
 ### Layer 2 — SSA Semantics IR (analysis/transform substrate)
 
@@ -130,7 +130,7 @@ kamy/
 │   ├── kamy-verify/        # SMT verification, test-vector equivalence, coverage reporting
 │   ├── kamy-config/        # Profile/config parsing (YAML), per-function layer selection
 │   ├── kamy-observe/       # tracing subscriber + log config (terminal-first diagnostics)
-│   ├── kamy-sdk/           # no_std Rust plugin entry ABI and linker-bound symbols
+│   ├── kamy-sdk/           # no_std SDK boundary; std module/runtime support is a later target
 │   └── kamy-cli/           # CLI binary
 ├── docs/
 │   ├── research.md
@@ -146,17 +146,11 @@ kamy/
 
 ## 5. Protection Profile Configuration
 
-Per-function, per-layer, composable. YAML format (matching CodeDefender's config schema).
+Per-function, per-layer, composable. YAML format with a CodeDefender-shaped configuration surface. This example uses the implemented subset. The exact supported settings and strict errors are documented in [tooling.md](tooling.md); unsupported enabled requests MUST fail rather than be ignored.
 
 ```yaml
 version: 1.0.0
 module_settings:
-  import_protection: false
-  obscure_entry_point: false
-  clear_unwind_info: false
-  fake_pdb_string:
-    enabled: false
-    value: ''
   custom_section_name:
     enabled: false
     value: ''
@@ -166,83 +160,21 @@ module_settings:
     plugins: []
 
 profiles:
-- name: light
+- name: arithmetic
   passes:
-  - type: ObscureReferences
-  - type: MutationEngine
-    iterations: 1
-    probability: 100
-    semantics:
-      add: true
-      sub: true
-      and: true
-      xor: true
-      or: true
-      not: true
-      neg: true
-    bitwidths:
-      bit8: true
-      bit16: true
-      bit32: true
-      bit64: true
-  compiler_settings:
-    assembler_settings:
-      shuffle_basic_blocks: true
-    optimization_settings:
-      constant_propagation: true
-      instruction_combine: true
-      dead_code_elim: true
-      prune_useless_block_params: true
-    lifter_settings:
-      lift_calls: true
-      calling_convention: WindowsAbi
-      max_stack_copy_size: 512
-      split_on_calls_fallback: true
-  symbols:
-  - !Name main
-  - !Name crypto_encrypt
-  - !Pattern "auth_*"
-  - !Address 0x140001000
-
-- name: heavy
-  passes:
-  - type: ObscureReferences
-  - type: ObscureConstants
   - type: MixedBooleanArithmetic
     iterations: 2
     probability: 100
-    semantics: { add: true, sub: true, and: true, xor: true, or: true, not: true, neg: true }
+    semantics: { add: true, sub: true, xor: true }
     bitwidths: { bit8: true, bit16: true, bit32: true, bit64: true }
-  - type: LoopEncodeSemantics
-    iterations: 1
-    probability: 25
-    semantics: { add: true, sub: true, and: true, xor: true }
-    bitwidths: { bit8: true, bit16: true, bit32: true, bit64: true }
-  - type: MutationEngine
-    iterations: 1
-    probability: 100
-    semantics: { add: true, sub: true, and: true, xor: true, or: true, not: true, neg: true }
-    bitwidths: { bit8: true, bit16: true, bit32: true, bit64: true }
-  compiler_settings:
-    assembler_settings:
-      shuffle_basic_blocks: true
-    optimization_settings:
-      constant_propagation: true
-      instruction_combine: true
-      dead_code_elim: true
-      prune_useless_block_params: true
-    lifter_settings:
-      lift_calls: true
-      calling_convention: WindowsAbi
-      max_stack_copy_size: 512
-      split_on_calls_fallback: true
   symbols:
-  - !Name decrypt_key
-  - !Pattern "crypto_*"
+  - !Name crypto_encrypt
+  - !Pattern 'auth_*'
+  - !Address 0x140001000
 
 exclude:
-- pattern: "test_*"
-  reason: "test functions"
+- pattern: 'test_*'
+  reason: 'test functions'
 ```
 
 `module_settings.custom_section_name` is optional and disabled by default. It applies
@@ -269,12 +201,14 @@ Section names are cosmetic. Windows loads code and finds directories through
 RVAs, section characteristics, and directory records, not these names. Rebuilding
 and relocation correctness MUST NOT depend on the configured spelling.
 
-**Selection methods:**
-- By symbol name (`!Name`)
-- By pattern (`!Pattern` with glob matching)
-- By address (`!Address`)
-- By function list file (start:end per line)
-- By PDB symbol
+**Selection:** `!Name`, `!Pattern` (`*`/`?`), reusable `!Group`, host-only
+`!Address` (RVA or VA), and host `!TopXref` operate on metadata entries.
+Authored names use `plugin::symbol`; module-local coordinates are not host
+addresses. Empty `symbols:` selects all entries. Exclusions win globally;
+the first matching profile owns each remaining symbol. Later profiles do not
+append passes. Numeric ambiguity/range errors and CLI RVA-selector/profile
+conflicts are explicit; see [tooling.md](tooling.md). Profile-plus-identity
+retains injection/naming/nonsemantic policy and suppresses semantic passes.
 
 ---
 
@@ -316,6 +250,135 @@ The shared model tracks source, target, kind, per-function incoming/outgoing ref
 
 Switch recovery remains D24's relocation evidence + per-function use-def DAG / `petgraph` VF2 + value-analysis fallback. Prove bounds and in-function targets or reject. A rejected/untouched function keeps its original table; a lowered function emits none.
 
+### 6.4 Shared symbol/reference contract (handoff 1)
+
+The shared definitions live in `kamy-core`, not in a module-only address model:
+
+- `SymbolId::Host { rva }` identifies a host source coordinate.
+- `SymbolId::Authored { module, symbol }` identifies a plugin instance and its
+  exact compiler symbol identity. Display names and module-local decode RVAs are
+  not identities. Two artifacts may use the same source RVA without collision;
+  loading one artifact twice gives distinct instance-qualified identities.
+  String-bearing identity fields use shared immutable `Arc<str>` storage.
+- `Generated { name }` and `HostImageBase` distinguish helpers and the true host
+  header/base anchor. Existing host IAT slots use `Host { rva }` storage identity
+  with `SymbolKind::Import`, not an unused logical-import namespace. Handoff 3
+  owns new module imports and their real loader relationships.
+- `Reference { source, offset, expression, field, origin }` identifies a field
+  relative to its containing source symbol. `ReferenceOrigin` records
+  `HostAnalysis`, `HostMetadata`, `Authored` or `Generated` provenance.
+- `SymbolicExpression::{Symbol, Difference}` retains signed addends and symbol
+  differences. `LinkField::{Absolute64, ImageRelative32, Relative32 { bias }}`
+  owns checked encoding: absolute VA64; value minus host image base as RVA32;
+  or value minus `(field_va + 4 + bias)` as signed rel32. Negative compiler
+  addends and trailing-immediate bias MUST NOT be flattened into a guessed RVA.
+  `LinkField::encode_into` writes only an exact-width caller-provided slice and
+  checks conversions; it does not allocate a relocation buffer.
+- `HostReference { source, target, kind }` remains host-analysis evidence with
+  local RVAs. It is not a second authoritative module/link binding model, and
+  representable references alone do not establish host completeness.
+
+`OperandReference { instruction, operand, reference }` attaches exact provenance
+to an operand at the unmodified local decode coordinate. `lift_function` takes
+these annotations as its final slice argument. Host callers may pass an empty
+slice and symbolize decoded direct/RIP references from host coordinates;
+authored callers MUST pass their exact metadata. There is no MOVABS-to-LEA byte
+normalization or reserved numeric namespace.
+
+`IrOp::Address(Reference)`, symbolic `IrOp::Call` targets and symbolic tail
+targets carry provenance through SSA, copies, phis and optimization. Address
+leaves are opaque, not integer constants. `select_instructions` returns
+`SelectedInstructions { instructions, references }`; each `InstructionReference`
+nominates an instruction index, operand and reference. `bind_references` binds
+those operands using a final `SymbolId` resolver before relocating the selected
+instructions. Encoder-local branch labels remain separate. They MUST NOT be
+interpreted as link symbols or used to rediscover lost provenance.
+
+Code operand annotations contain semantic values: relative fields include the
+decoded next-IP correction, and image-relative operands use a `Difference`
+against `HostImageBase` with semantic `Absolute64` field. Original data-field
+writes retain raw signed addends/bias. The binder MUST NOT apply the original
+input field semantics a second time.
+`NativeInst { bytes, references, reads, writes }` retains exact
+`Vec<OperandReference>` provenance for supported RIP64 memory operands in opaque
+`NativeInline` operations. Selection emits normal `InstructionReference`
+fixups, consumed by the same final binder; raw bytes alone are not a relocation
+contract. Authored annotations MUST match the original source field/operand and
+retain raw compiler addends/bias. `REL32_0` may encode a negative raw addend for
+trailing bytes; field bias need not equal the architectural instruction tail.
+The semantic operand target already includes next-IP correction, which the
+binder MUST NOT apply again. Existing EIP-relative/flag/semantic checks remain
+independent eligibility constraints.
+
+`kamy_transforms::resolve_image_base_uses(func, classify) -> bool` runs after
+SSA and before optimization. After shared DCE removes dead flag producers, it
+derives proven base-plus-constant relationships through copies/phis/Add/Sub and
+asks the host adapter to classify object/interior targets or true header/base
+anchors. Identified objects become opaque address leaves before placement, so
+their final locations can change. A true return constrains movement for
+unresolved/escaping raw-base consumers, including live ambiguous arithmetic
+flags. Equal-valued integer constants do not acquire pointer provenance.
+
+### 6.5 Authored-call contract
+
+`kamy_core::ir::FnSignature { args, returns, clobbers, noreturn }` is the shared
+call contract. Each argument/return is an `AbiValue { location, class, bits,
+passing }`. `AbiLocation` is a physical register or a stack offset in bytes from
+callee-entry RSP, with the return address at offset zero. `AbiClass` distinguishes
+integer, float, vector and pointer. `AbiPassing` is `Direct`,
+`Indirect { size, align }`, or `Sret { size, align }`; sret describes the hidden
+result-pointer argument. A decomposed aggregate uses separate machine-ordered
+pieces. Multiple returns are separate values, not aliases of one RAX result.
+`IrOp::Call { target, clobbers }` and `CallIndirect { clobbers }` carry actual
+call effects. Each `CallResult { register }` is a separate no-code SSA result
+definition pinned to its register/class, without allocating a call-token value.
+The call remains a side-effect root for DCE. Consumers MUST preserve result
+ordering and explicit clobbers through optimization/allocation; the symbolic
+fixup belongs to the direct target. Proven `noreturn` calls end with
+`IrTerminator::NoReturn`, distinct from unsupported `Unreachable`; decoding
+stops there and selection emits no synthetic return/epilogue after the call.
+
+`CallingConvLookup::lookup(target_va)` serves source decoding;
+`lookup_symbol(&SymbolId)` serves exact authored calls. Unknown authored calls
+MUST fail closed, not use the host four-GPR/RAX default. The public callback's
+Win64 `extern "system"` ABI does not establish the ABI of internal Rust calls.
+Host lookup retains callee inference, named import slots and import-thunk
+precedence, using the existing Win32metadata/CRT signatures before conservative
+unknown-host behavior. No mangled-name ABI inference or Rust ABI stability is
+assumed. Metadata representation does not imply every represented instruction,
+frame or aggregate shape is currently lowerable.
+Authored callee preservation also matters: compiler-preserved Win64-volatile
+GPR/XMM values remain pinned live-outs at return/tail boundaries. This preserves
+decoded restores and prevents scratch allocation from overwriting untouched
+values; the existing nonvolatile save/unwind machinery remains shared. Current
+limitations include R11 flag replay conflicting with pinned R11, CL-based
+shift/rotate lowering for exact contracts preserving RCX, and unknown stack
+return locations. Immediate shifts do not require that CL scratch path.
+Physical constraints attach to real boundaries: function-entry live-ins, local
+call/native operand copies and return copies. Logical GPR/XMM moves detach the
+value from a source physical pin rather than extending that pin through every
+alias and later call. Multiple consumers MUST NOT turn a return constant, phi
+or copied call result into an unrelated function-wide register constraint.
+This repairs boundary representation; it is not spilling, concrete-frame
+reconstruction or the pressure guarantee assigned to handoff 2.
+
+Implicit arithmetic uses explicit machine boundaries. `UDiv`/`SDiv` take
+`[high, low, divisor]`, with fixed RDX/RAX dividend inputs and quotient in RAX.
+`URem`/`SRem` take the quotient as a dependency and project RDX from that same
+division; a remainder-only consumer MUST NOT emit a second division.
+`UMulHi`/`SMulHi` take `[lhs, rhs]`, with lhs in RAX and the high result in RDX;
+the immediately dependent unary `Mul [high_product]` projects the low RAX result
+from the same hardware multiplication. Binary `Mul` remains an independent
+operation. Allocation retains the producer's RAX result until its low projection,
+and both outputs are snapshotted. Multiplication clobbers RAX/RDX. Architectural
+inputs and sources are snapshotted before boundary pins; this path adds neither
+R10/R11 scratch nor spill/frame storage.
+Supported widths are I8/I16/I32/I64, with byte division using AX and AL/AH.
+Signed IMUL overflow compares the high result with the low result's sign
+extension. Divisions remain DCE roots even with dead results, preserving
+divide-by-zero and quotient-overflow faults. Malformed or I128 forms fail
+preflight rather than entering a partial lowering.
+
 ---
 
 ## 7. Transform Phase
@@ -325,7 +388,7 @@ Switch recovery remains D24's relocation evidence + per-function use-def DAG / `
 Ordered, composable. All passes operate on the SSA IR. The pipeline for each function:
 
 ```
-1. Lift                      — x86 → SSA IR (lift_calls + split-on-call fallback)
+1. Lift                      — x86 → SSA IR with modeled call contracts
 2. Obfuscation passes        — ordered, profile-selected:
      ObscureReferences       — hide cross-references
      ObscureConstants        — hide/encrypt constant values
@@ -340,8 +403,12 @@ Ordered, composable. All passes operate on the SSA IR. The pipeline for each fun
 5. Assemble                  — encode via iced-x86, shuffle basic blocks
 ```
 
-Steps 1, 3, 4, 5 always run. Step 2 is profile-configured: a "light" profile might run only
-ObscureReferences + MutationEngine; a "heavy" profile runs all passes with multiple iterations.
+Steps 1, 3, 4 and 5 run for accepted functions. Step 2 is profile-configured.
+The catalog above is the target, not the implemented pass inventory. Supported
+MBA entries MUST run in declared order; first-MBA-only execution is not a valid
+interpretation of a profile. Unsupported enabled passes/settings MUST fail with
+profile/setting context. Semantic identity suppresses semantic passes, not module
+injection, naming or other supported nonsemantic policy.
 
 ### 7.2 Pass Invariants
 Every pass must:
@@ -358,7 +425,7 @@ Every pass must:
 ### 8.1 Code Generation
 - Instruction selection: IR ops → x86 instruction sequences
 - Register allocation: D40 adopts memory-backed intermediates and bounded scratch sets; handoff 2 owns that backend cutover. Until then, report pressure-driven reductions and identity lowering honestly; never verbatim-relocate failures.
-- Stack-frame reconstruction from high-water mark
+- Concrete original-frame reconstruction and memory-home integration are handoff-2 work, not implied by current generated save frames or plain unwind support.
 - Encode via iced-x86
 
 ### 8.2 Linking & PE Emission (D37)
@@ -373,6 +440,71 @@ Every pass must:
 
 For supported plain lowered code, `kamy-seh` derives stack/nonvolatile state from the final machine CFG and emits per-state Version 2 unwind ranges. Version 1's epilogue scan can mistake a cross-fragment jump for function exit and ignore the recorded allocation. Saved-register offsets use the fixed frame base, not incrementally restored RSP. Windows `RtlVirtualUnwind` verifies Version 2 branch/empty-frame handling and full unscaled saved-XMM offsets. Dynamic frames and unprovable handler/scope state remain safe-rejects.
 
+The single public entry is `kamy_link::protect(pe, host, functions, opts, cc,
+transform, injection) -> Result<(Vec<u8>, Report)>`. Host-only callers pass
+`module::Injection` with an empty plugin slice. The transform callback is
+`FnMut(&SymbolId, &mut IrFunction, f32) -> Result<TransformOutcome>`;
+`TransformOutcome.transformed` reports actual semantic changes, and callback
+errors propagate. The old `protect_with_transforms`/`protect_with_modules`
+entries and intermediate host-output reparse are removed.
+
+Internally, `plan_image` prepares original host evidence and
+`module::Plan::prepare` validates/lowers authored inputs before host placement.
+Module `place`/emission contributes to the same original-host `PeEdits`;
+`protect` performs the only final `PeFile::rebuild`. Host/module slots grow
+monotonically with checked extents and explicit 4,096-iteration bounds, failing
+on nonconvergence rather than overwriting a neighbor. Final binding uses the
+same source identities at every placement iteration. Original module decode
+RVAs and image bases are not shifted into a synthetic host range.
+
+`Options.selected_symbols: Option<BTreeSet<SymbolId>>` complements the existing
+host-only `FunctionSelector`. Unselected host bodies remain resident. Every
+authored body still MUST lower/link; unselected authored bodies skip semantic
+callbacks and report `selected=false`, `lowered=true`, `intensity=0`.
+`module::planned_functions(&[Plugin])` returns metadata-derived
+`PlannedFunction { plugin, name, symbol }`, not fake source coordinates or CFGs.
+
+The `Report` exposes `moved`, `(symbol, reason)` `rejected`, `ssa_lowered`,
+`ssa_lowered_symbols`, `address_map: BTreeMap<SymbolId, Rva>`, `functions`,
+`placements` and `directories`. `FunctionReport` separates selection,
+eligibility, lowering, actual transformation and successful intensity. The
+temporary pressure ladder is `1.0 → 0.5 → 0.25 → 0.0`; report only the successful
+attempt, with identity/no-transform intensity zero. Only `RegisterPressure`
+permits this retry; other structured allocation/domain failures propagate with
+their actual reason rather than being relabeled pressure. The ladder is not the
+D40 target.
+
+`Placement { symbol, source_rva, rva, size, ownership }` records retained,
+resident, generated or retired ownership. A source RVA is optional, not a global
+module identifier. `DirectoryReport { index, rva, file_offset, size, contributions }` uses
+`Vec<Placement>` contributions: Exception records identify actual runtime
+begin/length ranges; BaseReloc contributions identify actual field RVA/width.
+Empty index-3/index-5 reports have zero size and no contributions. Generated
+`directory-3`/`directory-5` placements identify the single active table ranges;
+replaced original table storage is retired. Retained old bytes alone do not
+constitute an active duplicate table.
+`file_offset` is optional: ordinary directories use RVAs, while certificate
+directory index 4 records the actual final file offset and RVA zero. Certificate
+storage has no address-map row; it is not an image-address symbol.
+`PeFile::output_data_directory` reads the final emitted directory record after
+the sole rebuild, without reparsing an intermediate image. Certificate
+contributions are retained file storage, not mapped RVA placements. Preserving
+certificate bytes does not preserve Authenticode validity after modification.
+
+Generated entry-loader/startup/init-table inputs and indirect-translation/CFG
+helpers remain part of this plan. Host and authored indirect consumers share
+the translation helpers and original-host translation table. Handoff 3 owns
+the compiled-loader replacement. Module data preserves permissions and BSS:
+`NewSection.virtual_size` is independent of initialized `data.len()`, MUST be
+at least that length, and permits a virtual zero-fill tail. Data relocations and
+linker-filled bounds MUST fit existing initialized bytes; link planning MUST NOT
+extend raw storage into BSS to write them. Debug/certificate/overlay consumers
+retain file-coordinate semantics through the existing raw rebuild machinery.
+Generated placement names are `entry-loader`, `startup`, `init-table`,
+`translation-{register:?}`, `cfg-check` and `directory-{index}` when present.
+Consumers MUST use symbol/ownership/range data, not section spelling, to locate
+these artifacts. Absent helpers do not require empty generated sections.
+
 ### 8.3 Entry Points, DLLs & Optional Modules (D38)
 - EP redirection and relocating the original startup are independent. EXE startup may remain resident or move when references are resolved; a structural redirect does not imply payload injection.
 - A transform-only returnable DLL entry is addressed **directly in `.kamy`**, with no `.text` stub; preserve arguments and return to the loader. Rebase moved exports' EAT RVAs and preserve DLL/header semantics ([#35](https://github.com/mkxto/kamy/issues/35)). Kernel EP remains pinned and untouched.
@@ -384,19 +516,69 @@ Vendor module claims (enforcing CFG, longjmp/SAFESEH registration, unwind-safe s
 
 ### 8.4 Rust SDK & Plugin Configuration (D39)
 
-`kamy-sdk` is a dependency-free `no_std` Rust crate. `plugin!(initialize)` exports
-the default callback and the module's aborting panic handler; `declare_init_table!()` optionally declares linker-filled
-`SYMBOL_init_table_start`/`SYMBOL_init_table_end` slots. The callback uses
+`kamy-sdk` is a dependency-free `no_std` Rust crate. The current freestanding
+module workflow is a limitation, not a no_std-only product requirement: D40
+assigns Rust `std` with `panic=abort` and its runtime prerequisites to handoff 3.
+`plugin!(initialize)` exports the default callback and owns the module's aborting
+panic handler plus the Windows x64 MSVC `_fltused` 32-bit data marker (`0x9875`).
+It MUST NOT coexist with a second runtime defining those symbols; this narrow
+floating-point prerequisite is not std/CRT support. `declare_init_table!()`
+optionally declares linker-filled `SYMBOL_init_table_start`/
+`SYMBOL_init_table_end` cells in distinct initialized native `.data$...`
+contributions, despite their initial null values. The provenance consumer rejects
+bound cells originating in COFF BSS with rebuild guidance; rebuild old plugins
+with the current SDK/producer rather than materializing their BSS tails.
+The callback uses
 `unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32`.
 These are entry registers, not main arguments. Zero continues; nonzero fast-fails.
 
 `kamy plugin build --manifest-path <Cargo.toml> -o <plugin.dll>` compiles a Rust
-`staticlib` Cargo target for `x86_64-pc-windows-msvc` with native fat LTO, then
-packages compiler metadata in the specialized DLL. Native COFF objects are private build intermediates.
-Consumer input is the self-contained DLL, with code/data symbol boundaries,
-layout-sensitive references and dedicated Exception/BaseReloc sections.
-Host inferred completeness does not gate this metadata. Unsupported module
-directories, operand forms or SSA/unwind lowering fail contextually.
+`staticlib` Cargo target for `x86_64-pc-windows-msvc` with fat LTO. The producer
+API is `kamy_pe::module::build_from_llvm_ir(ir, output, entry, linker, llc,
+compiler_version)`. It consumes post-LTO LLVM IR and uses version-matched `llc`
+for a full native object emission while capturing machine-state metadata from
+that same invocation. It does not resume serialized MIR. The LLVM 22.1.2-pinned
+parser associates typed IR, native argument/return locations and compiler
+symbols; compiler-name guessing and a generic Win64 default are not authored
+ABI evidence. Native COFF symbols/relocations and linked section contributions
+are validated against the specialized DLL. COFF remains a private intermediate,
+not a public plugin input or an alternative C/C++ SDK surface.
+
+The `KAMYMOD` embedded artifact schema is **version 2**, containing compiler ABI
+metadata with native symbol/reference provenance. Older versions MUST fail with
+rebuild guidance. Rebuild first-party and external plugins through the current
+producer; no compatibility branch preserves the old numeric binding model.
+`AuthoredModule::parse(bytes, identity)` takes the instance identity explicitly;
+`CodeSymbol` exposes `symbol`, `signature`, `name`, `start`, `end`, and
+`DataSymbol` exposes `symbol`, `name`, `start`, `size`. Decode coordinates remain
+local to the input. `AuthoredModule.references` is the shared `Vec<Reference>`.
+`AuthoredModule.symbols` preserves the complete original binding table;
+`bindings: BTreeMap<SymbolId, SymbolicExpression>` maps noncanonical compiler
+aliases to containing storage/function identities plus offsets. Native object
+section membership establishes those bindings, including one-past aliases;
+canonical code/nonexecuting storage roots have no binding. Resolve aliases
+before original reference expressions, not by searching final numeric ranges.
+Compiler identities use `coff:{object}:symbol:{symbol_table_index}:{native_name}`;
+storage identities use `coff:{object}:section:{section_index}:piece:{offset}`.
+Executable contributions contain one compiler-authored function each, preventing
+a section-root addend from silently naming a separately moved neighbor.
+
+`kamy_link::module::AuthoredSource::new(&Plugin)` is the shared source adapter
+for module planning and triage. `module()` exposes its unchanged decode view;
+`function_at(local_rva, Option<&Module>)` returns `AuthoredFunction { symbol,
+function, references }` from exact compiler boundaries. The source implements
+`CallingConvLookup` using authored contracts. With no host, host-base references
+remain symbolic; with a host, the same operand preparation and host-object
+classification used by the plan applies. Diagnostics MUST NOT recover a second
+function/provenance model from the DLL's entry-point discovery seeds.
+
+Consumer input is the self-contained DLL with dedicated Exception/BaseReloc
+sections, not a DLL loaded into the protection process or a sidecar object.
+Current module directories other than Exception/BaseReloc, language-handler
+unwind and unsupported operand/SSA/frame forms fail contextually. Host imports
+and TLS remain host inputs; ordinary module imports, module TLS/export runtime
+semantics and std support belong to handoff 3. Exact provenance does not waive
+ABI, instruction, frame or unwind limits.
 
 Authored references retain a symbol base and signed compiler addend. An x64
 `REL32` field can encode a negative addend for bytes following its displacement;
@@ -417,6 +599,37 @@ The build command never loads the plugin into the protection process.
 - Any pass that fakes CALL/RET must emit RDSSPQ feature check + INCSSPQ reconciliation
 - ENDBR64 insertion at indirect branch targets if CET-IBT is enabled
 - Never emit a RET that doesn't correspond to a real CALL
+
+### 8.6 Contracts consumed by the next handoffs
+
+Handoff 2 MUST reuse `SymbolId`, `Reference`, operand annotations,
+`FnSignature`/`AbiValue`, symbolic selection/binding and the single link plan.
+It owns the concrete frame, memory homes, bounded scratch sets and explicit
+flag state. It MUST preserve exact authored call locations and actual-body
+unwind, then remove pressure-only rejects/intensity retries when their causes
+are repaired. The intact combined bounds-check/counter callback remains an
+acceptance witness; splitting it is not frame recovery.
+
+Handoff 3 MUST build on those same contracts and the versioned specialized DLL
+producer/consumer. It owns replacing generated startup with compiled Rust
+module code, ordinary imports, Rust `std` with `panic=abort`, required runtime/TLS
+initialization and teardown, and process-attach-only DLL initialization. The
+generated startup/helper path remains an intentional handoff-1 input, not proof
+of a compiled loader or an arbitrary std-capable SDK. Current DLL callback
+sequencing MUST NOT be described as the final notification lifecycle.
+
+Handoff 4 MUST extend the same final placement, ownership and directory graph,
+not parse an intermediate protected image or create a second compactor. It owns
+moving completeness-proven survivors and data, rewriting affected structures,
+and explicit failure when global layout cannot be justified. Selective
+reclamation, dead-tail truncation and raw repacking are not whole-image virtual
+compaction. Retained stale bytes are distinct from an active stale directory;
+section count/name alone proves neither correctness nor vendor parity.
+
+Each successor consumes the committed portable fixture set and the preceding
+milestone's actual execution/coverage evidence. Measured vendor sample behavior,
+vendor feature claims and inference remain distinct; this repair campaign does
+not convert unobserved CFG/longjmp/SAFESEH extras into implemented guarantees.
 
 ---
 
@@ -473,17 +686,16 @@ GET  /report/{id}      — get detailed per-function transform report
 ```
 
 ### 10.2 CLI
-```
-kamy analyze input.exe --pdb input.pdb --output report.json
-kamy protect input.exe --profile profile.toml --output protected.exe --debug-map debug.json
-kamy verify  input.exe protected.exe --test-vectors 1000
-```
+
+The supported command surface and executable examples live in
+[tooling.md](tooling.md). Profiles use YAML. A public service API, PDB output
+and the complete transform catalog remain targets, not CLI implementation claims.
 
 ### 10.3 CI Integration
 ```yaml
 # GitHub Actions example
 - name: Protect binary
-  run: kamy protect build/app.exe --profile .kamy/production.toml --output build/app.protected.exe
+  run: kamy protect build/app.exe --profile .kamy/production.yml --output build/app.protected.exe
 
 - name: Verify protection
   run: kamy verify build/app.exe build/app.protected.exe

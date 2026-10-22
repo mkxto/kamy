@@ -24,7 +24,31 @@ pub(crate) fn report_to_coverage(report: &kamy_link::Report) -> Coverage {
     for (_, reason) in &report.rejected {
         *by_reason.entry(reason.tag().to_string()).or_default() += 1;
     }
+    let mut actual_intensity = BTreeMap::new();
+    for function in &report.functions {
+        if function.lowered {
+            *actual_intensity
+                .entry(function.intensity.to_string())
+                .or_default() += 1;
+        }
+    }
     Coverage {
+        selected: report
+            .functions
+            .iter()
+            .filter(|function| function.selected)
+            .count(),
+        eligible: report
+            .functions
+            .iter()
+            .filter(|function| function.eligible)
+            .count(),
+        transformed: report
+            .functions
+            .iter()
+            .filter(|function| function.transformed)
+            .count(),
+        actual_intensity,
         ssa_lowered: report.ssa_lowered,
         relocated: report.moved.len().saturating_sub(report.ssa_lowered),
         rejected: report.rejected.len(),
@@ -62,14 +86,19 @@ pub(crate) fn parse_rvas(s: &str) -> anyhow::Result<Vec<Rva>> {
         .collect()
 }
 
-/// Print the two-axis corpus report: per-member PASS/FAIL, SSA-lowered vs
-/// not-covered (relocated + rejected) with a coverage percent, the corpus
-/// TOTAL, and the merged rejection reasons sorted by count descending.
+/// Print execution verdicts, SSA coverage, semantic outcomes and rejection reasons.
 pub(crate) fn print_coverage(cov: &kamy_corpus::CorpusCoverage) {
     println!();
     println!(
-        "coverage  {:<24} {:<7}  {:>11} {:>9} {:>8}  coverage",
-        "name", "verdict", "SSA-lowered", "relocated", "rejected"
+        "coverage  {:<24} {:<7}  {:>8} {:>8} {:>11} {:>11} {:>9} {:>8}  coverage",
+        "name",
+        "verdict",
+        "selected",
+        "eligible",
+        "SSA-lowered",
+        "transformed",
+        "relocated",
+        "rejected"
     );
     let row = |name: &str, verdict: &str, c: &Coverage| {
         let total = c.ssa_lowered + c.relocated + c.rejected;
@@ -79,9 +108,18 @@ pub(crate) fn print_coverage(cov: &kamy_corpus::CorpusCoverage) {
             0.0
         };
         println!(
-            "          {name:<24} {verdict:<7}  {:>11} {:>9} {:>8}  {}/{total} ({pct:.1}%)",
-            c.ssa_lowered, c.relocated, c.rejected, c.ssa_lowered
+            "          {name:<24} {verdict:<7}  {:>8} {:>8} {:>11} {:>11} {:>9} {:>8}  {}/{total} ({pct:.1}%)",
+            c.selected,
+            c.eligible,
+            c.ssa_lowered,
+            c.transformed,
+            c.relocated,
+            c.rejected,
+            c.ssa_lowered
         );
+        if !c.actual_intensity.is_empty() {
+            println!("          actual intensity: {:?}", c.actual_intensity);
+        }
     };
     for m in &cov.members {
         row(&m.name, if m.passed { "PASS" } else { "FAIL" }, &m.coverage);
@@ -103,4 +141,68 @@ pub(crate) fn print_coverage(cov: &kamy_corpus::CorpusCoverage) {
         cov.passed,
         cov.failed,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kamy_core::SymbolId;
+
+    #[test]
+    fn numeric_rva_parsing_rejects_overflow_instead_of_truncating() {
+        assert_eq!(parse_rva("0xffffffff").unwrap(), Rva::new(u32::MAX));
+        assert!(parse_rva("0x100000000").is_err());
+        assert!(parse_rvas("1000,140001000").is_err());
+        assert_eq!(
+            parse_rvas("0x1000, 2000").unwrap(),
+            [Rva::new(0x1000), Rva::new(0x2000)]
+        );
+    }
+
+    #[test]
+    fn corpus_coverage_uses_successful_linker_outcomes_not_requested_passes() {
+        let symbols = [0x1000, 0x2000, 0x3000].map(|rva| SymbolId::Host { rva: Rva::new(rva) });
+        let report = kamy_link::Report {
+            moved: symbols[..2].to_vec(),
+            ssa_lowered: 2,
+            ssa_lowered_symbols: symbols[..2].to_vec(),
+            functions: vec![
+                kamy_link::FunctionReport {
+                    symbol: symbols[0].clone(),
+                    selected: true,
+                    eligible: true,
+                    lowered: true,
+                    transformed: true,
+                    intensity: 0.5,
+                },
+                kamy_link::FunctionReport {
+                    symbol: symbols[1].clone(),
+                    selected: true,
+                    eligible: true,
+                    lowered: true,
+                    transformed: false,
+                    intensity: 0.0,
+                },
+                kamy_link::FunctionReport {
+                    symbol: symbols[2].clone(),
+                    selected: true,
+                    eligible: false,
+                    lowered: false,
+                    transformed: false,
+                    intensity: 0.0,
+                },
+            ],
+            ..Default::default()
+        };
+        let coverage = report_to_coverage(&report);
+        assert_eq!(coverage.selected, 3);
+        assert_eq!(coverage.eligible, 2);
+        assert_eq!(coverage.ssa_lowered, 2);
+        assert_eq!(coverage.transformed, 1);
+        assert_eq!(coverage.relocated, 0);
+        assert_eq!(
+            coverage.actual_intensity,
+            BTreeMap::from([("0".into(), 1), ("0.5".into(), 1)])
+        );
+    }
 }

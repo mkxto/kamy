@@ -4,7 +4,7 @@ mod instcombine;
 pub mod mba;
 mod prune_phis;
 
-pub use constprop::ConstProp;
+pub use constprop::{ConstProp, resolve_image_base_uses};
 pub use dce::Dce;
 pub use instcombine::InstCombine;
 pub use mba::MbaPass;
@@ -231,7 +231,9 @@ mod tests {
             },
             Inst {
                 dest: Some(v_ret),
-                op: IrOp::CallIndirect,
+                op: IrOp::CallIndirect {
+                    clobbers: kamy_core::ir::win64_volatiles(),
+                },
                 args: vec![v_target],
                 ty: IrType::I64,
             },
@@ -241,7 +243,7 @@ mod tests {
             func.blocks[0]
                 .insts
                 .iter()
-                .any(|i| matches!(i.op, IrOp::CallIndirect)),
+                .any(|i| matches!(i.op, IrOp::CallIndirect { .. })),
             "an indirect call has side effects and must survive DCE"
         );
     }
@@ -358,5 +360,368 @@ mod tests {
             .find(|i| matches!(i.op, IrOp::Store))
             .expect("Store must survive");
         assert_eq!(store.args[1], v0);
+    }
+
+    fn reference(symbol: kamy_core::SymbolId) -> kamy_core::Reference {
+        kamy_core::Reference {
+            source: kamy_core::SymbolId::Authored {
+                module: "source".into(),
+                symbol: "object:0:symbol:1".into(),
+            },
+            offset: 2,
+            expression: kamy_core::SymbolicExpression::symbol(symbol),
+            field: kamy_core::LinkField::Absolute64,
+            origin: kamy_core::ReferenceOrigin::Authored,
+        }
+    }
+
+    #[test]
+    fn address_leaves_remain_opaque_through_copies_phis_and_optimization() {
+        let a = reference(kamy_core::SymbolId::Authored {
+            module: "a".into(),
+            symbol: "object:0:symbol:7".into(),
+        });
+        let b = reference(kamy_core::SymbolId::Authored {
+            module: "b".into(),
+            symbol: "object:0:symbol:7".into(),
+        });
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            next_value: 7,
+            blocks: vec![
+                IrBlock {
+                    id: BlockId(0),
+                    phis: vec![],
+                    insts: vec![
+                        Inst {
+                            dest: Some(ValueId(0)),
+                            op: IrOp::Address(a.clone()),
+                            args: vec![],
+                            ty: IrType::I64,
+                        },
+                        Inst {
+                            dest: Some(ValueId(1)),
+                            op: IrOp::Address(b.clone()),
+                            args: vec![],
+                            ty: IrType::I64,
+                        },
+                        Inst {
+                            dest: Some(ValueId(2)),
+                            op: IrOp::Copy,
+                            args: vec![ValueId(0)],
+                            ty: IrType::I64,
+                        },
+                        Inst {
+                            dest: Some(ValueId(3)),
+                            op: IrOp::Copy,
+                            args: vec![ValueId(1)],
+                            ty: IrType::I64,
+                        },
+                        Inst {
+                            dest: Some(ValueId(6)),
+                            op: IrOp::Undef,
+                            args: vec![],
+                            ty: IrType::I8,
+                        },
+                    ],
+                    term: IrTerminator::Jump(BlockId(1)),
+                },
+                IrBlock {
+                    id: BlockId(1),
+                    phis: vec![Phi {
+                        dest: ValueId(4),
+                        ty: IrType::I64,
+                        args: vec![(BlockId(0), ValueId(2)), (BlockId(1), ValueId(3))],
+                    }],
+                    insts: vec![
+                        Inst {
+                            dest: Some(ValueId(5)),
+                            op: IrOp::Const(0x140002000),
+                            args: vec![],
+                            ty: IrType::I64,
+                        },
+                        Inst {
+                            dest: None,
+                            op: IrOp::Use,
+                            args: vec![ValueId(4), ValueId(5)],
+                            ty: IrType::I64,
+                        },
+                    ],
+                    term: IrTerminator::Branch {
+                        cond: ValueId(6),
+                        taken: BlockId(1),
+                        not_taken: BlockId(2),
+                    },
+                },
+                IrBlock {
+                    id: BlockId(2),
+                    phis: vec![],
+                    insts: vec![],
+                    term: IrTerminator::Ret,
+                },
+            ],
+        };
+        optimize(&mut func);
+        let addresses: Vec<_> = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .filter_map(|inst| {
+                if let IrOp::Address(reference) = &inst.op {
+                    Some(reference)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(addresses, vec![&a, &b]);
+        assert_eq!(func.blocks[1].phis.len(), 1);
+        assert!(
+            func.blocks[1]
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.op, IrOp::Const(0x140002000)))
+        );
+    }
+
+    #[test]
+    fn decoded_movabs_pointer_and_literal_survive_ssa_merge_and_optimization() {
+        use kamy_core::{
+            BasicBlock, Function, Machine, Module, OperandReference, Rva, Section, SectionFlags,
+            Symbol, SymbolId, SymbolKind, Terminator,
+        };
+        struct Cc(SymbolId);
+        impl kamy_core::ir::CallingConvLookup for Cc {
+            fn lookup(&self, _: u64) -> Option<kamy_core::ir::FnSignature> {
+                None
+            }
+            fn lookup_symbol(&self, symbol: &SymbolId) -> Option<kamy_core::ir::FnSignature> {
+                (*symbol == self.0).then(kamy_core::ir::Win64Default::default_signature)
+            }
+        }
+        let literal = 0x140003008u64;
+        let mut code = vec![0x85, 0xc9, 0x74, 0x0c, 0x48, 0xb8];
+        code.extend_from_slice(&literal.to_le_bytes());
+        code.extend_from_slice(&[0xeb, 0x0a, 0x48, 0xb8]);
+        code.extend_from_slice(&literal.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x89, 0xc2, 0xc3]);
+        let source = SymbolId::Authored {
+            module: "module".into(),
+            symbol: "object:0:symbol:1".into(),
+        };
+        let mut pointer = reference(SymbolId::Authored {
+            module: "module".into(),
+            symbol: "object:0:symbol:7".into(),
+        });
+        pointer.source = source.clone();
+        pointer.offset = 6;
+        pointer.expression = pointer.expression.with_addend(8).unwrap();
+        let func = Function {
+            entry: Rva::new(0x1000),
+            blocks: vec![
+                BasicBlock {
+                    start: Rva::new(0x1000),
+                    end: Rva::new(0x1004),
+                    successors: vec![Rva::new(0x1010), Rva::new(0x1004)],
+                    terminator: Terminator::Branch {
+                        taken: Rva::new(0x1010),
+                        not_taken: Rva::new(0x1004),
+                    },
+                },
+                BasicBlock {
+                    start: Rva::new(0x1004),
+                    end: Rva::new(0x1010),
+                    successors: vec![Rva::new(0x101a)],
+                    terminator: Terminator::Jump(Rva::new(0x101a)),
+                },
+                BasicBlock {
+                    start: Rva::new(0x1010),
+                    end: Rva::new(0x101a),
+                    successors: vec![Rva::new(0x101a)],
+                    terminator: Terminator::Fallthrough(Rva::new(0x101a)),
+                },
+                BasicBlock {
+                    start: Rva::new(0x101a),
+                    end: Rva::new(0x101e),
+                    successors: vec![],
+                    terminator: Terminator::Return,
+                },
+            ],
+        };
+        let module = Module {
+            image_base: 0x140000000,
+            machine: Machine::X64,
+            entry_point: None,
+            sections: vec![Section {
+                name: ".text".into(),
+                rva: Rva::new(0x1000),
+                virtual_size: code.len() as u32,
+                data: code.clone(),
+                flags: SectionFlags {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+            }],
+            symbols: vec![Symbol {
+                id: source.clone(),
+                name: "caller".into(),
+                rva: func.entry,
+                kind: SymbolKind::Function,
+            }],
+            relocations: vec![],
+            functions: vec![func.clone()],
+        };
+        let annotations = [OperandReference {
+            instruction: Rva::new(0x1004),
+            operand: 1,
+            reference: pointer.clone(),
+        }];
+        let mut lifted = kamy_lift::lift_function(&module, &func, &Cc(source), &annotations);
+        assert!(!lifted.unsupported);
+        kamy_lift::construct_ssa(&mut lifted);
+        optimize(&mut lifted.func);
+        assert!(
+            lifted
+                .func
+                .blocks
+                .iter()
+                .any(|block| !block.phis.is_empty())
+        );
+        let instructions: Vec<_> = lifted
+            .func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .collect();
+        assert!(
+            instructions
+                .iter()
+                .any(|inst| matches!(&inst.op, IrOp::Address(actual) if actual == &pointer))
+        );
+        assert!(
+            instructions
+                .iter()
+                .any(|inst| matches!(inst.op, IrOp::Const(value) if value == literal))
+        );
+        assert_eq!(module.sections[0].data, code);
+    }
+
+    #[test]
+    fn proven_imagebase_object_arithmetic_is_symbolic_but_equal_literal_is_not() {
+        let mut func = one_block_func();
+        func.next_value = 6;
+        let base = reference(kamy_core::SymbolId::HostImageBase);
+        func.blocks[0].insts = vec![
+            Inst {
+                dest: Some(ValueId(0)),
+                op: IrOp::Address(base.clone()),
+                args: vec![],
+                ty: IrType::I64,
+            },
+            Inst {
+                dest: Some(ValueId(1)),
+                op: IrOp::Const(0x2010),
+                args: vec![],
+                ty: IrType::I64,
+            },
+            Inst {
+                dest: Some(ValueId(2)),
+                op: IrOp::Add,
+                args: vec![ValueId(0), ValueId(1)],
+                ty: IrType::I64,
+            },
+            Inst {
+                dest: Some(ValueId(5)),
+                op: IrOp::CarryAdd,
+                args: vec![ValueId(0), ValueId(1)],
+                ty: IrType::I8,
+            },
+            Inst {
+                dest: Some(ValueId(3)),
+                op: IrOp::Copy,
+                args: vec![ValueId(2)],
+                ty: IrType::I64,
+            },
+            Inst {
+                dest: Some(ValueId(4)),
+                op: IrOp::Const(0x140002010),
+                args: vec![],
+                ty: IrType::I64,
+            },
+            Inst {
+                dest: None,
+                op: IrOp::Use,
+                args: vec![ValueId(3), ValueId(4)],
+                ty: IrType::I64,
+            },
+        ];
+        let expression = kamy_core::SymbolicExpression::Symbol {
+            symbol: kamy_core::SymbolId::Host {
+                rva: kamy_core::Rva::new(0x2000),
+            },
+            addend: 16,
+        };
+        assert!(!resolve_image_base_uses(&mut func, |offset| {
+            if offset == 0x2010 {
+                Some(expression.clone())
+            } else {
+                None
+            }
+        }));
+        optimize(&mut func);
+        assert!(func.blocks[0].insts.iter().any(|inst| matches!(&inst.op, IrOp::Address(actual) if actual.expression == expression && actual.origin == base.origin && actual.source == base.source)));
+        assert!(
+            func.blocks[0]
+                .insts
+                .iter()
+                .any(|inst| matches!(inst.op, IrOp::Const(0x140002010)))
+        );
+    }
+
+    #[test]
+    fn header_offsets_stay_signed_and_unknown_base_arithmetic_constrains_movement() {
+        for offset in [-16i64, 16] {
+            let mut func = one_block_func();
+            func.next_value = 4;
+            func.blocks[0].insts = vec![
+                Inst {
+                    dest: Some(ValueId(0)),
+                    op: IrOp::Address(reference(kamy_core::SymbolId::HostImageBase)),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(ValueId(1)),
+                    op: IrOp::Const(offset as u64),
+                    args: vec![],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(ValueId(2)),
+                    op: IrOp::Add,
+                    args: vec![ValueId(0), ValueId(1)],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: Some(ValueId(3)),
+                    op: IrOp::Load,
+                    args: vec![ValueId(2)],
+                    ty: IrType::I64,
+                },
+                Inst {
+                    dest: None,
+                    op: IrOp::Use,
+                    args: vec![ValueId(3)],
+                    ty: IrType::I64,
+                },
+            ];
+            assert!(!resolve_image_base_uses(&mut func, |_| None));
+            assert!(func.blocks[0].insts.iter().any(|inst| matches!(&inst.op, IrOp::Address(actual) if matches!(&actual.expression, kamy_core::SymbolicExpression::Symbol { symbol: kamy_core::SymbolId::HostImageBase, addend } if *addend == offset))));
+            func.blocks[0].insts[1].op = IrOp::Undef;
+            func.blocks[0].insts[2].op = IrOp::Add;
+            func.blocks[0].insts[2].args = vec![ValueId(0), ValueId(1)];
+            assert!(resolve_image_base_uses(&mut func, |_| None));
+        }
     }
 }

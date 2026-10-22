@@ -1,4 +1,4 @@
-use kamy_core::{Reference, ReferenceKind, Rva};
+use kamy_core::{HostReference, ReferenceKind, Rva};
 use kamy_pe::PeFile;
 
 const IMAGE_BASE: u64 = 0x140000000;
@@ -181,7 +181,7 @@ impl Fixture {
         self.put32(TABLE + 4, self.header_size() + size);
     }
 
-    fn references(&self) -> anyhow::Result<Vec<Reference>> {
+    fn references(&self) -> anyhow::Result<Vec<HostReference>> {
         PeFile::parse(&self.bytes)
             .expect("synthetic PE32+ headers must parse")
             .metadata_references()

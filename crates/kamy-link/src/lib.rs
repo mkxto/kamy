@@ -6,13 +6,16 @@ mod rewrite;
 mod translation;
 
 use anyhow::{Context, ensure};
-use iced_x86::{Instruction, Register};
-use kamy_codegen::relocate;
+use iced_x86::Register;
+use kamy_codegen::{SelectedInstructions, relocate};
 use kamy_core::ir::{CallingConvLookup, IrFunction, MapCallConv, win64_import_signature};
-use kamy_core::{Function, Module, RejectionReason, Rva, SectionFlags, SymbolKind, Terminator};
+use kamy_core::{
+    Function, Module, OperandReference, RejectionReason, Rva, SectionFlags, SymbolId, SymbolKind,
+    Terminator,
+};
 use kamy_disasm::function_instructions;
 use kamy_pe::{BytePatch, DirectoryUpdate, NewSection, PeEdits, PeFile, SectionUpdate};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 const FUNCTION_ALIGN: u32 = 16;
 
@@ -21,6 +24,7 @@ pub struct Options {
     pub pdata_section: String,
     pub metadata_section: String,
     pub selector: Option<kamy_core::FunctionSelector>,
+    pub selected_symbols: Option<BTreeSet<SymbolId>>,
 }
 
 impl Default for Options {
@@ -30,32 +34,80 @@ impl Default for Options {
             pdata_section: ".pdata".into(),
             metadata_section: ".kamy".into(),
             selector: None,
+            selected_symbols: None,
         }
     }
 }
 
+#[derive(Default)]
 pub struct Report {
-    pub moved: Vec<Rva>,
-    pub rejected: Vec<(Rva, RejectionReason)>,
+    pub moved: Vec<SymbolId>,
+    pub rejected: Vec<(SymbolId, RejectionReason)>,
     pub ssa_lowered: usize,
-    pub ssa_lowered_rvas: Vec<Rva>,
-    pub address_map: BTreeMap<Rva, Rva>,
+    pub ssa_lowered_symbols: Vec<SymbolId>,
+    pub address_map: BTreeMap<SymbolId, Rva>,
+    pub functions: Vec<FunctionReport>,
+    pub directories: Vec<DirectoryReport>,
+    pub placements: Vec<Placement>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TransformOutcome {
+    pub transformed: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct FunctionReport {
+    pub symbol: SymbolId,
+    pub selected: bool,
+    pub eligible: bool,
+    pub lowered: bool,
+    pub transformed: bool,
+    pub intensity: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Ownership {
+    Retained,
+    Resident,
+    Generated,
+    Retired,
+}
+
+#[derive(Clone, Debug)]
+pub struct Placement {
+    pub symbol: SymbolId,
+    pub source_rva: Option<Rva>,
+    pub rva: Rva,
+    pub size: u32,
+    pub ownership: Ownership,
+}
+
+#[derive(Clone, Debug)]
+pub struct DirectoryReport {
+    pub index: usize,
+    pub rva: Rva,
+    pub file_offset: Option<u32>,
+    pub size: u32,
+    pub contributions: Vec<Placement>,
+}
+
+struct Lowered {
+    selected: SelectedInstructions,
+    transformed: bool,
+    intensity: f32,
+    pinned_host: BTreeSet<Rva>,
 }
 
 struct Prepared<'a> {
     function: &'a Function,
-    instructions: Vec<Instruction>,
-    references: Vec<Operand>,
+    selected: SelectedInstructions,
     indirect: Vec<(usize, Register)>,
     slot_len: u32,
-    new_rva: Option<u32>,
     body: Vec<u8>,
     unwind: Vec<kamy_seh::UnwindRange>,
-}
-
-enum Operand {
-    Branch(usize, u64),
-    Rip(usize, u64),
+    transformed: bool,
+    intensity: f32,
 }
 
 struct EncodedHelper {
@@ -113,23 +165,72 @@ pub fn build_callconv(module: &Module) -> MapCallConv {
 }
 
 /// Functions that cannot be transformed or safely referenced remain resident.
-pub fn protect_with_transforms(
+pub fn protect(
     pe: &PeFile,
     module: &Module,
     functions: &[Function],
     opts: &Options,
     cc: &dyn CallingConvLookup,
-    transform: &mut dyn FnMut(Rva, &mut IrFunction, f32),
+    transform: &mut dyn FnMut(&SymbolId, &mut IrFunction, f32) -> anyhow::Result<TransformOutcome>,
+    injection: module::Injection<'_>,
 ) -> anyhow::Result<(Vec<u8>, Report)> {
-    protect_inner(pe, module, functions, opts, cc, transform)
+    let (edits, mut report) = plan_image(pe, module, functions, opts, cc, transform, injection)?;
+    for placement in &report.placements {
+        if placement.ownership != Ownership::Retired {
+            report
+                .address_map
+                .insert(placement.symbol.clone(), placement.rva);
+        }
+    }
+    report.moved.sort();
+    report.ssa_lowered_symbols.sort();
+    report.rejected.sort_by(|left, right| left.0.cmp(&right.0));
+    report
+        .functions
+        .sort_by(|left, right| left.symbol.cmp(&right.symbol));
+    report.placements.sort_by(|left, right| {
+        (&left.symbol, left.rva, left.size, left.ownership).cmp(&(
+            &right.symbol,
+            right.rva,
+            right.size,
+            right.ownership,
+        ))
+    });
+    let image = pe.rebuild(&edits).context("rebuilding PE")?;
+    if let Some(certificate) = report
+        .directories
+        .iter_mut()
+        .find(|directory| directory.index == 4)
+    {
+        let (offset, size) = pe
+            .output_data_directory(&image, 4)?
+            .context("rebuilt certificate directory is missing")?;
+        certificate.file_offset = Some(offset.get());
+        certificate.size = size;
+    }
+    Ok((image, report))
+}
+
+enum LoweringError {
+    Rejected(RejectionReason),
+    Callback(anyhow::Error),
+}
+
+impl From<RejectionReason> for LoweringError {
+    fn from(reason: RejectionReason) -> Self {
+        Self::Rejected(reason)
+    }
 }
 
 fn ssa_instructions(
     module: &Module,
+    host: &Module,
     func: &Function,
+    symbol: &SymbolId,
+    references: &[OperandReference],
     cc: &dyn CallingConvLookup,
-    transform: &mut dyn FnMut(Rva, &mut IrFunction, f32),
-) -> Result<Vec<Instruction>, RejectionReason> {
+    transform: &mut dyn FnMut(&SymbolId, &mut IrFunction, f32) -> anyhow::Result<TransformOutcome>,
+) -> Result<Lowered, LoweringError> {
     // Only pressure retries re-lift: each transform intensity needs clean SSA.
     const INTENSITY_LADDER: [f32; 4] = [1.0, 0.5, 0.25, 0.0];
     let base = module.image_base;
@@ -153,27 +254,43 @@ fn ssa_instructions(
         while decoder.can_decode() {
             // EIP-relative lowering currently loses address provenance in the lifter.
             if decoder.decode().memory_base() == Register::EIP {
-                return Err(RejectionReason::UnsupportedInstruction);
+                return Err(RejectionReason::UnsupportedInstruction.into());
             }
         }
     }
     for (i, &intensity) in INTENSITY_LADDER.iter().enumerate() {
-        let mut result = kamy_lift::lift_function(module, func, cc);
+        let mut result = kamy_lift::lift_function(module, func, cc, references);
         if result.unsupported {
-            return Err(RejectionReason::UnsupportedInstruction);
+            return Err(RejectionReason::UnsupportedInstruction.into());
         }
         kamy_lift::ssa::construct_ssa(&mut result);
-        transform(func.entry, &mut result.func, intensity);
+        let unresolved_base =
+            kamy_transforms::resolve_image_base_uses(&mut result.func, |offset| {
+                module::identify_host_object(
+                    kamy_core::SymbolicExpression::Symbol {
+                        symbol: SymbolId::HostImageBase,
+                        addend: offset,
+                    },
+                    host,
+                )
+                .ok()
+            });
+        let outcome = if intensity == 0.0 {
+            TransformOutcome::default()
+        } else {
+            transform(symbol, &mut result.func, intensity).map_err(LoweringError::Callback)?
+        };
         kamy_transforms::optimize(&mut result.func);
         if uses_unsupported_flags(&result.func) {
-            return Err(RejectionReason::UnsupportedFlags);
+            return Err(RejectionReason::UnsupportedFlags.into());
         }
         if result.func.blocks.iter().any(|b| {
-            b.insts
-                .iter()
-                .any(|i| matches!(i.op, kamy_core::ir::IrOp::Call { target } if target == entry_va))
+            b.insts.iter().any(|i| {
+                matches!(&i.op, kamy_core::ir::IrOp::Call { target, .. }
+                    if target.expression == kamy_core::SymbolicExpression::symbol(symbol.clone()))
+            })
         }) {
-            return Err(RejectionReason::SelfRecursive);
+            return Err(RejectionReason::SelfRecursive.into());
         }
 
         match kamy_codegen::allocate_registers(
@@ -193,7 +310,7 @@ fn ssa_instructions(
                 // miscompile (D22) — only when a shift is actually emitted.
                 let prologue_delta = 8 * used.len() as u32 + stack_alloc;
                 if prologue_delta > 0 && accesses_caller_frame(&result.func, &result.rsp_chain) {
-                    return Err(RejectionReason::CallerFrameAccess);
+                    return Err(RejectionReason::CallerFrameAccess.into());
                 }
                 let instrs = kamy_codegen::select_instructions(
                     &result.func,
@@ -203,9 +320,25 @@ fn ssa_instructions(
                     &used,
                     &used_xmm,
                 );
-                return Ok(instrs);
+                let mut pinned_host = BTreeSet::new();
+                if unresolved_base {
+                    pinned_host.extend(host.functions.iter().map(|function| function.entry));
+                }
+                for reference in &instrs.references {
+                    module::pin_interior_host(
+                        &reference.reference.expression,
+                        host,
+                        &mut pinned_host,
+                    );
+                }
+                return Ok(Lowered {
+                    selected: instrs,
+                    transformed: intensity > 0.0 && outcome.transformed,
+                    intensity: if outcome.transformed { intensity } else { 0.0 },
+                    pinned_host,
+                });
             }
-            Err(_) => {
+            Err(RejectionReason::RegisterPressure) => {
                 let msg = "register pressure";
                 if let Some(&next) = INTENSITY_LADDER.get(i + 1) {
                     tracing::warn!(
@@ -217,10 +350,11 @@ fn ssa_instructions(
                 }
                 continue;
             }
+            Err(reason) => return Err(reason.into()),
         }
     }
     tracing::debug!(func = %func.entry, "pressure ladder exhausted");
-    Err(RejectionReason::RegisterPressure)
+    Err(RejectionReason::RegisterPressure.into())
 }
 
 /// Variable-count shift flags cannot be reconstructed without the original CL.
@@ -358,67 +492,59 @@ fn accesses_caller_frame(func: &IrFunction, rsp_chain: &HashSet<kamy_core::ir::V
 }
 
 impl Prepared<'_> {
-    fn bind(
+    fn encode(
         &mut self,
-        addresses: &BTreeMap<u64, u64>,
+        addresses: &BTreeMap<Rva, Rva>,
         helpers: &BTreeMap<u32, (Register, u32)>,
         base: u64,
-    ) -> anyhow::Result<bool> {
-        let mut changed = false;
-        for reference in &self.references {
-            match *reference {
-                Operand::Branch(index, original) => {
-                    let target = addresses.get(&original).copied().unwrap_or(original);
-                    changed |= self.instructions[index].near_branch_target() != target;
-                }
-                Operand::Rip(index, original) => {
-                    let target = addresses.get(&original).copied().unwrap_or(original);
-                    changed |= self.instructions[index].ip_rel_memory_address() != target;
-                }
-            }
-        }
+        rva: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        kamy_codegen::bind_references(&mut self.selected, base, |symbol| {
+            resolve_host(symbol, addresses, base)
+        })?;
         for &(index, register) in &self.indirect {
-            let (_, rva) = helpers
+            let rva = helpers
                 .get(&(register as u32))
-                .context("missing indirect translator")?;
-            let target = base
-                .checked_add(u64::from(*rva))
-                .context("translator VA overflow")?;
-            changed |= self.instructions[index].near_branch_target() != target;
-        }
-        if !changed {
-            return Ok(false);
-        }
-        for reference in &self.references {
-            match *reference {
-                Operand::Branch(index, original) => {
-                    self.instructions[index].set_near_branch64(original)
-                }
-                Operand::Rip(index, original) => {
-                    self.instructions[index].set_memory_displacement64(original)
-                }
-            }
-        }
-        kamy_codegen::rebase_instructions(&mut self.instructions, addresses)?;
-        for &(index, register) in &self.indirect {
-            let rva = helpers[&(register as u32)].1;
-            self.instructions[index].set_near_branch64(
+                .context("missing indirect translator")?
+                .1;
+            self.selected.instructions[index].set_near_branch64(
                 base.checked_add(u64::from(rva))
                     .context("translator VA overflow")?,
             );
         }
-        Ok(changed)
+        relocate(
+            &self.selected.instructions,
+            base.checked_add(u64::from(rva))
+                .context("code VA overflow")?,
+        )
     }
 }
 
-fn protect_inner(
+fn resolve_host(symbol: &SymbolId, addresses: &BTreeMap<Rva, Rva>, base: u64) -> Option<u64> {
+    match symbol {
+        SymbolId::Host { rva } => {
+            base.checked_add(u64::from(addresses.get(rva).unwrap_or(rva).get()))
+        }
+        SymbolId::HostImageBase => Some(base),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct HostReport {
+    rejected: Vec<(Rva, RejectionReason)>,
+    functions: Vec<FunctionReport>,
+}
+
+fn plan_image(
     pe: &PeFile,
     module: &Module,
     functions: &[Function],
     opts: &Options,
     cc: &dyn CallingConvLookup,
-    transform: &mut dyn FnMut(Rva, &mut IrFunction, f32),
-) -> anyhow::Result<(Vec<u8>, Report)> {
+    transform: &mut dyn FnMut(&SymbolId, &mut IrFunction, f32) -> anyhow::Result<TransformOutcome>,
+    injection: module::Injection<'_>,
+) -> anyhow::Result<(PeEdits, Report)> {
     let metadata = pe
         .metadata_references()
         .context("enumerating image references")?;
@@ -434,9 +560,6 @@ fn protect_inner(
             .context("original section RVA overflow")
     })?;
     let code_rva = align_up(image_end, pe.section_alignment())?;
-    let code_va = base
-        .checked_add(u64::from(code_rva))
-        .context("code VA overflow")?;
     let runtime_fns = pe.runtime_functions();
     let import_slots = pe.import_slots().iter().map(|r| r.get()).collect();
     let funcs_by_entry = functions.iter().map(|f| (f.entry.get(), f)).collect();
@@ -448,17 +571,31 @@ fn protect_inner(
         && opts.metadata_section.is_empty()
         && opts.pdata_section.is_empty();
     let has_cfg_check = has_cfg && pe.has_cfg_check();
-    let mut report = Report {
-        moved: Vec::new(),
-        rejected: Vec::new(),
-        ssa_lowered: 0,
-        ssa_lowered_rvas: Vec::new(),
-        address_map: BTreeMap::new(),
-    };
+    let mut report = HostReport::default();
+    let mut authored = module::Plan::prepare(pe, module, opts, transform, injection)?;
     let mut ordered: Vec<_> = functions.iter().collect();
     ordered.sort_by_key(|function| function.entry);
     let mut prepared = Vec::new();
     for function in ordered {
+        let symbol = SymbolId::Host {
+            rva: function.entry,
+        };
+        let selected = opts
+            .selector
+            .as_ref()
+            .is_none_or(|selector| selector.allows(function.entry))
+            && opts
+                .selected_symbols
+                .as_ref()
+                .is_none_or(|symbols| symbols.contains(&symbol));
+        report.functions.push(FunctionReport {
+            symbol: symbol.clone(),
+            selected,
+            eligible: false,
+            lowered: false,
+            transformed: false,
+            intensity: 0.0,
+        });
         match classify(module, function, &runtime_fns, &import_slots, &eh_runtime) {
             Ok(()) => {}
             Err(Some(reason)) => {
@@ -467,14 +604,16 @@ fn protect_inner(
             }
             Err(None) => continue,
         }
+        report.functions.last_mut().unwrap().eligible = reference_model.is_resolved(function.entry)
+            && cfg_usable
+            && !authored.pins(function.entry)
+            && !(pe.subsystem() == 1 && module.entry_point == Some(function.entry));
         let reason = if pe.subsystem() == 1 && module.entry_point == Some(function.entry) {
             Some(RejectionReason::InvalidReference)
-        } else if opts
-            .selector
-            .as_ref()
-            .is_some_and(|selector| !selector.allows(function.entry))
-        {
+        } else if !selected {
             Some(RejectionReason::Deselected)
+        } else if authored.pins(function.entry) {
+            Some(RejectionReason::InvalidReference)
         } else if !reference_model.is_resolved(function.entry) {
             Some(RejectionReason::SymbolizationUncertain)
         } else if !cfg_usable {
@@ -486,14 +625,17 @@ fn protect_inner(
             report.rejected.push((function.entry, reason));
             continue;
         }
-        let mut instructions = match ssa_instructions(module, function, cc, transform) {
-            Ok(instructions) => instructions,
-            Err(reason) => {
+        let lowered = match ssa_instructions(module, module, function, &symbol, &[], cc, transform)
+        {
+            Ok(lowered) => lowered,
+            Err(LoweringError::Rejected(reason)) => {
                 report.rejected.push((function.entry, reason));
                 continue;
             }
+            Err(LoweringError::Callback(error)) => return Err(error),
         };
-        let indirect = match translation::instrument(&mut instructions) {
+        let mut selected = lowered.selected;
+        let indirect = match translation::instrument(&mut selected.instructions) {
             Ok(indirect) => indirect,
             Err(_) => {
                 report
@@ -502,48 +644,22 @@ fn protect_inner(
                 continue;
             }
         };
-        let labels: HashSet<_> = instructions
-            .iter()
-            .map(Instruction::ip)
-            .filter(|ip| *ip != 0)
-            .collect();
-        let indirect_indices: HashSet<_> = indirect.iter().map(|(index, _)| *index).collect();
-        let mut references = Vec::new();
-        for (index, instruction) in instructions.iter().enumerate() {
-            if !indirect_indices.contains(&index)
-                && matches!(instruction.op0_kind(), iced_x86::OpKind::NearBranch64)
-                && !labels.contains(&instruction.near_branch_target())
-            {
-                references.push(Operand::Branch(index, instruction.near_branch_target()));
-            }
-            if instruction.is_ip_rel_memory_operand()
-                && !labels.contains(&instruction.ip_rel_memory_address())
-            {
-                references.push(Operand::Rip(index, instruction.ip_rel_memory_address()));
-            }
-        }
         prepared.push(Prepared {
             function,
-            instructions,
-            references,
+            selected,
             indirect,
             slot_len: 0,
-            new_rva: None,
             body: Vec::new(),
             unwind: Vec::new(),
+            transformed: lowered.transformed,
+            intensity: lowered.intensity,
         });
     }
 
     let seed_addresses = prepared
         .iter()
-        .map(|function| {
-            Ok((
-                base.checked_add(u64::from(function.function.entry.get()))
-                    .context("original VA overflow")?,
-                code_va,
-            ))
-        })
-        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        .map(|function| (function.function.entry, Rva::new(code_rva)))
+        .collect();
     let seed_helpers = prepared
         .iter()
         .flat_map(|function| function.indirect.iter())
@@ -551,8 +667,7 @@ fn protect_inner(
         .collect();
     prepared.retain_mut(|function| {
         let result = function
-            .bind(&seed_addresses, &seed_helpers, base)
-            .and_then(|_| relocate(&function.instructions, code_va))
+            .encode(&seed_addresses, &seed_helpers, base, code_rva)
             .and_then(|body| {
                 ensure!(!body.is_empty(), "empty selected function");
                 u32::try_from(body.len()).context("encoded function exceeds RVA space")
@@ -574,6 +689,7 @@ fn protect_inner(
         || prepared
             .iter()
             .any(|function| !function.indirect.is_empty())
+        || authored.helper_registers().next().is_some()
     {
         layout::retired_exception_slot(pe, module, &reference_model, &regenerated_fields)?
     } else {
@@ -591,168 +707,42 @@ fn protect_inner(
         xdata_rva,
         mut patches,
         mut reference_edits,
-    ) = loop {
-        if prepared.is_empty() {
-            report.rejected.sort_by_key(|&(entry, _)| entry);
-            let mut edits = PeEdits::default();
-            if blank_names {
-                blank_entry_section(module, &mut edits.section_updates);
-            }
-            return Ok((pe.rebuild(&edits).context("rebuilding PE")?, report));
-        }
-        let mut cursor = code_rva;
-        let mut addresses = BTreeMap::new();
-        for function in &prepared {
-            cursor = align_up(cursor, FUNCTION_ALIGN)?;
-            addresses.insert(function.function.entry, Rva::new(cursor));
-            cursor = cursor
-                .checked_add(function.slot_len)
-                .context("code layout RVA overflow")?;
-        }
-        let (patches, pinned) = rewrite::resident_patches(module, &reference_model, &addresses);
-        if !pinned.is_empty() {
-            prepared.retain(|function| {
-                if pinned.contains(&function.function.entry) {
-                    report
-                        .rejected
-                        .push((function.function.entry, RejectionReason::InvalidReference));
-                    false
-                } else {
-                    true
+    ) = {
+        let mut iterations = 0usize;
+        loop {
+            iterations += 1;
+            ensure!(
+                iterations <= 4096,
+                "host layout failed to converge after 4096 monotone iterations"
+            );
+            if prepared.is_empty() && authored.is_empty() {
+                let mut edits = PeEdits::default();
+                if blank_names {
+                    blank_entry_section(module, &mut edits.section_updates);
                 }
-            });
-            continue;
-        }
-        let mut helpers = BTreeMap::new();
-        for function in &prepared {
-            for &(_, register) in &function.indirect {
-                helpers.insert(register as u32, (register, 0));
+                let mut final_report =
+                    finalize_report(report, &prepared, module, &BTreeMap::new(), &runtime_fns)?;
+                final_report.directories = directory_reports(pe, &[], &final_report.placements);
+                describe_runtime_directories(
+                    &mut final_report,
+                    runtime_fns
+                        .iter()
+                        .map(|function| (function.begin.get(), function.end.get())),
+                    &module.relocations,
+                );
+                return Ok((edits, final_report));
             }
-        }
-        if has_cfg {
-            helpers.insert(Register::RAX as u32, (Register::RAX, 0));
-        }
-        let mut recycled_end = helper_slot.map(|slot| slot.span.start);
-        for (_, rva) in helpers.values_mut() {
-            let recycled = match (helper_slot, recycled_end.as_mut()) {
-                (Some(slot), Some(end)) => slot.reserve(end, translation::HELPER_LEN)?,
-                _ => None,
-            };
-            if let Some(recycled) = recycled {
-                *rva = recycled;
-            } else {
+            let mut cursor = code_rva;
+            let mut addresses = BTreeMap::new();
+            for function in &prepared {
                 cursor = align_up(cursor, FUNCTION_ALIGN)?;
-                *rva = cursor;
+                addresses.insert(function.function.entry, Rva::new(cursor));
                 cursor = cursor
-                    .checked_add(translation::HELPER_LEN)
-                    .context("helper RVA overflow")?;
+                    .checked_add(function.slot_len)
+                    .context("code layout RVA overflow")?;
             }
-        }
-        let check_rva = if has_cfg_check {
-            let recycled = match (helper_slot, recycled_end.as_mut()) {
-                (Some(slot), Some(end)) => {
-                    slot.reserve(end, translation::CHECK_BYTES.len() as u32)?
-                }
-                _ => None,
-            };
-            if let Some(recycled) = recycled {
-                Some(recycled)
-            } else {
-                cursor = align_up(cursor, FUNCTION_ALIGN)?;
-                let rva = cursor;
-                cursor = cursor
-                    .checked_add(translation::CHECK_BYTES.len() as u32)
-                    .context("CFG helper RVA overflow")?;
-                Some(rva)
-            }
-        } else {
-            None
-        };
-        let va_addresses = addresses
-            .iter()
-            .map(|(&old, &new)| {
-                Ok((
-                    base.checked_add(u64::from(old.get()))
-                        .context("original VA overflow")?,
-                    base.checked_add(u64::from(new.get()))
-                        .context("new VA overflow")?,
-                ))
-            })
-            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-        let mut rejected = BTreeMap::new();
-        let mut grew = false;
-        for function in &mut prepared {
-            let new_rva = addresses[&function.function.entry].get();
-            let bindings_changed = match function.bind(&va_addresses, &helpers, base) {
-                Ok(changed) => changed,
-                Err(_) => {
-                    rejected.insert(function.function.entry, RejectionReason::InvalidReference);
-                    continue;
-                }
-            };
-            if function.new_rva == Some(new_rva) && !bindings_changed {
-                continue;
-            }
-            let new_va = base
-                .checked_add(u64::from(new_rva))
-                .context("new VA overflow")?;
-            let body = match relocate(&function.instructions, new_va) {
-                Ok(body) => body,
-                Err(_) => {
-                    rejected.insert(function.function.entry, RejectionReason::CodegenFailure);
-                    continue;
-                }
-            };
-            let len = u32::try_from(body.len()).context("encoded function exceeds RVA space")?;
-            if len > function.slot_len {
-                // Slots grow monotonically; branch widening cannot oscillate layout.
-                function.slot_len = len;
-                grew = true;
-            }
-            function.new_rva = Some(new_rva);
-            function.body = body;
-            function.unwind.clear();
-        }
-        if !rejected.is_empty() {
-            prepared.retain(|function| !rejected.contains_key(&function.function.entry));
-            report.rejected.extend(rejected);
-            continue;
-        }
-        if grew {
-            continue;
-        }
-        // Widening can put a tentative successor entry inside the current body.
-        for function in &mut prepared {
-            if !function.unwind.is_empty() {
-                continue;
-            }
-            let new_va = base
-                .checked_add(u64::from(addresses[&function.function.entry].get()))
-                .context("new VA overflow")?;
-            match kamy_seh::unwind_ranges(&function.body, new_va) {
-                Ok(ranges) if !ranges.is_empty() => function.unwind = ranges,
-                _ => {
-                    rejected.insert(function.function.entry, RejectionReason::EhNoBucketCreation);
-                }
-            }
-        }
-        if !rejected.is_empty() {
-            prepared.retain(|function| !rejected.contains_key(&function.function.entry));
-            report.rejected.extend(rejected);
-            continue;
-        }
-        let reference_edits = match pe.rebase_references(&addresses) {
-            Ok(edits) => edits,
-            Err(error) => {
-                let mut pinned = HashSet::new();
-                for (&old, &new) in &addresses {
-                    if pe.rebase_references(&BTreeMap::from([(old, new)])).is_err() {
-                        pinned.insert(old);
-                    }
-                }
-                if pinned.is_empty() {
-                    return Err(error).context("rebasing image references");
-                }
+            let (patches, pinned) = rewrite::resident_patches(module, &reference_model, &addresses);
+            if !pinned.is_empty() {
                 prepared.retain(|function| {
                     if pinned.contains(&function.function.entry) {
                         report
@@ -765,78 +755,210 @@ fn protect_inner(
                 });
                 continue;
             }
-        };
-        let xdata_rva = align_up(cursor, pe.section_alignment())?;
-        let mut encoded_helpers = Vec::with_capacity(helpers.len());
-        let mut bad_helpers = BTreeMap::new();
-        for (&key, &(register, rva)) in &helpers {
-            let body = match translation::helper(register, rva, xdata_rva) {
-                Ok(body) => body,
-                Err(_) => {
-                    bad_helpers.insert(key, RejectionReason::InvalidReference);
+            let mut helpers = BTreeMap::new();
+            for function in &prepared {
+                for &(_, register) in &function.indirect {
+                    helpers.insert(register as u32, (register, 0));
+                }
+            }
+            for register in authored.helper_registers() {
+                helpers.insert(register as u32, (register, 0));
+            }
+            if has_cfg {
+                helpers.insert(Register::RAX as u32, (Register::RAX, 0));
+            }
+            let mut recycled_end = helper_slot.map(|slot| slot.span.start);
+            for (_, rva) in helpers.values_mut() {
+                let recycled = match (helper_slot, recycled_end.as_mut()) {
+                    (Some(slot), Some(end)) => slot.reserve(end, translation::HELPER_LEN)?,
+                    _ => None,
+                };
+                if let Some(recycled) = recycled {
+                    *rva = recycled;
+                } else {
+                    cursor = align_up(cursor, FUNCTION_ALIGN)?;
+                    *rva = cursor;
+                    cursor = cursor
+                        .checked_add(translation::HELPER_LEN)
+                        .context("helper RVA overflow")?;
+                }
+            }
+            let check_rva = if has_cfg_check {
+                let recycled = match (helper_slot, recycled_end.as_mut()) {
+                    (Some(slot), Some(end)) => {
+                        slot.reserve(end, translation::CHECK_BYTES.len() as u32)?
+                    }
+                    _ => None,
+                };
+                if let Some(recycled) = recycled {
+                    Some(recycled)
+                } else {
+                    cursor = align_up(cursor, FUNCTION_ALIGN)?;
+                    let rva = cursor;
+                    cursor = cursor
+                        .checked_add(translation::CHECK_BYTES.len() as u32)
+                        .context("CFG helper RVA overflow")?;
+                    Some(rva)
+                }
+            } else {
+                None
+            };
+            let mut rejected = BTreeMap::new();
+            let mut grew = false;
+            for function in &mut prepared {
+                let new_rva = addresses[&function.function.entry].get();
+                let body = match function.encode(&addresses, &helpers, base, new_rva) {
+                    Ok(body) => body,
+                    Err(_) => {
+                        rejected.insert(function.function.entry, RejectionReason::CodegenFailure);
+                        continue;
+                    }
+                };
+                let len =
+                    u32::try_from(body.len()).context("encoded function exceeds RVA space")?;
+                if len > function.slot_len {
+                    // Slots grow monotonically; branch widening cannot oscillate layout.
+                    function.slot_len = len;
+                    grew = true;
+                }
+                function.body = body;
+                function.unwind.clear();
+            }
+            if !rejected.is_empty() {
+                prepared.retain(|function| !rejected.contains_key(&function.function.entry));
+                report.rejected.extend(rejected);
+                continue;
+            }
+            if grew {
+                continue;
+            }
+            // Widening can put a tentative successor entry inside the current body.
+            for function in &mut prepared {
+                if !function.unwind.is_empty() {
+                    continue;
+                }
+                let new_va = base
+                    .checked_add(u64::from(addresses[&function.function.entry].get()))
+                    .context("new VA overflow")?;
+                match kamy_seh::unwind_ranges(&function.body, new_va) {
+                    Ok(ranges) if !ranges.is_empty() => function.unwind = ranges,
+                    _ => {
+                        rejected
+                            .insert(function.function.entry, RejectionReason::EhNoBucketCreation);
+                    }
+                }
+            }
+            if !rejected.is_empty() {
+                prepared.retain(|function| !rejected.contains_key(&function.function.entry));
+                report.rejected.extend(rejected);
+                continue;
+            }
+            let reference_edits = match pe.rebase_references(&addresses) {
+                Ok(edits) => edits,
+                Err(error) => {
+                    let mut pinned = HashSet::new();
+                    for (&old, &new) in &addresses {
+                        if pe.rebase_references(&BTreeMap::from([(old, new)])).is_err() {
+                            pinned.insert(old);
+                        }
+                    }
+                    if pinned.is_empty() {
+                        return Err(error).context("rebasing image references");
+                    }
+                    prepared.retain(|function| {
+                        if pinned.contains(&function.function.entry) {
+                            report
+                                .rejected
+                                .push((function.function.entry, RejectionReason::InvalidReference));
+                            false
+                        } else {
+                            true
+                        }
+                    });
                     continue;
                 }
             };
-            let va = base
-                .checked_add(u64::from(rva))
-                .context("helper VA overflow")?;
-            match kamy_seh::unwind_ranges(&body, va) {
-                Ok(unwind) if !unwind.is_empty() => {
-                    encoded_helpers.push(EncodedHelper { rva, body, unwind })
-                }
-                _ => {
-                    bad_helpers.insert(key, RejectionReason::EhNoBucketCreation);
-                }
-            }
-        }
-        let mut global_reject = if has_cfg {
-            bad_helpers.get(&(Register::RAX as u32)).copied()
-        } else {
-            None
-        };
-        let check_unwind = if let Some(rva) = check_rva {
-            let va = base
-                .checked_add(u64::from(rva))
-                .context("CFG helper VA overflow")?;
-            match kamy_seh::unwind_ranges(&translation::CHECK_BYTES, va) {
-                Ok(ranges) if !ranges.is_empty() => Some(ranges),
-                _ => {
-                    global_reject = Some(RejectionReason::EhNoBucketCreation);
-                    None
+            let authored_end = authored.place(cursor, &addresses, &helpers)?;
+            let xdata_rva = align_up(authored_end, pe.section_alignment())?;
+            let mut encoded_helpers = Vec::with_capacity(helpers.len());
+            let mut bad_helpers = BTreeMap::new();
+            for (&key, &(register, rva)) in &helpers {
+                let body = match translation::helper(register, rva, xdata_rva) {
+                    Ok(body) => body,
+                    Err(_) => {
+                        bad_helpers.insert(key, RejectionReason::InvalidReference);
+                        continue;
+                    }
+                };
+                let va = base
+                    .checked_add(u64::from(rva))
+                    .context("helper VA overflow")?;
+                match kamy_seh::unwind_ranges(&body, va) {
+                    Ok(unwind) if !unwind.is_empty() => {
+                        encoded_helpers.push(EncodedHelper { rva, body, unwind })
+                    }
+                    _ => {
+                        bad_helpers.insert(key, RejectionReason::EhNoBucketCreation);
+                    }
                 }
             }
-        } else {
-            None
-        };
-        if global_reject.is_some() || !bad_helpers.is_empty() {
-            prepared.retain(|function| {
-                let reason = global_reject.or_else(|| {
-                    function
-                        .indirect
-                        .iter()
-                        .find_map(|&(_, register)| bad_helpers.get(&(register as u32)).copied())
+            let mut global_reject = if has_cfg {
+                bad_helpers.get(&(Register::RAX as u32)).copied()
+            } else {
+                None
+            };
+            let check_unwind = if let Some(rva) = check_rva {
+                let va = base
+                    .checked_add(u64::from(rva))
+                    .context("CFG helper VA overflow")?;
+                match kamy_seh::unwind_ranges(&translation::CHECK_BYTES, va) {
+                    Ok(ranges) if !ranges.is_empty() => Some(ranges),
+                    _ => {
+                        global_reject = Some(RejectionReason::EhNoBucketCreation);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if global_reject.is_some() || !bad_helpers.is_empty() {
+                ensure!(
+                    authored.is_empty()
+                        || (global_reject.is_none()
+                            && !authored
+                                .helper_registers()
+                                .any(|register| bad_helpers.contains_key(&(register as u32)))),
+                    "generated translation/CFG helper cannot describe authored module references"
+                );
+                prepared.retain(|function| {
+                    let reason = global_reject.or_else(|| {
+                        function
+                            .indirect
+                            .iter()
+                            .find_map(|&(_, register)| bad_helpers.get(&(register as u32)).copied())
+                    });
+                    if let Some(reason) = reason {
+                        report.rejected.push((function.function.entry, reason));
+                        false
+                    } else {
+                        true
+                    }
                 });
-                if let Some(reason) = reason {
-                    report.rejected.push((function.function.entry, reason));
-                    false
-                } else {
-                    true
-                }
-            });
-            continue;
+                continue;
+            }
+            break (
+                addresses,
+                helpers,
+                encoded_helpers,
+                check_rva,
+                check_unwind,
+                cursor,
+                recycled_end,
+                xdata_rva,
+                patches,
+                reference_edits,
+            );
         }
-        break (
-            addresses,
-            helpers,
-            encoded_helpers,
-            check_rva,
-            check_unwind,
-            cursor,
-            recycled_end,
-            xdata_rva,
-            patches,
-            reference_edits,
-        );
     };
 
     patches.append(&mut reference_edits.patches);
@@ -945,6 +1067,14 @@ fn protect_inner(
     ensure!(code.len() <= reserved, "code exceeded reserved layout");
     let padding = reserved - code.len();
     append_nops(&mut code, padding);
+    let mut new_sections = Vec::new();
+    authored.emit(
+        &mut new_sections,
+        &mut reference_edits.relocations,
+        &mut xdata,
+        &mut entries,
+        xdata_rva,
+    )?;
     let mut metadata_layout = layout::ReadOnlyLayout {
         rva: xdata_rva,
         data: xdata,
@@ -964,6 +1094,12 @@ fn protect_inner(
         });
         patches.append(&mut imports.iat_patches);
     }
+    reference_edits
+        .relocations
+        .sort_by_key(|relocation| (relocation.rva, relocation.kind as u8));
+    reference_edits
+        .relocations
+        .dedup_by(|left, right| left.rva == right.rva && left.kind == right.kind);
     let relocations = kamy_pe::encode_base_relocations(&reference_edits.relocations)
         .context("serializing base relocations")?;
     if relocations.is_empty() {
@@ -1025,6 +1161,9 @@ fn protect_inner(
                 .unwrap_or(&section.name),
         ));
     }
+    for section in &new_sections {
+        output_sections.push((section.rva, section.virtual_size, section.name.as_str()));
+    }
     output_sections.push((
         Rva::new(code_rva),
         u32::try_from(code.len()).context("code size overflow")?,
@@ -1045,8 +1184,10 @@ fn protect_inner(
         rva: Rva::new(pdata_rva),
         size: u32::try_from(pdata.len()).context("pdata size overflow")?,
     });
-    let new_sections = vec![
-        section(opts.code_section.clone(), code_rva, true, code),
+    if !code.is_empty() {
+        new_sections.push(section(opts.code_section.clone(), code_rva, true, code));
+    }
+    new_sections.extend([
         section(
             opts.metadata_section.clone(),
             xdata_rva,
@@ -1054,21 +1195,338 @@ fn protect_inner(
             metadata_layout.data,
         ),
         section(opts.pdata_section.clone(), pdata_rva, false, pdata),
-    ];
-    report.moved = addresses.keys().copied().collect();
-    report.ssa_lowered = report.moved.len();
-    report.ssa_lowered_rvas = report.moved.clone();
-    report.rejected.sort_by_key(|&(entry, _)| entry);
-    report.address_map = addresses;
+    ]);
+    let mut final_report = finalize_report(report, &prepared, module, &addresses, &runtime_fns)?;
+    authored.finish_report(&mut final_report);
+    for &(register, rva) in helpers.values() {
+        final_report.placements.push(Placement {
+            symbol: SymbolId::Generated {
+                name: format!("translation-{register:?}").into(),
+            },
+            source_rva: None,
+            rva: Rva::new(rva),
+            size: translation::HELPER_LEN,
+            ownership: Ownership::Generated,
+        });
+    }
+    if let Some(rva) = check_rva {
+        final_report.placements.push(Placement {
+            symbol: SymbolId::Generated {
+                name: "cfg-check".into(),
+            },
+            source_rva: None,
+            rva: Rva::new(rva),
+            size: translation::CHECK_BYTES.len() as u32,
+            ownership: Ownership::Generated,
+        });
+    }
+    for directory in &directories {
+        if directory.size != 0 {
+            final_report.placements.push(Placement {
+                symbol: SymbolId::Generated {
+                    name: format!("directory-{}", directory.index).into(),
+                },
+                source_rva: None,
+                rva: directory.rva,
+                size: directory.size,
+                ownership: Ownership::Generated,
+            });
+        }
+        if let Some((rva, size)) = pe
+            .data_directory(directory.index)
+            .filter(|&(_, size)| size != 0)
+        {
+            final_report.placements.push(Placement {
+                symbol: SymbolId::Host { rva },
+                source_rva: Some(rva),
+                rva,
+                size,
+                ownership: Ownership::Retired,
+            });
+        }
+    }
+    final_report.directories = directory_reports(pe, &directories, &final_report.placements);
+    describe_runtime_directories(
+        &mut final_report,
+        entries.iter().map(|&(begin, end, _)| (begin, end)),
+        &reference_edits.relocations,
+    );
+    new_sections.sort_by_key(|section| section.rva);
     let edits = PeEdits {
         new_sections,
         section_updates,
         patches,
         directories,
-        entry_point: reference_edits.entry_point,
+        entry_point: authored.entry_point().or(reference_edits.entry_point),
         clear_guard_cf: has_cfg,
     };
-    Ok((pe.rebuild(&edits).context("rebuilding PE")?, report))
+    Ok((edits, final_report))
+}
+
+fn describe_runtime_directories(
+    report: &mut Report,
+    entries: impl IntoIterator<Item = (u32, u32)>,
+    relocations: &[kamy_core::Relocation],
+) {
+    if let Some(directory) = report
+        .directories
+        .iter_mut()
+        .find(|directory| directory.index == PeFile::EXCEPTION_DIRECTORY)
+    {
+        directory.contributions = entries
+            .into_iter()
+            .map(|(begin, end)| {
+                let owner = report.placements.iter().find(|owner| {
+                    owner.ownership != Ownership::Retired
+                        && owner.rva.get() <= begin
+                        && owner
+                            .rva
+                            .get()
+                            .checked_add(owner.size)
+                            .is_some_and(|owner_end| end <= owner_end)
+                });
+                Placement {
+                    symbol: owner.map_or(
+                        SymbolId::Host {
+                            rva: Rva::new(begin),
+                        },
+                        |owner| owner.symbol.clone(),
+                    ),
+                    source_rva: owner.and_then(|owner| owner.source_rva),
+                    rva: Rva::new(begin),
+                    size: end - begin,
+                    ownership: owner.map_or(Ownership::Retained, |owner| owner.ownership),
+                }
+            })
+            .collect();
+    }
+    if let Some(directory) = report
+        .directories
+        .iter_mut()
+        .find(|directory| directory.index == 5)
+    {
+        directory.contributions = relocations
+            .iter()
+            .filter_map(|relocation| {
+                let size = match relocation.kind {
+                    kamy_core::RelocKind::Dir64 => 8,
+                    kamy_core::RelocKind::HighLow => 4,
+                    _ => return None,
+                };
+                let owner = report.placements.iter().find(|owner| {
+                    owner.ownership != Ownership::Retired
+                        && owner.rva <= relocation.rva
+                        && owner.rva.get().checked_add(owner.size).is_some_and(|end| {
+                            relocation
+                                .rva
+                                .get()
+                                .checked_add(size)
+                                .is_some_and(|field_end| field_end <= end)
+                        })
+                });
+                Some(Placement {
+                    symbol: owner.map_or(
+                        SymbolId::Host {
+                            rva: relocation.rva,
+                        },
+                        |owner| owner.symbol.clone(),
+                    ),
+                    source_rva: owner.and_then(|owner| owner.source_rva),
+                    rva: relocation.rva,
+                    size,
+                    ownership: owner.map_or(Ownership::Retained, |owner| owner.ownership),
+                })
+            })
+            .collect();
+    }
+}
+
+fn finalize_report(
+    mut host: HostReport,
+    prepared: &[Prepared<'_>],
+    module: &Module,
+    addresses: &BTreeMap<Rva, Rva>,
+    runtime: &[kamy_pe::RuntimeFunction],
+) -> anyhow::Result<Report> {
+    let mut report = Report::default();
+    host.rejected.sort_by_key(|&(rva, _)| rva);
+    report.rejected = host
+        .rejected
+        .into_iter()
+        .map(|(rva, reason)| (SymbolId::Host { rva }, reason))
+        .collect();
+    for function in &mut host.functions {
+        let SymbolId::Host { rva } = function.symbol else {
+            unreachable!()
+        };
+        if let Some(lowered) = prepared
+            .iter()
+            .find(|lowered| lowered.function.entry == rva)
+        {
+            function.lowered = true;
+            function.transformed = lowered.transformed;
+            function.intensity = lowered.intensity;
+        }
+    }
+    report.functions = host.functions;
+    for function in &module.functions {
+        let symbol = SymbolId::Host {
+            rva: function.entry,
+        };
+        let end = function
+            .blocks
+            .iter()
+            .map(|block| block.end)
+            .max()
+            .unwrap_or(function.entry);
+        let size = end
+            .get()
+            .checked_sub(function.entry.get())
+            .context("invalid host function extent")?;
+        if let Some(&new_rva) = addresses.get(&function.entry) {
+            let lowered = prepared
+                .iter()
+                .find(|lowered| lowered.function.entry == function.entry)
+                .context("mover has no prepared body")?;
+            report.placements.push(Placement {
+                symbol: symbol.clone(),
+                source_rva: Some(function.entry),
+                rva: new_rva,
+                size: u32::try_from(lowered.body.len())?,
+                ownership: Ownership::Generated,
+            });
+            report.placements.push(Placement {
+                symbol: symbol.clone(),
+                source_rva: Some(function.entry),
+                rva: function.entry,
+                size,
+                ownership: Ownership::Retired,
+            });
+            report.moved.push(symbol.clone());
+            report.ssa_lowered_symbols.push(symbol.clone());
+            report.address_map.insert(symbol, new_rva);
+        } else {
+            report.placements.push(Placement {
+                symbol,
+                source_rva: Some(function.entry),
+                rva: function.entry,
+                size,
+                ownership: Ownership::Resident,
+            });
+        }
+    }
+    for function in runtime {
+        if !addresses.contains_key(&function.begin)
+            && !report.placements.iter().any(|placement| {
+                placement.ownership != Ownership::Retired
+                    && placement.rva <= function.begin
+                    && placement
+                        .rva
+                        .get()
+                        .checked_add(placement.size)
+                        .is_some_and(|end| function.end.get() <= end)
+            })
+        {
+            report.placements.push(Placement {
+                symbol: SymbolId::Host {
+                    rva: function.begin,
+                },
+                source_rva: Some(function.begin),
+                rva: function.begin,
+                size: function.end.get() - function.begin.get(),
+                ownership: Ownership::Retained,
+            });
+        }
+    }
+    report.ssa_lowered = report.ssa_lowered_symbols.len();
+    Ok(report)
+}
+
+fn directory_reports(
+    pe: &PeFile,
+    updates: &[DirectoryUpdate],
+    placements: &[Placement],
+) -> Vec<DirectoryReport> {
+    (0..16)
+        .filter_map(|index| {
+            let update = updates.iter().find(|update| update.index == index);
+            let (rva, size) = update
+                .map(|update| (update.rva, update.size))
+                .or_else(|| pe.data_directory(index))?;
+            if size == 0 {
+                return matches!(index, 3 | 5).then_some(DirectoryReport {
+                    index,
+                    rva,
+                    file_offset: None,
+                    size,
+                    contributions: Vec::new(),
+                });
+            }
+            if index == 4 {
+                return Some(DirectoryReport {
+                    index,
+                    rva: Rva::ZERO,
+                    file_offset: Some(rva.get()),
+                    size,
+                    contributions: vec![Placement {
+                        symbol: SymbolId::Generated {
+                            name: "certificate".into(),
+                        },
+                        source_rva: None,
+                        rva: Rva::ZERO,
+                        size,
+                        ownership: Ownership::Retained,
+                    }],
+                });
+            }
+            let contributions =
+                if update.is_some() {
+                    vec![Placement {
+                        symbol: SymbolId::Generated {
+                            name: format!("directory-{index}").into(),
+                        },
+                        source_rva: None,
+                        rva,
+                        size,
+                        ownership: Ownership::Generated,
+                    }]
+                } else {
+                    placements
+                        .iter()
+                        .filter(|placement| {
+                            placement.ownership != Ownership::Retired
+                                && placement.rva <= rva
+                                && placement.rva.get().checked_add(placement.size).is_some_and(
+                                    |end| {
+                                        rva.get()
+                                            .checked_add(size)
+                                            .is_some_and(|directory_end| directory_end <= end)
+                                    },
+                                )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+            let contributions = if contributions.is_empty() {
+                vec![Placement {
+                    symbol: SymbolId::Host { rva },
+                    source_rva: Some(rva),
+                    rva,
+                    size,
+                    ownership: Ownership::Retained,
+                }]
+            } else {
+                contributions
+            };
+            Some(DirectoryReport {
+                index,
+                rva,
+                file_offset: None,
+                size,
+                contributions,
+            })
+        })
+        .collect()
 }
 
 fn blank_entry_section(module: &Module, updates: &mut Vec<SectionUpdate>) {
@@ -1102,6 +1560,7 @@ fn section(name: String, rva: u32, execute: bool, data: Vec<u8>) -> NewSection {
             write: false,
             execute,
         },
+        virtual_size: u32::try_from(data.len()).expect("section data exceeds RVA space"),
         data,
     }
 }
@@ -1403,6 +1862,7 @@ fn append_nops(bytes: &mut Vec<u8>, mut len: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced_x86::Instruction;
 
     #[test]
     fn runtime_table_includes_moved_leaf_without_original_pdata() {
@@ -1419,37 +1879,55 @@ mod tests {
 
     #[test]
     fn encoded_caller_rebinds_when_callee_becomes_resident() {
+        use kamy_core::{LinkField, Reference, ReferenceOrigin, SymbolicExpression};
         let function = Function {
             entry: Rva::new(0x1000),
             blocks: vec![],
         };
-        let instructions = vec![
-            Instruction::with_branch(iced_x86::Code::Call_rel32_64, 0x140002000).unwrap(),
-            Instruction::with(iced_x86::Code::Retnq),
-        ];
         let mut prepared = Prepared {
             function: &function,
-            instructions,
-            references: vec![Operand::Branch(0, 0x140002000)],
+            selected: SelectedInstructions {
+                instructions: vec![
+                    Instruction::with_branch(iced_x86::Code::Call_rel32_64, 0x140002000).unwrap(),
+                    Instruction::with(iced_x86::Code::Retnq),
+                ],
+                references: vec![kamy_codegen::InstructionReference {
+                    instruction: 0,
+                    operand: 0,
+                    reference: Reference {
+                        source: SymbolId::Host {
+                            rva: function.entry,
+                        },
+                        offset: 1,
+                        expression: SymbolicExpression::symbol(SymbolId::Host {
+                            rva: Rva::new(0x2000),
+                        }),
+                        field: LinkField::Relative32 { bias: 0 },
+                        origin: ReferenceOrigin::HostAnalysis,
+                    },
+                }],
+            },
             indirect: vec![],
             slot_len: 0,
-            new_rva: None,
             body: vec![],
             unwind: vec![],
+            transformed: false,
+            intensity: 0.0,
         };
-        let map = BTreeMap::from([(0x140002000, 0x140006000)]);
-        prepared.bind(&map, &BTreeMap::new(), 0x140000000).unwrap();
-        let body = relocate(&prepared.instructions, 0x140005000).unwrap();
-        let mut decoder =
-            iced_x86::Decoder::with_ip(64, &body, 0x140005000, iced_x86::DecoderOptions::NONE);
-        assert_eq!(decoder.decode().near_branch_target(), 0x140006000);
-        prepared
-            .bind(&BTreeMap::new(), &BTreeMap::new(), 0x140000000)
-            .unwrap();
-        let body = relocate(&prepared.instructions, 0x140005000).unwrap();
-        let mut decoder =
-            iced_x86::Decoder::with_ip(64, &body, 0x140005000, iced_x86::DecoderOptions::NONE);
-        assert_eq!(decoder.decode().near_branch_target(), 0x140002000);
+        for (map, expected) in [
+            (
+                BTreeMap::from([(Rva::new(0x2000), Rva::new(0x6000))]),
+                0x140006000,
+            ),
+            (BTreeMap::new(), 0x140002000),
+        ] {
+            let body = prepared
+                .encode(&map, &BTreeMap::new(), 0x140000000, 0x5000)
+                .unwrap();
+            let mut decoder =
+                iced_x86::Decoder::with_ip(64, &body, 0x140005000, iced_x86::DecoderOptions::NONE);
+            assert_eq!(decoder.decode().near_branch_target(), expected);
+        }
     }
 
     #[test]

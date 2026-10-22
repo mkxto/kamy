@@ -34,8 +34,10 @@ impl Pass for Dce {
                         inst.op,
                         IrOp::Store
                             | IrOp::Call { .. }
-                            | IrOp::CallIndirect
+                            | IrOp::CallIndirect { .. }
                             | IrOp::NativeInline(_)
+                            | IrOp::UDiv
+                            | IrOp::SDiv
                     );
                 if is_root {
                     if let Some(dest) = inst.dest {

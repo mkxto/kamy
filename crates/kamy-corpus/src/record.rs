@@ -10,6 +10,15 @@ use crate::manifest::MemberKind;
 /// SSA lift/lower coverage for one member, or an accumulated corpus total.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Coverage {
+    #[serde(default)]
+    pub selected: usize,
+    #[serde(default)]
+    pub eligible: usize,
+    #[serde(default)]
+    pub transformed: usize,
+    /// Successful lowering intensity histogram; zero includes semantic identity.
+    #[serde(default)]
+    pub actual_intensity: std::collections::BTreeMap<String, usize>,
     /// Functions lowered through the SSA pipeline — the only "covered" bucket.
     pub ssa_lowered: usize,
     /// Functions shipped as verbatim relocations (no SSA) — not covered.
@@ -22,6 +31,12 @@ pub struct Coverage {
 impl Coverage {
     /// Fold `other` into `self`: sum the counts and merge the by-reason tallies.
     pub fn merge(&mut self, other: &Coverage) {
+        self.selected += other.selected;
+        self.eligible += other.eligible;
+        self.transformed += other.transformed;
+        for (intensity, count) in &other.actual_intensity {
+            *self.actual_intensity.entry(intensity.clone()).or_default() += count;
+        }
         self.ssa_lowered += other.ssa_lowered;
         self.relocated += other.relocated;
         self.rejected += other.rejected;
@@ -156,4 +171,66 @@ pub fn diff(expected: &BehaviorRecord, observed: &BehaviorRecord) -> Vec<String>
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn coverage_merges_execution_independent_semantic_outcomes() {
+        let mut total = Coverage {
+            selected: 3,
+            eligible: 2,
+            ssa_lowered: 2,
+            transformed: 1,
+            actual_intensity: BTreeMap::from([("0.5".into(), 1), ("0".into(), 1)]),
+            rejected: 1,
+            by_reason: BTreeMap::from([("RegisterPressure".into(), 1)]),
+            ..Default::default()
+        };
+        total.merge(&Coverage {
+            selected: 4,
+            eligible: 3,
+            ssa_lowered: 3,
+            transformed: 0,
+            actual_intensity: BTreeMap::from([("0".into(), 3)]),
+            rejected: 1,
+            by_reason: BTreeMap::from([("LiftFailure".into(), 1)]),
+            ..Default::default()
+        });
+        assert_eq!(
+            (
+                total.selected,
+                total.eligible,
+                total.ssa_lowered,
+                total.transformed
+            ),
+            (7, 5, 5, 1)
+        );
+        assert_eq!(
+            total.actual_intensity,
+            BTreeMap::from([("0".into(), 4), ("0.5".into(), 1)])
+        );
+        assert_eq!(total.rejected, 2);
+        assert_eq!(total.relocated, 0);
+        let serialized = serde_norway::to_string(&total).unwrap();
+        let restored: Coverage = serde_norway::from_str(&serialized).unwrap();
+        assert_eq!(restored.transformed, 1);
+        assert_eq!(restored.actual_intensity, total.actual_intensity);
+        assert_eq!(restored.by_reason, total.by_reason);
+    }
+
+    #[test]
+    fn historical_identity_coverage_never_fabricates_semantic_protection() {
+        let coverage: Coverage = serde_norway::from_str(
+            "ssa_lowered: 1314\nrelocated: 0\nrejected: 9888\nby_reason: {}\n",
+        )
+        .unwrap();
+        assert_eq!(coverage.ssa_lowered, 1314);
+        assert_eq!(coverage.rejected, 9888);
+        assert_eq!(coverage.transformed, 0);
+        assert!(coverage.actual_intensity.is_empty());
+    }
 }

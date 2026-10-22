@@ -1,7 +1,7 @@
 # Kamy — Project Status
 
 Living document. Updated as work lands.
-Current relocation work is recorded in the final #17 section; older counts below are historical measurements.
+Current repair evidence is recorded in the final campaign section. Earlier relocation, SDK and corpus measurements are historical snapshots, not acceptance of the D40 cutover.
 
 ---
 
@@ -359,7 +359,7 @@ its accumulator over 20,000 iterations (`relocated` = 0 corpus-wide — verbatim
 movement is gone). The computed-`jmp`/pad obfuscation CodeDefender layers on top
 is a separate Phase-4 transform.
 
-## Relocation rebuild — current (#17, D37–D39)
+## Relocation rebuild — pre-D40 implementation snapshot (#17, D37–D39)
 
 The supported input is x86-64 PE32+; x86/PE32 is out of scope.
 
@@ -472,6 +472,263 @@ Runtime acceptance uses Rust-only plugin and EXE/DLL fixtures:
 
 Module imports, module TLS/PE export directories, language-handler unwind,
 interior-code pointers and unsupported instruction/operand forms remain explicit
-errors. Exact authored reference coverage does not waive D5 or instruction/ABI
-support. Enforcing module CFG and the vendor's unobserved extras remain outside
+errors. Exact authored reference coverage does not waive instruction, explicit
+ABI, frame or unwind support. D40 supersedes the former zero-spill policy;
+pressure rejection/reduced intensity remain current backend limitations until
+handoff 2. Enforcing module CFG and the vendor's unobserved extras remain outside
 this epic's gates.
+
+## D40 repair campaign — handoff-1 contracts and evidence
+
+**Handoff 1 complete.** The integration owner observed all four workspace gates
+green (**311 tests, 41 suites**), final identity corpus **23/23 PASS**, and the
+freshly rebuilt **full** SDK structural/runtime matrix `sdk-rebuild=full PASS`.
+This completes the symbol/reference/ABI/single-rebuild milestone, not handoffs
+2–4. Current evidence follows the historical intermediate snapshots below.
+
+Policy milestone `5ef9b46` records D40 before implementation. The integration
+owner reports these gates green for that policy milestone:
+
+```sh
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo build --workspace --all-targets
+cargo test --workspace
+```
+
+The supplied test count is **225**. These results establish the policy baseline,
+not verification of the later symbol/ABI/link/schema changes.
+
+The supplied pre-cutover identity baseline is **23/23 PASS**, **1,314/11,202
+SSA-lowered**, and **9,888 rejected**: 3,846 `SEHComplex`, 3,323
+`SymbolizationUncertain`, 1,740 `RegisterPressure`, 557 `LiftFailure`, 209
+`UnsupportedInstruction`, 101 `BadIndirectBranch`, 64 `CallerFrameAccess`, 32
+`ResolvableIndirect`, 12 `InvalidReference`, 2 `EhNoBucketCreation`, and 2
+`SelfRecursive`. This is the comparison population, not a post-cutover result.
+Execution verdict, selected/eligible/lowered/actually transformed counts,
+effective intensity and rejection transitions MUST be reported separately.
+Population additions/removals MUST NOT be counted as recovered coverage.
+
+D40's ordered scope remains binding: handoff 1 owns unified symbols, authored
+ABI contracts and one rebuild; handoff 2 owns concrete frames/memory-backed
+lowering; handoff 3 owns compiled Rust startup, ordinary imports and Rust `std`
+with `panic=abort`; handoff 4 owns whole-image virtual compaction. The current
+freestanding SDK workflow and generated loader are limitations, not the target.
+The earlier callback, ASLR and unwind observations above are historical evidence
+for the old implementation, not runtime acceptance of the new contracts.
+
+The implementation owners supplied the handoff-1 interfaces documented in
+[architecture.md](architecture.md): source-qualified `SymbolId`, shared signed
+`SymbolicExpression`/`Reference` fields, exact authored operand annotations,
+explicit `FnSignature`/`AbiValue`, the single `kamy_link::protect` entry and
+original-host `PeEdits` plan, generated helper placements and directory
+ownership/file-coordinate reports. These are interface records, not acceptance
+results. Authored artifacts use KAMYMOD version 2; public maps use CSV
+`kamy-debug-map,2`; structural JSON reports use `kamy-link-report` version 1.
+Old artifacts MUST be rebuilt and old map consumers migrated, without numeric
+module namespaces or compatibility aliases.
+
+The supplied producer contract uses Rust post-LTO IR and matching LLVM 22.1.2
+full native emission with machine-state capture in the same invocation, not
+serialized MIR resumption. The known SDK callback boundary is validated
+explicitly; unused machine inputs do not prove arbitrary missing argument
+locations. Unsupported internal ABI records fail closed. This records no new
+runtime ABI claim. Current tool discovery and supported/rejected settings are
+specified in [tooling.md](tooling.md).
+
+Profile-plus-identity retains configured injection/naming and suppresses semantic
+passes. Supported MBA requests remain ordered; unsupported passes/settings and
+profile/RVA-selector conflicts are explicit errors. Effective intensity remains
+separate from requested transformation until handoff 2 removes pressure retries.
+`tests/sdk-rebuild` retains the original combined pressure witness intact; its
+presence is not recovery or execution evidence. Later handoffs MUST reuse these
+contracts and portable fixtures rather than introduce another ABI, namespace,
+loader-only backend or rebuild stage.
+
+### Initial handoff-1 union gates (before boundary repair)
+
+The integration owner reports these commands green on the implementation union:
+
+```sh
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo build --workspace --all-targets
+cargo test --workspace
+```
+
+Result: **275 tests passed across 40 suites**. The workspace language-server
+`cargo check` diagnostics were also clean. This snapshot precedes the subsequent
+generic ABI-pin boundary repair and native-oracle correction. It is not the
+final gate result for those later changes or a runtime oracle.
+
+### Initial post-cutover identity corpus (before boundary repair)
+
+The integration owner ran the rebuilt debug CLI with this invocation (local
+paths are parameterized):
+
+```sh
+target/debug/kamy.exe -q corpus verify --corpus <corpus-checkout> --keep --baseline <before.yml> --write-baseline <after.yml>
+```
+
+Result: **23/23 PASS**, **1,314/11,202 SSA-lowered**, **9,888 rejected**.
+Every member's lowered count and rejection-reason totals match the pre-cutover
+baseline, including **1,740 `RegisterPressure`** and **64 `CallerFrameAccess`**.
+No aggregate recovery or population-denominator change is claimed. Source-level
+per-function transition comparison is a separate measurement, not implied by
+matching totals.
+
+The new report axes are **12,848 selected**, **3,343 eligible**, **0 actually
+transformed**, and `actual_intensity: {"0": 1314}`. Selected includes discovered
+import/forwarder seeds and is not the 11,202-function coverage denominator.
+The old YAML lacked these axes; a printed zero-to-new-value delta is a schema
+addition, not recovered coverage or additional protection. This run exercises
+identity behavior, not MBA or authored-module runtime acceptance.
+
+### Historical boundary-repair regression — repaired before acceptance
+
+The integration owner subsequently exercised a CLI containing the generic
+ABI-pin repair, before the NativeInline RIP-provenance correction. That
+intermediate identity corpus was **11/23 PASS**, **1,697/11,202 lowered** and
+**9,505 rejected**, including 971 `RegisterPressure`, 449 `CallerFrameAccess`
+and 3 `EhNoBucketCreation`. That intermediate lowered increase was not accepted
+coverage: execution regressed. Subsequent headless bisection isolated RVA
+`0x96b4`; real implicit arithmetic and boundary/provenance repairs preceded the
+green final corpus and actually lowered culprit execution recorded below. No
+blanket reject, population reduction or protected-output re-blessing was used
+as the acceptance substitute.
+
+### Repaired-union workspace gates
+
+The integration owner reports the repaired union, including initialized bound
+storage, accurate rejection dispatch and fast-fail outcome classification,
+green under:
+
+```sh
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo build --workspace --all-targets
+cargo test --workspace
+```
+
+Final result: **311 tests passed across 41 suites**, with clean workspace
+language-server `cargo check` diagnostics after the storage repair. The earlier
+308-test gate preceded that repair. Separate fresh corpus and full SDK runtime
+results below supply the execution evidence; workspace tests alone do not.
+
+### Repaired identity corpus and isolated culprit execution
+
+The integration owner reports the repaired CLI's identity corpus **23/23 PASS**,
+**1,721/11,202 SSA-lowered (15.4%)**, and **9,481 rejected**. The reported
+population remains **11,202**; lowering increased by **407** against the
+1,314-function baseline. Identity reports **0 actually transformed**. This is
+backend coverage, not additional MBA protection or memory-backed allocation.
+
+| Rejection reason | Repaired count |
+|---|---:|
+| SEHComplex | 3,846 |
+| SymbolizationUncertain | 3,323 |
+| RegisterPressure | 869 |
+| LiftFailure | 557 |
+| CallerFrameAccess | 488 |
+| UnsupportedInstruction | 247 |
+| BadIndirectBranch | 101 |
+| ResolvableIndirect | 32 |
+| InvalidReference | 12 |
+| EhNoBucketCreation | 3 |
+| SelfRecursive | 3 |
+
+The integration owner also asserted that isolated host culprit RVA `0x96b4`
+actually lowered, then observed **four-vector native differential verification
+PASS**. This is execution of the repaired body, not success through residency.
+The integration owner's exact source-function comparison uses saved baseline
+mover maps/rejections against the new structured link reports for all 23 same
+inputs: **11,202 → 11,202**, **0 added**, **0 removed**. It records **421
+recovered**, **14 lost**, net **+407** lowered functions. The 14 lost functions
+MUST NOT be concealed by the net improvement.
+
+| Before | After | Functions |
+|---|---|---:|
+| SSA-lowered | RegisterPressure | 9 |
+| RegisterPressure | SSA-lowered | 414 |
+| RegisterPressure | CallerFrameAccess | 413 |
+| RegisterPressure | UnsupportedInstruction | 55 |
+| SSA-lowered | UnsupportedInstruction | 3 |
+| SSA-lowered | CallerFrameAccess | 2 |
+| UnsupportedInstruction | RegisterPressure | 3 |
+| UnsupportedInstruction | SSA-lowered | 4 |
+| CallerFrameAccess | SSA-lowered | 3 |
+| UnsupportedInstruction | CallerFrameAccess | 12 |
+| RegisterPressure | EhNoBucketCreation | 1 |
+| UnsupportedInstruction | SelfRecursive | 1 |
+
+New physical-boundary constraints, the existing frame guard and explicit
+unmodeled native-flag checks explain rejection classes; they do not implement
+the pressure/frame guarantee assigned to handoff 2. The comparison preserves
+every source function rather than changing the population to improve coverage.
+
+### Final full SDK structural/runtime matrix
+
+The integration owner rebuilt both hosts and regenerated **all 11 real Rust
+module artifacts** with the initialized linker-bound storage contract, then ran
+the full harness. All three stages exited zero; the final output was
+`sdk-rebuild=full PASS`. The exercised commands were the following, with local
+tool/library paths supplied as arguments rather than committed dependencies:
+
+```sh
+target/debug/sdk-rebuild.exe build --out target/sdk-rebuild --kamy target/debug/kamy.exe --cargo cargo --rustc rustc --linker <lld-link.exe> --llvm-tools <matching-LLVM-tools-directory> --lib-dirs <semicolon-separated-library-directories> --scope full
+target/debug/sdk-rebuild.exe produce --out target/sdk-rebuild --kamy target/debug/kamy.exe --cargo cargo --rustc rustc --linker <lld-link.exe> --llvm-tools <matching-LLVM-tools-directory> --lib-dirs <semicolon-separated-library-directories> --scope full
+target/debug/sdk-rebuild.exe run --out target/sdk-rebuild --kamy target/debug/kamy.exe --cargo cargo --rustc rustc --linker <lld-link.exe> --llvm-tools <matching-LLVM-tools-directory> --lib-dirs <semicolon-separated-library-directories> --scope full
+```
+
+- **EXE/DLL × inline/init-table:** ordered callbacks, ABI, bounds and fast-fail
+  scenarios pass. DLL checks preserve exact entry arguments and TRUE return;
+  the replay oracle produces `1212`. Forced ASLR passes throughout the matrix.
+- **Identity versus transformation:** profile-plus-identity preserves injection
+  and naming, with callback-module lowered counts `[1,1]` and transformed counts
+  `[0,0]`. The ordered two-MBA-entry profile lowers `[1,1]` and actually
+  transforms `[1,1]`; selector visitation alone is not the oracle.
+- **Actual ABI calls:** the scalar Float64 XMM0 argument/return contract is
+  validated, with a real source call `0x104b → 0x1160` and a final decoded call
+  to its symbol's actual placement. Runtime ABI outputs are `abi=true`, including
+  the mixed integer/floating and aggregate cases in the fixture. This does not
+  claim runtime coverage for every represented ABI type or f32.
+- **BSS and permissions:** all four ABI outputs report `bss_virtual_ranges=1`;
+  the 8 KiB virtual tail stays writable/nonexecuting without file-backed zero
+  extension. Runtime zero-initialization and read/write checks pass. The earlier
+  real BSS regression was repaired through initialized native bound cells and
+  nonextending field writes, not by weakening the oracle or changing goldens.
+- **Native Windows unwind:** independently constructed machine-state probes
+  pass for a 96-byte module callback frame, an 8-byte scalar frame and the
+  generated loader's 72-byte frame. Poisoned nonvolatile GPR/XMM state is
+  restored. These probes cover selected logical post-prologue PCs; structural
+  checks cover all Exception ranges, not every-fragment runtime execution.
+- **Intact pressure witness:** the original combined bounds-check/counter
+  callback actually lowers and executes with `trace=12` and span **24**. It is
+  not split, and no `EXPECTED_LIMITATION` fallback is taken. This repairs that
+  witness, not arbitrary pressure, concrete frames or the handoff-2 guarantee.
+- **Strict configuration:** unsupported-request and flag-conflict subprocess
+  cases pass, as do disabled nonexistent-plugin paths. Fast-fail checks require
+  the actual `0xc0000409` fault and empty stdout; an absent normal exit alone
+  cannot satisfy the oracle.
+- **One active final graph:** source artifact metadata is stripped; host IAT
+  counts remain **79 for EXE / 1 for DLL** in these import-free module cases.
+  Final Exception/BaseReloc contributions, sorted/nonoverlapping runtime ranges,
+  source-qualified maps and ownership checks pass. This is not a claim that
+  future ordinary module imports must leave the host IAT unchanged.
+
+The final post-storage-repair corpus rerun also remains **23/23 PASS**,
+**1,721/11,202 lowered**, **9,481 rejected**, with the same reason totals and
+exact stable-function transitions above: **421 recovered, 14 lost, 0 added,
+0 removed**. No current SDK failure or pending runtime acceptance is implied
+by the historical intermediate observations.
+
+Handoff 2 consumes the documented symbolic operands, explicit ABI/call effects,
+shared lowering and single-plan unwind/layout interfaces, plus the intact
+pressure witness. It still owns concrete frames, memory-backed intermediates,
+bounded scratch sets and removal of pressure-driven intensity reduction.
+Handoff 3 consumes KAMYMOD v2, `AuthoredSource`, helper/table identities and the
+same link plan; it owns compiled Rust startup, ordinary module imports, std with
+`panic=abort`, runtime/TLS and process-attach-only DLL initialization. Handoff 4
+extends that same ownership/reference/directory graph for whole-image virtual
+compaction. None of std completeness, a compiled loader, global compaction or
+general frame recovery is delivered by this milestone.

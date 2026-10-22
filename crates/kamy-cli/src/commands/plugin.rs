@@ -51,7 +51,46 @@ fn build(
     linker: &Path,
     scratch: &Path,
 ) -> anyhow::Result<()> {
-    let object = scratch.join("plugin.obj");
+    let ir = scratch.join("plugin.ll");
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let version = Process::new(&rustc)
+        .arg("-vV")
+        .output()
+        .context("querying Rust LLVM version")?;
+    ensure!(
+        version.status.success(),
+        "Rust compiler version query failed"
+    );
+    let version = String::from_utf8(version.stdout).context("Rust version is not UTF-8")?;
+    let llvm_version = version
+        .lines()
+        .find_map(|l| l.strip_prefix("LLVM version: "))
+        .context("rustc did not report its LLVM version")?;
+    let host = version
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .context("rustc did not report its host target")?;
+    let sysroot = Process::new(&rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .context("querying Rust sysroot")?;
+    ensure!(sysroot.status.success(), "Rust sysroot query failed");
+    let sysroot = String::from_utf8(sysroot.stdout).context("Rust sysroot is not UTF-8")?;
+    let tools = std::env::var_os("KAMY_LLVM_TOOLS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(sysroot.trim())
+                .join("lib")
+                .join("rustlib")
+                .join(host)
+                .join("bin")
+        });
+    let llc = tools.join(if cfg!(windows) { "llc.exe" } else { "llc" });
+    ensure!(
+        llc.is_file(),
+        "matching LLVM compiler {} is absent; install rustup component llvm-tools-preview or configure KAMY_LLVM_TOOLS_DIR with rustc-matched LLVM tools",
+        llc.display()
+    );
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let status = Process::new(cargo)
         .args([
@@ -74,16 +113,24 @@ fn build(
             "profile.release.panic=\"abort\"",
             "--",
         ])
-        .arg(format!("--emit=obj={}", object.display()))
-        .args(["-C", "linker-plugin-lto=no"])
+        .arg("--crate-type=staticlib")
+        .arg(format!("--emit=llvm-ir={}", ir.display()))
+        .args([
+            "-C",
+            "linker-plugin-lto=no",
+            "-C",
+            "embed-bitcode=yes",
+            "-C",
+            "lto=fat",
+        ])
         .status()
         .context("running Cargo for Rust SDK plugin")?;
     ensure!(status.success(), "Rust plugin compilation failed: {status}");
     ensure!(
-        object.is_file(),
-        "Cargo did not emit the Rust plugin native object {}",
-        object.display()
+        ir.is_file(),
+        "Cargo did not emit the Rust plugin post-LTO LLVM IR {}",
+        ir.display()
     );
-    kamy_pe::module::build(&[object], output, entry, linker)
+    kamy_pe::module::build_from_llvm_ir(&ir, output, entry, linker, &llc, llvm_version)
         .with_context(|| format!("packaging Rust plugin {}", output.display()))
 }

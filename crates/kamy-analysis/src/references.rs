@@ -2,18 +2,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, ensure};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
-use kamy_core::{Module, Reference, ReferenceKind, RelocKind, Rva, Terminator};
+use kamy_core::{HostReference, Module, ReferenceKind, RelocKind, Rva, Terminator};
 
 #[derive(Debug, Clone, Default)]
 pub struct FunctionReferences {
     pub incoming: Vec<usize>,
     pub outgoing: Vec<usize>,
-    pub unresolved: Vec<Reference>,
+    pub unresolved: Vec<HostReference>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ReferenceModel {
-    pub references: Vec<Reference>,
+    pub references: Vec<HostReference>,
     pub functions: BTreeMap<Rva, FunctionReferences>,
 }
 
@@ -136,7 +136,7 @@ impl Ownership {
 /// instruction boundaries or complete reference recovery (D22).
 pub fn build_reference_model(
     module: &Module,
-    metadata: &[Reference],
+    metadata: &[HostReference],
 ) -> anyhow::Result<ReferenceModel> {
     let ownership = Ownership::build(module).context("validating recovered reference ownership")?;
     let mut references = metadata.to_vec();
@@ -201,7 +201,7 @@ pub fn build_reference_model(
             ))
         };
         if let Some(target) = va_rva(module, value) {
-            references.push(Reference {
+            references.push(HostReference {
                 source: relocation.rva,
                 target,
                 kind: if relocation.kind == RelocKind::Dir64 {
@@ -213,7 +213,7 @@ pub fn build_reference_model(
         }
     }
     if let Some(target) = module.entry_point {
-        references.push(Reference {
+        references.push(HostReference {
             source: Rva::ZERO,
             target,
             kind: ReferenceKind::EntryPoint,
@@ -332,7 +332,7 @@ pub fn build_reference_model(
             ) && !matches!(block.terminator, Terminator::Return)
                 && module.is_executable(block.end)
             {
-                references.push(Reference {
+                references.push(HostReference {
                     source,
                     target: block.end,
                     kind: ReferenceKind::DirectBranch,
@@ -342,7 +342,7 @@ pub fn build_reference_model(
             match &block.terminator {
                 Terminator::Switch { table } => {
                     for &target in &table.entries {
-                        references.push(Reference {
+                        references.push(HostReference {
                             source,
                             target,
                             kind: ReferenceKind::Switch,
@@ -382,7 +382,7 @@ pub fn build_reference_model(
     }
     scan_unclassified(module, &ownership, &merged, &mut references);
     for entry in uncertain {
-        references.push(Reference {
+        references.push(HostReference {
             source: entry,
             target: entry,
             kind: ReferenceKind::Opaque,
@@ -489,13 +489,13 @@ fn collect_instruction(
     instruction: &Instruction,
     source: Rva,
     ownership: Option<&Ownership>,
-    references: &mut Vec<Reference>,
-    mut rva_immediates: Option<&mut Vec<Reference>>,
+    references: &mut Vec<HostReference>,
+    mut rva_immediates: Option<&mut Vec<HostReference>>,
 ) -> bool {
     let opaque = ownership.is_some();
     let accept_target = |target: &Rva| ownership.is_none_or(|owner| owner.owner(*target).is_some());
     if let Some(target) = near_target(module, instruction).filter(accept_target) {
-        references.push(Reference {
+        references.push(HostReference {
             source,
             target,
             kind: if opaque {
@@ -518,7 +518,7 @@ fn collect_instruction(
     {
         let rip_relative = instruction.is_ip_rel_memory_operand();
         if rip_relative || module.is_executable(target) {
-            references.push(Reference {
+            references.push(HostReference {
                 source,
                 target,
                 kind: if opaque
@@ -552,7 +552,7 @@ fn collect_instruction(
                 .filter(|target| module.is_executable(*target))
                 .filter(|_| module.image_base.checked_add(value).is_some())
             {
-                candidates.push(Reference {
+                candidates.push(HostReference {
                     source,
                     target,
                     kind: ReferenceKind::Opaque,
@@ -580,7 +580,7 @@ fn collect_instruction(
                         })
             });
             if opaque || !relocated {
-                references.push(Reference {
+                references.push(HostReference {
                     source,
                     target,
                     kind: ReferenceKind::Opaque,
@@ -595,7 +595,7 @@ fn scan_unclassified(
     module: &Module,
     ownership: &Ownership,
     classified: &[Interval],
-    references: &mut Vec<Reference>,
+    references: &mut Vec<HostReference>,
 ) {
     for section in &module.sections {
         let len = section.data.len().min(section.virtual_size as usize);
@@ -637,7 +637,7 @@ fn scan_unclassified(
                     )))
                 };
                 if let Some(target) = target.filter(|&target| ownership.owner(target).is_some()) {
-                    references.push(Reference {
+                    references.push(HostReference {
                         source,
                         target,
                         kind: ReferenceKind::Opaque,
@@ -665,7 +665,7 @@ fn scan_unclassified(
     }
 }
 
-fn reference_key(reference: &Reference) -> (Rva, Rva, u8) {
+fn reference_key(reference: &HostReference) -> (Rva, Rva, u8) {
     let kind = match reference.kind {
         ReferenceKind::DirectBranch => 0,
         ReferenceKind::RipRelative => 1,
@@ -739,8 +739,8 @@ mod tests {
         }
     }
 
-    fn reference(source: u32, target: u32, kind: ReferenceKind) -> Reference {
-        Reference {
+    fn reference(source: u32, target: u32, kind: ReferenceKind) -> HostReference {
+        HostReference {
             source: Rva::new(source),
             target: Rva::new(target),
             kind,

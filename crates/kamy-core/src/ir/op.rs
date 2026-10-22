@@ -3,6 +3,7 @@ use super::phys::PhysReg;
 #[derive(Clone, Debug)]
 pub struct NativeInst {
     pub bytes: Vec<u8>,
+    pub references: Vec<crate::OperandReference>,
     pub reads: Vec<PhysReg>,
     pub writes: Vec<PhysReg>,
 }
@@ -11,10 +12,7 @@ pub struct NativeInst {
 pub enum IrOp {
     // --- constants ---
     Const(u64),
-    /// Absolute VA of a RIP-relative data reference; lowered to a
-    /// position-independent `lea reg, [rip+disp]` whose displacement the encoder
-    /// recomputes for the relocated code.
-    RipAddr(u64),
+    Address(crate::Reference),
     Undef,
 
     // --- data flow ---
@@ -27,12 +25,25 @@ pub enum IrOp {
     Add,
     Sub,
     Neg,
+    /// Binary low product, or unary RAX low-result projection of the high
+    /// product in `args[0]`, before any instruction overwrites that result.
     Mul,
+    /// Unsigned high half of a 2N-bit product. The first N-bit input occupies
+    /// RAX and the result RDX; both physical registers are clobbered.
     UMulHi,
+    /// Signed high product with the same physical contract as [`IrOp::UMulHi`].
     SMulHi,
+    /// Divide the concatenation `[high, low]` by `divisor`, all N-bit values.
+    /// Inputs high/low occupy RDX/RAX; quotient occupies RAX. Division by zero
+    /// and an unrepresentable N-bit quotient fault, even if the result is dead.
     UDiv,
+    /// Signed 2N-bit dividend and N-bit divisor, truncated toward zero, with
+    /// the same physical and fault contract as [`IrOp::UDiv`].
     SDiv,
+    /// RDX remainder projection of the matching division in `args[0]`.
+    /// It MUST precede any instruction that overwrites that physical result.
     URem,
+    /// RDX projection of [`IrOp::SDiv`]; nonzero remainder has dividend's sign.
     SRem,
 
     // --- bitwise ---
@@ -94,9 +105,15 @@ pub enum IrOp {
     Use,
     // --- call ---
     Call {
-        target: u64,
+        target: crate::Reference,
+        clobbers: Vec<PhysReg>,
     },
     /// Indirect call; `args[0]` is the target address, `args[1..]` the ABI
     /// argument values. Lowered to `call reg`.
-    CallIndirect,
+    CallIndirect {
+        clobbers: Vec<PhysReg>,
+    },
+    CallResult {
+        register: PhysReg,
+    },
 }

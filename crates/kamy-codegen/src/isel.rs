@@ -385,7 +385,10 @@ fn block_order(func: &IrFunction) -> Vec<BlockId> {
                 stack.push(*not_taken);
                 stack.push(*taken);
             }
-            IrTerminator::Ret | IrTerminator::Tail { .. } | IrTerminator::Unreachable => {}
+            IrTerminator::Ret
+            | IrTerminator::NoReturn
+            | IrTerminator::Tail { .. }
+            | IrTerminator::Unreachable => {}
         }
     }
     order
@@ -500,10 +503,11 @@ pub fn select_instructions(
     _entry_va: u64,
     callee_saved_used: &[Register],
     callee_saved_xmms: &[Register],
-) -> Vec<Instruction> {
+) -> crate::references::SelectedInstructions {
     let order = block_order(func);
     let folded_constants = folded_rsp_constants(func, alloc);
     let mut out: Vec<Instruction> = Vec::new();
+    let mut references = Vec::new();
     let mut block_labels: HashMap<BlockId, u64> = HashMap::new();
     for (bi, &bid) in order.iter().enumerate() {
         block_labels.insert(bid, LABEL_BASE + (bi as u64) * 0x1000);
@@ -567,7 +571,7 @@ pub fn select_instructions(
                     .dest
                     .is_some_and(|dest| folded_constants.contains(&dest))
             {
-                select_inst(func, alloc, inst, &block_labels, &mut out);
+                select_inst(func, alloc, inst, &block_labels, &mut out, &mut references);
             }
         }
 
@@ -597,10 +601,11 @@ pub fn select_instructions(
             &mut landings,
             &mut next_landing,
             &mut out,
+            &mut references,
         );
 
-        // Every block emits at least a terminator; stamp its first instruction
-        // with the block label so branches here resolve.
+        // NoReturn blocks contain their terminating call; other blocks emit a
+        // terminator, so every block has an instruction to carry its label.
         out[block_start].set_ip(block_labels[&bid]);
     }
 
@@ -615,7 +620,10 @@ pub fn select_instructions(
         out[start].set_ip(label);
     }
 
-    out
+    crate::references::SelectedInstructions {
+        instructions: out,
+        references,
+    }
 }
 
 fn select_inst(
@@ -624,6 +632,7 @@ fn select_inst(
     inst: &kamy_core::ir::Inst,
     _block_labels: &HashMap<BlockId, u64>,
     out: &mut Vec<Instruction>,
+    references: &mut Vec<crate::references::InstructionReference>,
 ) {
     let ty = inst.ty;
 
@@ -674,17 +683,44 @@ fn select_inst(
             }
         }
 
-        IrOp::RipAddr(target) => {
+        IrOp::Address(reference) => {
             let dest = inst.dest.unwrap();
-            let dest_reg = reg_of(alloc, dest, IrType::I64);
-            let mut lea = Instruction::with2(
-                Code::Lea_r64_m,
-                dest_reg,
-                MemoryOperand::with_base(Register::RIP),
-            )
-            .unwrap();
-            lea.set_memory_displacement64(*target);
-            out.push(lea);
+            let dest_reg = reg_of(alloc, dest, ty);
+            let instruction = out.len();
+            let operand = if matches!(
+                reference.expression,
+                kamy_core::SymbolicExpression::Symbol { .. }
+            ) {
+                out.push(
+                    Instruction::with2(
+                        Code::Lea_r64_m,
+                        reg_of(alloc, dest, IrType::I64),
+                        MemoryOperand::with_base(Register::RIP),
+                    )
+                    .unwrap(),
+                );
+                1
+            } else {
+                match ty {
+                    IrType::I32 => {
+                        out.push(Instruction::with2(Code::Mov_r32_imm32, dest_reg, 0u32).unwrap())
+                    }
+                    _ => out.push(
+                        Instruction::with2(
+                            Code::Mov_r64_imm64,
+                            reg_of(alloc, dest, IrType::I64),
+                            0u64,
+                        )
+                        .unwrap(),
+                    ),
+                }
+                1
+            };
+            references.push(crate::references::InstructionReference {
+                instruction,
+                operand,
+                reference: reference.clone(),
+            });
         }
 
         IrOp::Copy => {
@@ -849,22 +885,34 @@ fn select_inst(
         }
 
         IrOp::Mul => {
+            if inst.args.len() == 1 {
+                assert_eq!(
+                    reg_of(alloc, inst.dest.unwrap(), ty),
+                    gpr_register(Gpr::Rax, ty)
+                );
+                return;
+            }
             let dest = inst.dest.unwrap();
             let lhs = inst.args[0];
             let rhs = inst.args[1];
-            let dest_reg = reg_of(alloc, dest, ty);
-            let lhs_reg = reg_of(alloc, lhs, ty);
-            let rhs_reg = reg_of(alloc, rhs, ty);
-            let code = match ty {
+            let machine_ty = if ty == IrType::I8 { IrType::I32 } else { ty };
+            let dest_reg = reg_of(alloc, dest, machine_ty);
+            let lhs_reg = reg_of(alloc, lhs, machine_ty);
+            let rhs_reg = reg_of(alloc, rhs, machine_ty);
+            let code = match machine_ty {
                 IrType::I64 | IrType::I128 => Code::Imul_r64_rm64,
                 IrType::I32 => Code::Imul_r32_rm32,
                 IrType::I16 => Code::Imul_r16_rm16,
-                _ => Code::Imul_r32_rm32,
+                IrType::I8 => unreachable!(),
             };
-            if dest_reg != lhs_reg {
-                out.push(Instruction::with2(mov_code(ty), dest_reg, lhs_reg).unwrap());
+            if dest_reg == rhs_reg {
+                out.push(Instruction::with2(code, dest_reg, lhs_reg).unwrap());
+            } else {
+                if dest_reg != lhs_reg {
+                    out.push(Instruction::with2(mov_code(machine_ty), dest_reg, lhs_reg).unwrap());
+                }
+                out.push(Instruction::with2(code, dest_reg, rhs_reg).unwrap());
             }
-            out.push(Instruction::with2(code, dest_reg, rhs_reg).unwrap());
         }
 
         IrOp::Load => {
@@ -1007,20 +1055,34 @@ fn select_inst(
             out.push(Instruction::with2(cmov_code, dest_reg, true_reg).unwrap());
         }
 
-        IrOp::Call { target } => {
-            out.push(Instruction::with_branch(Code::Call_rel32_64, *target).unwrap());
+        IrOp::Call { target, .. } => {
+            references.push(crate::references::InstructionReference {
+                instruction: out.len(),
+                operand: 0,
+                reference: target.clone(),
+            });
+            out.push(Instruction::with_branch(Code::Call_rel32_64, 0).unwrap());
         }
 
-        IrOp::CallIndirect => {
+        IrOp::CallIndirect { .. } => {
             let target_reg = reg_of(alloc, inst.args[0], IrType::I64);
             out.push(Instruction::with1(Code::Call_rm64, target_reg).unwrap());
         }
 
         IrOp::NativeInline(native) => {
+            references.extend(native.references.iter().map(|reference| {
+                crate::references::InstructionReference {
+                    instruction: out.len(),
+                    operand: reference.operand,
+                    reference: reference.reference.clone(),
+                }
+            }));
             let mut decoder = Decoder::new(64, &native.bytes, DecoderOptions::NONE);
-            for instr in &mut decoder {
-                out.push(instr);
-            }
+            out.push(decoder.decode());
+            assert!(
+                !decoder.can_decode(),
+                "NativeInline must contain one instruction"
+            );
         }
 
         IrOp::Mov128 => {
@@ -1150,13 +1212,68 @@ fn select_inst(
             out.push(Instruction::with2(code, dest_reg, src_reg).unwrap());
         }
 
-        IrOp::UDiv | IrOp::SDiv | IrOp::URem | IrOp::SRem | IrOp::UMulHi | IrOp::SMulHi => {
-            let dest = inst.dest.unwrap();
-            let dest_reg = reg_of(alloc, dest, ty);
-            out.push(Instruction::with2(mov_code(ty), dest_reg, dest_reg).unwrap());
+        IrOp::UDiv | IrOp::SDiv => {
+            assert_eq!(reg_of(alloc, inst.args[0], ty), gpr_register(Gpr::Rdx, ty));
+            assert_eq!(reg_of(alloc, inst.args[1], ty), gpr_register(Gpr::Rax, ty));
+            assert_eq!(
+                reg_of(alloc, inst.dest.unwrap(), ty),
+                gpr_register(Gpr::Rax, ty)
+            );
+            let divisor = reg_of(alloc, inst.args[2], ty);
+            let signed = matches!(inst.op, IrOp::SDiv);
+            let code = match (signed, ty) {
+                (false, IrType::I8) => Code::Div_rm8,
+                (false, IrType::I16) => Code::Div_rm16,
+                (false, IrType::I32) => Code::Div_rm32,
+                (false, IrType::I64) => Code::Div_rm64,
+                (true, IrType::I8) => Code::Idiv_rm8,
+                (true, IrType::I16) => Code::Idiv_rm16,
+                (true, IrType::I32) => Code::Idiv_rm32,
+                (true, IrType::I64) => Code::Idiv_rm64,
+                (_, IrType::I128) => unreachable!("arithmetic width preflight"),
+            };
+            if ty == IrType::I8 {
+                out.push(Instruction::with2(Code::Mov_r8_rm8, Register::AH, Register::DL).unwrap());
+            }
+            out.push(Instruction::with1(code, divisor).unwrap());
+            if ty == IrType::I8 {
+                // AH cannot be encoded with a REX-register destination.
+                out.push(Instruction::with2(Code::Mov_r8_rm8, Register::DL, Register::AH).unwrap());
+            }
         }
 
-        IrOp::Undef | IrOp::Use => {}
+        IrOp::URem | IrOp::SRem => {
+            assert_eq!(
+                reg_of(alloc, inst.dest.unwrap(), ty),
+                gpr_register(Gpr::Rdx, ty)
+            );
+        }
+
+        IrOp::UMulHi | IrOp::SMulHi => {
+            assert_eq!(reg_of(alloc, inst.args[0], ty), gpr_register(Gpr::Rax, ty));
+            assert_eq!(
+                reg_of(alloc, inst.dest.unwrap(), ty),
+                gpr_register(Gpr::Rdx, ty)
+            );
+            let signed = matches!(inst.op, IrOp::SMulHi);
+            let code = match (signed, ty) {
+                (false, IrType::I8) => Code::Mul_rm8,
+                (false, IrType::I16) => Code::Mul_rm16,
+                (false, IrType::I32) => Code::Mul_rm32,
+                (false, IrType::I64) => Code::Mul_rm64,
+                (true, IrType::I8) => Code::Imul_rm8,
+                (true, IrType::I16) => Code::Imul_rm16,
+                (true, IrType::I32) => Code::Imul_rm32,
+                (true, IrType::I64) => Code::Imul_rm64,
+                (_, IrType::I128) => unreachable!("arithmetic width preflight"),
+            };
+            out.push(Instruction::with1(code, reg_of(alloc, inst.args[1], ty)).unwrap());
+            if ty == IrType::I8 {
+                out.push(Instruction::with2(Code::Mov_r8_rm8, Register::DL, Register::AH).unwrap());
+            }
+        }
+
+        IrOp::Undef | IrOp::Use | IrOp::CallResult { .. } => {}
     }
 }
 
@@ -1202,13 +1319,19 @@ fn select_terminator(
     landings: &mut Vec<(u64, BlockId, BlockId)>,
     next_landing: &mut u64,
     out: &mut Vec<Instruction>,
+    references: &mut Vec<crate::references::InstructionReference>,
 ) {
     match term {
         IrTerminator::Ret => {
             out.push(Instruction::with(Code::Retnq));
         }
         IrTerminator::Tail { target } => {
-            out.push(Instruction::with_branch(Code::Jmp_rel32_64, *target).unwrap());
+            references.push(crate::references::InstructionReference {
+                instruction: out.len(),
+                operand: 0,
+                reference: target.clone(),
+            });
+            out.push(Instruction::with_branch(Code::Jmp_rel32_64, 0).unwrap());
         }
         IrTerminator::Jump(target) => {
             // Single successor: no critical edge, emit the phi copies inline.
@@ -1262,6 +1385,7 @@ fn select_terminator(
         IrTerminator::Unreachable => {
             out.push(Instruction::with(Code::Int3));
         }
+        IrTerminator::NoReturn => {}
     }
 }
 
@@ -1269,6 +1393,545 @@ fn select_terminator(
 mod tests {
     use super::*;
     use kamy_core::ir::*;
+
+    fn arithmetic_fixture(
+        ty: IrType,
+        op: IrOp,
+        sources: &[Gpr],
+        remainder: bool,
+    ) -> (IrFunction, RegAllocation, Vec<ValueId>) {
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let mut insts = Vec::new();
+        let mut pins = HashMap::new();
+        let mut inputs = Vec::new();
+        for &gpr in sources {
+            let value = func.alloc_value();
+            insts.push(Inst {
+                dest: Some(value),
+                op: IrOp::Undef,
+                args: vec![],
+                ty,
+            });
+            pins.insert(value, PhysReg::Gpr(gpr));
+            inputs.push(value);
+        }
+        let mut snapshots = Vec::new();
+        for input in inputs {
+            let value = func.alloc_value();
+            insts.push(Inst {
+                dest: Some(value),
+                op: IrOp::Copy,
+                args: vec![input],
+                ty,
+            });
+            snapshots.push(value);
+        }
+        let division = matches!(op, IrOp::UDiv | IrOp::SDiv);
+        let fixed = if division {
+            &[Gpr::Rdx, Gpr::Rax][..]
+        } else {
+            &[Gpr::Rax][..]
+        };
+        for (index, &gpr) in fixed.iter().enumerate() {
+            let value = func.alloc_value();
+            insts.push(Inst {
+                dest: Some(value),
+                op: IrOp::Copy,
+                args: vec![snapshots[index]],
+                ty,
+            });
+            pins.insert(value, PhysReg::Gpr(gpr));
+            snapshots[index] = value;
+        }
+        let result = func.alloc_value();
+        insts.push(Inst {
+            dest: Some(result),
+            op: op.clone(),
+            args: snapshots,
+            ty,
+        });
+        pins.insert(
+            result,
+            PhysReg::Gpr(if division { Gpr::Rax } else { Gpr::Rdx }),
+        );
+        let mut results = vec![result];
+        if remainder {
+            let value = func.alloc_value();
+            insts.push(Inst {
+                dest: Some(value),
+                op: if matches!(op, IrOp::SDiv) {
+                    IrOp::SRem
+                } else {
+                    IrOp::URem
+                },
+                args: vec![result],
+                ty,
+            });
+            pins.insert(value, PhysReg::Gpr(Gpr::Rdx));
+            results.push(value);
+        }
+        if !division {
+            let value = func.alloc_value();
+            insts.push(Inst {
+                dest: Some(value),
+                op: IrOp::Mul,
+                args: vec![result],
+                ty,
+            });
+            pins.insert(value, PhysReg::Gpr(Gpr::Rax));
+            results.push(value);
+        }
+        let mut outputs = Vec::new();
+        for result in results {
+            let value = func.alloc_value();
+            insts.push(Inst {
+                dest: Some(value),
+                op: IrOp::Copy,
+                args: vec![result],
+                ty,
+            });
+            outputs.push(value);
+        }
+        insts.push(Inst {
+            dest: None,
+            op: IrOp::Use,
+            args: outputs.clone(),
+            ty,
+        });
+        func.blocks.push(IrBlock {
+            id: BlockId(0),
+            phis: vec![],
+            insts,
+            term: IrTerminator::Ret,
+        });
+        let alloc =
+            crate::allocate_registers(&func, &crate::CALLEE_SAVED_GPRS, &HashSet::new(), &pins)
+                .unwrap();
+        (func, alloc, outputs)
+    }
+
+    fn arithmetic_register(register: Register) -> (usize, u32, u32) {
+        let full = register.full_register();
+        let index = [
+            Register::RAX,
+            Register::RCX,
+            Register::RDX,
+            Register::RBX,
+            Register::RSP,
+            Register::RBP,
+            Register::RSI,
+            Register::RDI,
+            Register::R8,
+            Register::R9,
+            Register::R10,
+            Register::R11,
+            Register::R12,
+            Register::R13,
+            Register::R14,
+            Register::R15,
+        ]
+        .iter()
+        .position(|&candidate| candidate == full)
+        .unwrap();
+        (
+            index,
+            register.size() as u32 * 8,
+            if register == Register::AH { 8 } else { 0 },
+        )
+    }
+
+    fn arithmetic_read(regs: &[u64; 16], register: Register) -> u64 {
+        let (index, bits, shift) = arithmetic_register(register);
+        (regs[index] >> shift) & (u64::MAX >> (64 - bits))
+    }
+
+    fn arithmetic_write(regs: &mut [u64; 16], register: Register, value: u64) {
+        let (index, bits, shift) = arithmetic_register(register);
+        let mask = u64::MAX >> (64 - bits);
+        if bits >= 32 {
+            regs[index] = value & mask;
+        } else {
+            regs[index] = (regs[index] & !(mask << shift)) | ((value & mask) << shift);
+        }
+    }
+
+    fn execute_arithmetic(
+        instructions: &[Instruction],
+        regs: &mut [u64; 16],
+    ) -> Result<(), &'static str> {
+        use iced_x86::Mnemonic;
+        for inst in instructions {
+            match inst.mnemonic() {
+                Mnemonic::Mov => {
+                    let value = arithmetic_read(regs, inst.op1_register());
+                    arithmetic_write(regs, inst.op0_register(), value);
+                }
+                Mnemonic::Div | Mnemonic::Idiv | Mnemonic::Mul | Mnemonic::Imul => {
+                    let source = inst.op0_register();
+                    let bits = source.size() as u32 * 8;
+                    let mask = u64::MAX >> (64 - bits);
+                    let low_reg = gpr_register(
+                        Gpr::Rax,
+                        match bits {
+                            8 => IrType::I8,
+                            16 => IrType::I16,
+                            32 => IrType::I32,
+                            64 => IrType::I64,
+                            _ => unreachable!(),
+                        },
+                    );
+                    let high_reg = if bits == 8 {
+                        Register::AH
+                    } else {
+                        gpr_register(
+                            Gpr::Rdx,
+                            match bits {
+                                16 => IrType::I16,
+                                32 => IrType::I32,
+                                64 => IrType::I64,
+                                _ => unreachable!(),
+                            },
+                        )
+                    };
+                    let low = arithmetic_read(regs, low_reg);
+                    let source = arithmetic_read(regs, source);
+                    let signed = |value: u64| (i128::from(value) << (128 - bits)) >> (128 - bits);
+                    let (lo, hi) = if matches!(inst.mnemonic(), Mnemonic::Mul | Mnemonic::Imul) {
+                        let product = if inst.mnemonic() == Mnemonic::Imul {
+                            (signed(low) * signed(source)) as u128
+                        } else {
+                            u128::from(low) * u128::from(source)
+                        };
+                        (product as u64, (product >> bits) as u64)
+                    } else {
+                        if source == 0 {
+                            return Err("divide by zero");
+                        }
+                        let dividend =
+                            (u128::from(arithmetic_read(regs, high_reg)) << bits) | u128::from(low);
+                        if inst.mnemonic() == Mnemonic::Idiv {
+                            let dividend = if bits == 64 {
+                                dividend as i128
+                            } else {
+                                ((dividend << (128 - 2 * bits)) as i128) >> (128 - 2 * bits)
+                            };
+                            let divisor = signed(source);
+                            let quotient =
+                                dividend.checked_div(divisor).ok_or("quotient overflow")?;
+                            if quotient < -(1i128 << (bits - 1))
+                                || quotient >= (1i128 << (bits - 1))
+                            {
+                                return Err("quotient overflow");
+                            }
+                            (quotient as u64, (dividend % divisor) as u64)
+                        } else {
+                            let quotient = dividend / u128::from(source);
+                            if quotient > u128::from(mask) {
+                                return Err("quotient overflow");
+                            }
+                            (quotient as u64, (dividend % u128::from(source)) as u64)
+                        }
+                    };
+                    arithmetic_write(regs, low_reg, lo);
+                    arithmetic_write(regs, high_reg, hi);
+                }
+                Mnemonic::Ret => {}
+                other => panic!("unexpected arithmetic fixture instruction {other:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn emitted_division_handles_widths_remainders_and_fixed_register_cycles() {
+        use iced_x86::Mnemonic;
+        for ty in [IrType::I8, IrType::I16, IrType::I32, IrType::I64] {
+            let bits = ty.bits();
+            let mask = u64::MAX >> (64 - bits);
+            for sources in [
+                [Gpr::Rax, Gpr::Rdx, Gpr::Rcx],
+                [Gpr::Rcx, Gpr::Rdx, Gpr::Rax],
+                [Gpr::Rax, Gpr::Rcx, Gpr::Rdx],
+                [Gpr::Rdx, Gpr::R10, Gpr::R8],
+            ] {
+                for signed in [false, true] {
+                    let (func, alloc, outputs) = arithmetic_fixture(
+                        ty,
+                        if signed { IrOp::SDiv } else { IrOp::UDiv },
+                        &sources,
+                        true,
+                    );
+                    let selected = select_for_test(&func, &alloc, 0, 0, &[], &[]);
+                    assert_eq!(
+                        selected
+                            .iter()
+                            .filter(|inst| matches!(
+                                inst.mnemonic(),
+                                Mnemonic::Div | Mnemonic::Idiv
+                            ))
+                            .count(),
+                        1
+                    );
+                    let encoded = crate::relocate(&selected, 0x1000).unwrap();
+                    let decoded: Vec<_> =
+                        Decoder::with_ip(64, &encoded, 0x1000, DecoderOptions::NONE)
+                            .into_iter()
+                            .collect();
+                    for (high, low, divisor, expected) in if signed {
+                        vec![
+                            (
+                                mask,
+                                mask - 99,
+                                7,
+                                Ok(((-14i64) as u64 & mask, (-2i64) as u64 & mask)),
+                            ),
+                            (0, 100, mask - 6, Ok(((-14i64) as u64 & mask, 2))),
+                            (0, 1, 0, Err("divide by zero")),
+                            (mask, 1u64 << (bits - 1), mask, Err("quotient overflow")),
+                        ]
+                    } else {
+                        vec![
+                            (0, mask, 3, Ok((mask / 3, mask % 3))),
+                            (
+                                1,
+                                0,
+                                3,
+                                Ok((((1u128 << bits) / 3) as u64, ((1u128 << bits) % 3) as u64)),
+                            ),
+                            (0, 1, 0, Err("divide by zero")),
+                            (3, 0, 3, Err("quotient overflow")),
+                        ]
+                    } {
+                        let mut regs = [0xfeed_beef_cafe_babe; 16];
+                        for (source, value) in sources.into_iter().zip([high, low, divisor]) {
+                            regs[source.index()] = value;
+                        }
+                        let actual = execute_arithmetic(&decoded, &mut regs).map(|()| {
+                            (
+                                arithmetic_read(&regs, reg_of(&alloc, outputs[0], ty)),
+                                arithmetic_read(&regs, reg_of(&alloc, outputs[1], ty)),
+                            )
+                        });
+                        assert_eq!(
+                            actual, expected,
+                            "{ty:?} signed={signed} sources={sources:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emitted_high_products_preserve_signed_and_unsigned_high_halves() {
+        for ty in [IrType::I8, IrType::I16, IrType::I32, IrType::I64] {
+            let bits = ty.bits();
+            let mask = u64::MAX >> (64 - bits);
+            for signed in [false, true] {
+                let (func, alloc, outputs) = arithmetic_fixture(
+                    ty,
+                    if signed { IrOp::SMulHi } else { IrOp::UMulHi },
+                    &[Gpr::Rdx, Gpr::Rax],
+                    false,
+                );
+                let selected = select_for_test(&func, &alloc, 0, 0, &[], &[]);
+                assert_eq!(
+                    selected
+                        .iter()
+                        .filter(|inst| matches!(
+                            inst.mnemonic(),
+                            iced_x86::Mnemonic::Mul | iced_x86::Mnemonic::Imul
+                        ))
+                        .count(),
+                    1
+                );
+                let encoded = crate::relocate(&selected, 0x1000).unwrap();
+                let decoded: Vec<_> = Decoder::with_ip(64, &encoded, 0x1000, DecoderOptions::NONE)
+                    .into_iter()
+                    .collect();
+                for (left, right) in [(mask, mask), (mask, 2), (1u64 << (bits - 1), 2), (0, mask)] {
+                    let mut regs = [0xfeed_beef_cafe_babe; 16];
+                    regs[Gpr::Rdx.index()] = left;
+                    regs[Gpr::Rax.index()] = right;
+                    execute_arithmetic(&decoded, &mut regs).unwrap();
+                    let extend = |value: u64| (i128::from(value) << (128 - bits)) >> (128 - bits);
+                    let product = if signed {
+                        (extend(left) * extend(right)) as u128
+                    } else {
+                        u128::from(left) * u128::from(right)
+                    };
+                    assert_eq!(
+                        arithmetic_read(&regs, reg_of(&alloc, outputs[0], ty)),
+                        ((product >> bits) as u64) & mask,
+                        "{ty:?} signed={signed}"
+                    );
+                    assert_eq!(
+                        arithmetic_read(&regs, reg_of(&alloc, outputs[1], ty)),
+                        product as u64 & mask,
+                        "{ty:?} signed={signed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_aggregate_pic_binds_only_declared_operand_and_checks_range() {
+        use kamy_core::{
+            LinkField, OperandReference, Reference, ReferenceOrigin, Rva, SymbolId,
+            SymbolicExpression,
+        };
+        let bytes = [
+            0x48, 0x8b, 0x42, 0x10, 0x48, 0x83, 0xc0, 7, 0xf3, 0x0f, 0x6f, 0x02, 0x66, 0x0f, 0xd4,
+            0x05, 0xec, 0x0f, 0, 0, 0xf3, 0x0f, 0x7f, 0x01, 0x48, 0x89, 0x41, 0x10, 0xc3,
+        ];
+        let source = SymbolId::Authored {
+            module: "aggregate".into(),
+            symbol: "helper".into(),
+        };
+        let target = SymbolId::Authored {
+            module: "aggregate".into(),
+            symbol: "coff:0:section:7:piece:0".into(),
+        };
+        let reference = Reference {
+            source,
+            offset: 16,
+            expression: SymbolicExpression::symbol(target.clone()),
+            field: LinkField::Relative32 { bias: 0 },
+            origin: ReferenceOrigin::Authored,
+        };
+        let native = Inst {
+            dest: None,
+            op: IrOp::NativeInline(NativeInst {
+                bytes: bytes[12..20].to_vec(),
+                references: vec![OperandReference {
+                    instruction: Rva::new(0x100c),
+                    operand: 1,
+                    reference: reference.clone(),
+                }],
+                reads: vec![PhysReg::Xmm(XmmReg::Xmm0)],
+                writes: vec![PhysReg::Xmm(XmmReg::Xmm0)],
+            }),
+            args: vec![],
+            ty: IrType::I128,
+        };
+        let func = IrFunction {
+            entry: BlockId(0),
+            blocks: vec![],
+            next_value: 0,
+        };
+        let alloc = RegAllocation {
+            assignments: HashMap::new(),
+            copies: vec![],
+            edge_copies: HashMap::new(),
+            flag_scratch: None,
+        };
+        let mut selected = crate::SelectedInstructions::default();
+        selected.instructions.extend(Decoder::with_ip(
+            64,
+            &bytes[..12],
+            0x1000,
+            DecoderOptions::NONE,
+        ));
+        select_inst(
+            &func,
+            &alloc,
+            &native,
+            &HashMap::new(),
+            &mut selected.instructions,
+            &mut selected.references,
+        );
+        selected.instructions.extend(Decoder::with_ip(
+            64,
+            &bytes[20..],
+            0x1014,
+            DecoderOptions::NONE,
+        ));
+        let literal = 0x2000u64;
+        selected
+            .instructions
+            .push(Instruction::with2(Code::Mov_r64_imm64, Register::R10, literal).unwrap());
+        selected
+            .instructions
+            .push(Decoder::with_ip(64, &bytes[12..20], 0x100c, DecoderOptions::NONE).decode());
+        assert_eq!(selected.references.len(), 1);
+        assert_eq!(selected.references[0].reference, reference);
+        crate::bind_references(&mut selected, 0, |symbol| {
+            (symbol == &target).then_some(0x9000)
+        })
+        .unwrap();
+        let encoded = crate::relocate(&selected.instructions, 0x4000).unwrap();
+        let decoded: Vec<_> = Decoder::with_ip(64, &encoded, 0x4000, DecoderOptions::NONE)
+            .into_iter()
+            .collect();
+        assert_eq!(decoded[3].ip_rel_memory_address(), 0x9000);
+        assert_eq!(decoded[7].immediate64(), literal);
+        assert_eq!(decoded[8].ip_rel_memory_address(), literal);
+        crate::bind_references(&mut selected, 0, |_| Some(0x1_0000_0000)).unwrap();
+        assert!(crate::relocate(&selected.instructions, 0x4000).is_err());
+        assert!(crate::bind_references(&mut selected, 0, |_| None).is_err());
+        let mut shuffle = native.clone();
+        let IrOp::NativeInline(payload) = &mut shuffle.op else {
+            unreachable!()
+        };
+        payload.bytes = vec![0x66, 0x0f, 0x70, 0x05, 0xf7, 0x0f, 0, 0, 7];
+        payload.references[0].reference.offset = 4;
+        payload.references[0].reference.field = LinkField::Relative32 { bias: 0 };
+        LinkField::Relative32 { bias: 0 }
+            .encode_into(0x2000 - 1, 0x1004, 0, &mut payload.bytes[4..8])
+            .unwrap();
+        let original = Decoder::with_ip(64, &payload.bytes, 0x1000, DecoderOptions::NONE).decode();
+        assert_eq!(original.ip_rel_memory_address(), 0x2000);
+        let mut selected = crate::SelectedInstructions::default();
+        select_inst(
+            &func,
+            &alloc,
+            &shuffle,
+            &HashMap::new(),
+            &mut selected.instructions,
+            &mut selected.references,
+        );
+        crate::bind_references(&mut selected, 0, |_| Some(0x9000)).unwrap();
+        let encoded = crate::relocate(&selected.instructions, 0x4000).unwrap();
+        let decoded = Decoder::with_ip(64, &encoded, 0x4000, DecoderOptions::NONE).decode();
+        assert_eq!(decoded.ip_rel_memory_address(), 0x9000);
+        assert_eq!(decoded.immediate8(), 7);
+    }
+
+    fn host_reference(target: u64) -> kamy_core::Reference {
+        kamy_core::Reference {
+            source: kamy_core::SymbolId::Host {
+                rva: kamy_core::Rva::new(0x1000),
+            },
+            offset: 0,
+            expression: kamy_core::SymbolicExpression::symbol(kamy_core::SymbolId::Host {
+                rva: kamy_core::Rva::new(u32::try_from(target - 0x140000000).unwrap()),
+            }),
+            field: kamy_core::LinkField::Relative32 { bias: 0 },
+            origin: kamy_core::ReferenceOrigin::HostAnalysis,
+        }
+    }
+
+    fn select_for_test(
+        func: &IrFunction,
+        alloc: &RegAllocation,
+        image_base: u64,
+        entry_va: u64,
+        saved: &[Register],
+        xmms: &[Register],
+    ) -> Vec<Instruction> {
+        let mut selected = select_instructions(func, alloc, image_base, entry_va, saved, xmms);
+        crate::bind_references(&mut selected, image_base, |symbol| match symbol {
+            kamy_core::SymbolId::Host { rva } => image_base.checked_add(u64::from(rva.get())),
+            _ => None,
+        })
+        .unwrap();
+        selected.instructions
+    }
 
     #[test]
     fn rsp_constant_folding_preserves_live_uses_and_immediate_boundaries() {
@@ -1311,7 +1974,7 @@ mod tests {
                         term: IrTerminator::Ret,
                     }],
                 };
-                let instrs = select_instructions(&func, &alloc, 0, 0, &[], &[]);
+                let instrs = select_for_test(&func, &alloc, 0, 0, &[], &[]);
                 assert_eq!(instrs.len(), 2);
                 let code = crate::relocate(&instrs, 0x1000).unwrap();
                 let decoded = Decoder::with_ip(64, &code, 0x1000, DecoderOptions::NONE).decode();
@@ -1393,7 +2056,7 @@ mod tests {
             flag_scratch: None,
         };
 
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
+        let instrs = select_for_test(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
 
         assert!(!instrs.is_empty());
 
@@ -1492,7 +2155,7 @@ mod tests {
             flag_scratch: None,
         };
 
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
+        let instrs = select_for_test(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
 
         // The exact gate the linker hit: BlockEncoder must accept every instruction.
         let bytes = crate::relocate(&instrs, 0x140001000).expect("xmm moves must encode");
@@ -1554,7 +2217,7 @@ mod tests {
             flag_scratch: None,
         };
 
-        let instrs = select_instructions(
+        let instrs = select_for_test(
             &func,
             &alloc,
             0x140000000,
@@ -1615,7 +2278,7 @@ mod tests {
             flag_scratch: None,
         };
 
-        let instrs = select_instructions(
+        let instrs = select_for_test(
             &func,
             &alloc,
             0x140000000,
@@ -1711,7 +2374,7 @@ mod tests {
             &HashMap::new(),
         )
         .unwrap();
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
+        let instrs = select_for_test(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
         // Intra-function branch targets must resolve to in-block instructions.
         crate::relocate(&instrs, 0x140001000).expect("branches resolve");
         let mnemonics: Vec<iced_x86::Mnemonic> = instrs.iter().map(|i| i.mnemonic()).collect();
@@ -1762,7 +2425,7 @@ mod tests {
             edge_copies: HashMap::new(),
             flag_scratch: None,
         };
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
+        let instrs = select_for_test(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
         assert!(
             instrs
                 .iter()
@@ -1843,7 +2506,7 @@ mod tests {
             edge_copies: HashMap::new(),
             flag_scratch: Some(PhysReg::Gpr(Gpr::R11)),
         };
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
+        let instrs = select_for_test(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
         crate::relocate(&instrs, 0x140001000).expect("branch on add flag must encode");
         use iced_x86::Mnemonic;
         let mnemonics: Vec<Mnemonic> = instrs.iter().map(|i| i.mnemonic()).collect();
@@ -1865,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn rip_addr_lowers_to_position_independent_lea() {
+    fn symbolic_address_lowers_to_position_independent_lea() {
         const TARGET: u64 = 0x1_4000_5000;
         let mut func = IrFunction {
             entry: BlockId(0),
@@ -1879,7 +2542,7 @@ mod tests {
             insts: vec![
                 Inst {
                     dest: Some(v0),
-                    op: IrOp::RipAddr(TARGET),
+                    op: IrOp::Address(host_reference(TARGET)),
                     args: vec![],
                     ty: IrType::I64,
                 },
@@ -1899,7 +2562,7 @@ mod tests {
             &HashMap::new(),
         )
         .unwrap();
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x1_4000_2000, &[], &[]);
+        let instrs = select_for_test(&func, &alloc, 0x140000000, 0x1_4000_2000, &[], &[]);
         // Encode at two different VAs; both must still resolve to the same absolute
         // target (position independence).
         for new_va in [0x1_4000_2000u64, 0x1_4000_9000u64] {
@@ -1936,7 +2599,9 @@ mod tests {
                 args: vec![],
                 ty: IrType::I64,
             }],
-            term: IrTerminator::Tail { target: TARGET },
+            term: IrTerminator::Tail {
+                target: host_reference(TARGET),
+            },
         });
 
         let mut assignments = HashMap::new();
@@ -1950,7 +2615,7 @@ mod tests {
 
         // One callee-saved push is odd, so a realign shim is added; the frame must
         // be torn down (realign add + pop) before the tail jmp, and no ret emitted.
-        let instrs = select_instructions(
+        let instrs = select_for_test(
             &func,
             &alloc,
             0x140000000,
@@ -2047,7 +2712,7 @@ mod tests {
             edge_copies: HashMap::new(),
             flag_scratch: None,
         };
-        let instrs = select_instructions(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
+        let instrs = select_for_test(&func, &alloc, 0x140000000, 0x140001000, &[], &[]);
         use iced_x86::{Mnemonic, OpKind};
         let shl = instrs
             .iter()
