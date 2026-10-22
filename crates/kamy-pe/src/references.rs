@@ -418,7 +418,7 @@ impl Collector<'_> {
                 );
             }
             match kind {
-                0 if length == 0 => {}
+                0 | 14 if length == 0 => {}
                 2 => {
                     ensure!(
                         data.starts_with(b"RSDS") || data.starts_with(b"NB10"),
@@ -793,16 +793,55 @@ mod tests {
     }
 
     #[test]
-    fn unknown_address_bearing_debug_payload_is_rejected() {
+    fn empty_iltcg_debug_record_preserves_payload_reference() {
         let mut pe = fixture();
+        let baseline = pe.metadata_references().unwrap();
         pe.data_directories[6] = (0x1200, 28);
-        put32(&mut pe, 0x120c, 1);
-        assert!(
-            pe.metadata_references()
-                .unwrap_err()
-                .to_string()
-                .contains("debug type 1")
-        );
+        put32(&mut pe, 0x120c, 14);
+        assert_eq!(pe.metadata_references().unwrap(), baseline);
+
+        put32(&mut pe, 0x1214, 0x1400);
+        put32(&mut pe, 0x1218, 0x400);
+        let references = pe.metadata_references().unwrap();
+        let mut expected = baseline;
+        expected.push(HostReference {
+            source: Rva::new(0x1214),
+            target: Rva::new(0x1400),
+            kind: ReferenceKind::ImageRelative,
+        });
+        assert_eq!(references, expected);
+    }
+
+    #[test]
+    fn empty_iltcg_debug_record_still_checks_coordinates() {
+        for (payload, file_offset) in [(0, 0x1001), (0x2000, 0), (0x1900, 0x900)] {
+            let mut pe = fixture();
+            pe.sections[0].raw_size = 0x800;
+            pe.data_directories[6] = (0x1200, 28);
+            put32(&mut pe, 0x120c, 14);
+            put32(&mut pe, 0x1214, payload);
+            put32(&mut pe, 0x1218, file_offset);
+            assert!(
+                pe.metadata_references().is_err(),
+                "accepted invalid empty ILTCG coordinates {payload:#x}/{file_offset:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_debug_payloads_remain_rejected() {
+        for (kind, length) in [(1, 0), (1, 4), (14, 4)] {
+            for payload in [0, 0x1400] {
+                let mut pe = fixture();
+                pe.data_directories[6] = (0x1200, 28);
+                put32(&mut pe, 0x120c, kind);
+                put32(&mut pe, 0x1210, length);
+                put32(&mut pe, 0x1214, payload);
+                put32(&mut pe, 0x1218, 0x400);
+                put32(&mut pe, 0x1400, 0x1100);
+                assert!(pe.metadata_references().is_err());
+            }
+        }
     }
 
     #[test]

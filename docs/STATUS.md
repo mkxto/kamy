@@ -732,3 +732,32 @@ same link plan; it owns compiled Rust startup, ordinary module imports, std with
 extends that same ownership/reference/directory graph for whole-image virtual
 compaction. None of std completeness, a compiled loader, global compaction or
 general frame recovery is delivered by this milestone.
+
+## Empty ILTCG debug records
+
+The PE reference collector accepts type 14 (`IMAGE_DEBUG_TYPE_ILTCG`) only
+when its payload size is zero. Existing RVA/file-coordinate checks remain;
+unsupported nonempty payloads still fail closed. Debug rebuilding clears both
+payload pointers for empty records rather than creating an end-of-blob RVA.
+This implements D4/D16/D22/D37/D40 and handoff 1's section 3 directory/file-offset
+contract within the existing single rebuild; no image-base or relocation model
+changes are involved.
+
+Observed verification:
+
+- The reported `HelloWorld.exe` identity protection completes with **11
+  SSA-lowered**, **0 transformed**, **32 rejected**, and no verbatim relocation.
+- Native traced execution exits **0**, prints `Hello World!` followed by CRLF,
+  and has no fault or timeout. Differential verification passes **32 seeded
+  runs** with no exit/stdout/stderr mismatches.
+- The rebuilt image reparses successfully. Its empty type-14 record has zero
+  size, RVA and file pointer; nonempty debug payload RVA/file coordinates agree.
+  The image base is unchanged and all **20 DIR64 fixups** target the image.
+- A portable section-boundary regression failed before the emitter fix because
+  an empty debug record targeted the exclusive section end. It passes after
+  clearing the empty payload pointers.
+- All four workspace gates pass: **314 tests, 41 suites**.
+- Identity corpus: **23/23 PASS**, **1,721/11,202 SSA-lowered**, **9,481
+  rejected**, **0 transformed**, **0 verbatim-relocated**; totals match the
+  preceding recorded campaign result.
+

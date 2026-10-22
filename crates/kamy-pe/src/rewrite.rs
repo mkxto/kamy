@@ -306,6 +306,10 @@ impl PeFile {
         }
         for offset in (0..size as usize).step_by(28) {
             let length = read_u32(&blob, offset + 16)? as usize;
+            if length == 0 {
+                blob[offset + 20..offset + 28].fill(0);
+                continue;
+            }
             let file = read_u32(&blob, offset + 24)? as usize;
             let end = file
                 .checked_add(length)
@@ -996,6 +1000,59 @@ mod tests {
         assert_eq!(pe.u16_at_rva(0x12e4), Some(1));
         assert!(pe.rebase_references(&moved(&[(0x1100, 0x4000)])).is_err());
         assert!(pe.rebase_references(&moved(&[(0x1180, 0x4100)])).is_err());
+    }
+
+    #[test]
+    fn empty_debug_record_at_aligned_section_end_has_no_payload_reference() {
+        let mut pe = fixture();
+        directory(&mut pe, 6, 0x1500, 56);
+        put32(&mut pe, 0x150c, 2);
+        put32(&mut pe, 0x1510, 0x200 - 56);
+        put32(&mut pe, 0x1514, 0x1700);
+        let file = pe.patch_offset(0x1700, 0x200 - 56).unwrap();
+        put32(&mut pe, 0x1518, file as u32);
+        pe.bytes[file..file + 4].copy_from_slice(b"RSDS");
+        put32(&mut pe, 0x1528, 14);
+        let (blob, update) = pe
+            .rebuild_debug_directory(&[], Rva::new(0x3000), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(blob.len(), 0x200);
+        let output = pe
+            .rebuild(&PeEdits {
+                new_sections: vec![NewSection {
+                    name: ".kdebug".into(),
+                    rva: Rva::new(0x3000),
+                    flags: SectionFlags {
+                        read: true,
+                        write: false,
+                        execute: false,
+                    },
+                    virtual_size: 0x200,
+                    data: blob,
+                }],
+                directories: vec![update],
+                ..PeEdits::default()
+            })
+            .unwrap();
+        let rebuilt = PeFile::parse(&output).unwrap();
+        assert_eq!(
+            rebuilt.metadata_references().unwrap(),
+            vec![
+                kamy_core::HostReference {
+                    source: Rva::new(0),
+                    target: Rva::new(0x1100),
+                    kind: ReferenceKind::EntryPoint,
+                },
+                kamy_core::HostReference {
+                    source: Rva::new(0x3014),
+                    target: Rva::new(0x3038),
+                    kind: ReferenceKind::ImageRelative,
+                },
+            ]
+        );
+        assert_eq!(rebuilt.u32_at_rva(0x3030), Some(0));
+        assert_eq!(rebuilt.u32_at_rva(0x3034), Some(0));
     }
 
     #[test]
