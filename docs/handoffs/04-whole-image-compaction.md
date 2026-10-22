@@ -6,6 +6,16 @@ single symbol/reference graph, shared backend/frame model, complete module
 runtime inputs and final image emitter. Do not build a separate rewriter or
 re-analyze an intermediate emitted PE to obtain compaction inputs.
 
+## Completion notice
+
+**Status: Pending; no completion accepted.** Assigned issue scopes are the
+whole-image layout/reference portions of #17/#18/#19/#20/#22/#27/#30/#33/#35,
+consuming the completed SDK/runtime and frame contracts. These are assignments,
+not claims of work performed. On completion, replace this notice with the
+issue-by-issue work/evidence/residual ledger, accepted commits and successor
+contracts required by the master's
+[completion contract](00-master.md#completion-notices), and update its register.
+
 ## Goal
 
 Deliver real whole-image virtual compaction as an explicit supported layout

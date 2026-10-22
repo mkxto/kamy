@@ -1,9 +1,37 @@
 # Prompt 1 — Unified symbols, authoritative references and one rebuild
 
-Implement this assignment in the Kamy checkout. Read
-`docs/handoffs/00-master.md` first; its confirmed decisions, preservation list,
-no-bandaid rules and verification/commit contract are part of this prompt.
-Do not implement the entire campaign in this assignment.
+Read `docs/handoffs/00-master.md` first; its confirmed decisions, preservation
+list, no-bandaid rules and verification/commit contract remain binding. The
+assignment below records completed scope, not permission to restart its shared
+contracts or implement the entire campaign.
+
+## Completion notice
+
+**Status: Completed.** Policy commit `5ef9b46`; implementation commit `feaffd8`.
+The required H1 acceptance passed. Detailed commands, runtime/structural proof,
+stable-function transitions and remaining limits are in the final D40 campaign
+section of [STATUS.md](../STATUS.md). This notice follows the master's
+[completion contract](00-master.md#completion-notices); it does not close remote
+issues or claim the remaining campaign is implemented.
+
+| Issue scopes worked on | Delivered acceptance scope | Disposition and remaining owner |
+|---|---|---|
+| #17/#18/#19/#22/#27/#30/#33/#35 | Shared identities/expressions, authored provenance, one final rebuild, ownership and directory/reference binding | Partial issue work; global placement remains 04, reference/control-flow residuals 07 |
+| #20 | Final Exception/BaseReloc ownership and actual-body unwind integration/probes | Partial; handler/scope/personality reconstruction remains 06 |
+| #32/#13 | Authored ABI/call contracts, module code/data/BSS and linker-filled bounds | Partial; frame/call-precision residuals remain 02, compiled startup/imports/std/runtime/lifecycle 03 |
+| #28/#29/#34 | Ordered supported profiles, strict unsupported/conflicting requests, identity injection/naming and source-qualified maps | H1 contract scope satisfied; broader naming/protection features are not claimed |
+| #11; #8 preserved | DIV/IDIV, paired multiplication, high-byte reads and native symbolic operands/physical-boundary repairs required by H1 | Narrow prerequisite work; broad semantics remain 05, existing #8 regressions preserved |
+
+Successors MUST reuse `SymbolId`, `Reference`/`SymbolicExpression`/`LinkField`,
+`FnSignature`/`AbiValue`, `SelectedInstructions`, `AuthoredSource` and the single
+`kamy_link::protect` plan. The artifact/map/report contracts are KAMYMOD v2,
+`kamy-debug-map,2` and `kamy-link-report` v1; see
+[architecture.md](../architecture.md) and [tooling.md](../tooling.md).
+
+Pressure/frame guarantees remain 02; compiled Rust startup, ordinary imports,
+std/runtime and process-attach-only DLL initialization remain 03. Whole-image
+compaction, broad semantics, EH and recovery residuals remain 04–07. Native flag
+rejection is containment, not completed flag semantics.
 
 ## Goal
 

@@ -4,6 +4,15 @@ Implement this assignment after Prompt 1. Read `docs/handoffs/00-master.md` and
 `01-unified-rebuild.md`, then inspect the actual preceding implementation and
 its evidence. Do not recreate its symbolic model or link plan.
 
+## Completion notice
+
+**Status: Pending; no completion accepted.** Assigned issue scopes are
+#15/#6/#5 applicability, #16/#13 residuals and #9/#10, preserving corrected #23
+behavior. These are assignments, not claims of work performed. On completion,
+replace this notice with the issue-by-issue work/evidence/residual ledger,
+accepted commits and successor contracts required by the master's
+[completion contract](00-master.md#completion-notices), and update its register.
+
 ## Goal and explicit policy change
 
 Establish concrete frame reconstruction and memory-backed intermediate state
@@ -17,12 +26,11 @@ when it preserves the pressure bound. Avoid unnecessary stores/copies for dead
 values and rematerializable pure literals; do not interpret memory-backed as
 permission to emit avoidable work indiscriminately.
 
-The user explicitly superseded D5's hard zero-spill policy. Reconcile the next
-available decision entry, D5/D28 and all affected docs before implementation;
-leave the historical rationale identifiable, not simultaneously binding.
-Reconcile #15/#6/#5: #6 currently describes preserving zero-spill through serial
-scheduling, which is not the newly agreed default. Stronger nonlinear MBA is
-still out of scope.
+D40 already records the user's replacement of D5's hard zero-spill policy.
+Consume that settled decision; reconcile remaining obsolete rules/comments as
+the backend cuts over rather than reopening the policy. Reconcile #15/#6/#5:
+#6 describes preserving zero-spill through serial scheduling, which is not the
+agreed default. Stronger nonlinear MBA remains out of scope.
 
 ## Preserve and investigate before changing
 
@@ -41,6 +49,13 @@ Existing GPR and XMM callee-saved pools, Win32metadata/CRT signatures, import
 thunk resolution, callee-side inference, SSA call-argument pin transfer,
 parallel-copy logic and actual-body unwind are working mechanisms. Extend
 rather than reimplement them. Do not assume GPRs and XMMs are interchangeable.
+
+Read the [completed H1 notice](01-unified-rebuild.md#completion-notice) and its
+accepted `feaffd8` evidence in [STATUS.md](../STATUS.md), then measure the current
+tree after any intervening work. Keep that fresh baseline distinct from H1's
+historical comparison. Report recovered functions, rejection-class migrations
+and previously lowered functions that regress separately; a pressure reject
+becoming `CallerFrameAccess` is not recovered coverage.
 
 ## Required implementation order
 
@@ -146,6 +161,13 @@ before/after witnesses, not only tests that assert new internal structures.
    host-visible state through an authored image-base expression, and returns
    success/nonzero appropriately. Do not split checks/counter into separate
    callbacks, remove branches or lower its requested intensity to make it fit.
+   Remove `CaseOutcome::ExpectedPressureLimitation` and the diagnostic-string
+   matching allowance from `tests/sdk-rebuild/src/main.rs`, migrating all its
+   consumers without a compatibility branch. Pressure rejection, skipped witness
+   execution or pressure-driven reduction of requested intensity MUST fail this
+   acceptance. The full harness MUST NOT report success without executing the
+   witness. H1 already executed this case successfully; preserve that regression
+   while proving the general memory-backed guarantee.
 2. Supported high-pressure GPR and XMM cases exceed the old register budget and
    execute correctly across blocks, loops, joins, calls and native boundaries.
    Include multiple concurrently live values and copy cycles, not only many

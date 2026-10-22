@@ -6,6 +6,17 @@ symbol/reference graph, frame-backed lowering, semantic operations, exceptional
 edges and one final layout. This is #14's residual correctness/coverage work,
 not a second disassembler, a new obfuscating dispatcher or a jump-table patcher.
 
+## Completion notice
+
+**Status: Pending; no completion accepted.** Assigned issue scopes are
+#14/#18/#19 recovery/reference residuals, with the predecessor issue ledger
+reconciled at final delivery. Preserve #8 and any #9/#10 work completed by
+predecessors; #21 stays closed/not planned. These are assignments, not claims of
+work performed. On completion, replace this notice with the issue-by-issue
+work/evidence/residual ledger, accepted commits and successor contracts required
+by the master's
+[completion contract](00-master.md#completion-notices), and update its register.
+
 ## Goal and issue boundaries
 
 Recover provable indirect/static dispatch and improve function/block recovery

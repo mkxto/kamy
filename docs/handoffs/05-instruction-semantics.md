@@ -1,9 +1,18 @@
 # Prompt 5 — Instruction, flag and segment semantic coverage
 
 Read `docs/handoffs/coverage-extension.md` and `00-master.md` first. Execute
-against the completed core campaign by default; honor any prerequisite work
-already pulled into 02/03. Do not modify an active predecessor's contracts or
-recreate its symbolic/frame/allocation machinery.
+against the completed core campaign by default; honor prerequisite work already
+delivered by 01–03 and read their completion notices. Do not modify an active
+predecessor's contracts or recreate its symbolic/frame/allocation machinery.
+
+## Completion notice
+
+**Status: Pending; no completion accepted.** Assigned issue scopes are #11/#26;
+#8's completed operand fix and corrected #23 behavior MUST be preserved. These
+are assignments, not claims of work performed. On completion, replace this notice
+with the issue-by-issue work/evidence/residual ledger, accepted commits and
+successor contracts required by the master's
+[completion contract](00-master.md#completion-notices), and update its register.
 
 ## Goal and ownership
 
@@ -35,6 +44,24 @@ new broad Kamy-versus-CD comparison. For each family record:
   ordering, fault/trap behavior and available transformation/legalization rules.
 - Actual corpus sites and consumer-visible witnesses. Do not count a mnemonic
   as complete when one width or operand direction works.
+
+Subtract the bounded prerequisites already delivered by
+[H1](01-unified-rebuild.md#completion-notice) from the residual implementation
+matrix, preserving their regressions and shared producer/consumer contracts:
+
+- I8/I16/I32/I64 DIV/IDIV with quotient/remainder projections from one hardware
+  division and preserved divide faults.
+- Paired low/high multiplication, implicit-register constraints and snapshots.
+- High-byte operand reads; this does not establish every high-byte destination
+  or encoding form.
+- Exact symbolic RIP operands through accepted NativeInline operations and the
+  final shared binder.
+
+Record these as predecessor work, not new recovery by this handoff. Recheck the
+actual implementation and any additional 02/03 prerequisites before extending
+them. H1's rejection of unmodeled native flag reads/writes is containment, not
+implemented flag semantics and not completion of #11. Do not credit unchanged
+bit-count or other existing operations to H1 without checking their history.
 
 Implement these families in gated milestones. The assignment includes all the
 families below; an agent may sequence commits, not stop after the first family

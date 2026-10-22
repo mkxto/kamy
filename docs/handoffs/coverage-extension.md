@@ -1,9 +1,11 @@
 # Coverage extension — instructions after the core repair campaign
 
-This is an additive roadmap. It does not modify or supersede the active
+This is an additive roadmap. It does not modify or supersede the completed
 [Prompt 1](01-unified-rebuild.md), the confirmed four-stage order in
-[00-master.md](00-master.md), or any implementation currently in progress.
-Do not interrupt that agent or start concurrent edits to its shared types.
+[00-master.md](00-master.md), or any active predecessor's contracts. Read the
+master's [completion register](00-master.md#completion-register) and each
+completed handoff's notice; do not restart accepted work or concurrently edit
+an active predecessor's shared types.
 
 Read this file with each new coverage prompt and the master contract. Default
 execution order: finish 01 -> 02 -> 03 -> 04, then execute 05 -> 06 -> 07.
@@ -20,13 +22,21 @@ starting. A source location/type mentioned in an old prompt may have moved.
 | #16 dead dependencies, #13 call precision residuals | 02 | Signature DB, CRT supplement, thunk resolution and inference already exist |
 | #9 pinned live-across-call recovery, #10 recursion | 02 | Acceptance is explicit; no separate implementation merely because issues remain open |
 | Required SDK semantic/runtime operations | [03](03-rust-sdk-runtime.md) | Mandatory prerequisites for promised std cases, not blanket #11 completion |
-| #11 instruction/flag expansion, #26 segments | [05](05-instruction-semantics.md) | Audit and consume any operations already completed by 02/03 |
+| #11 instruction/flag expansion, #26 segments | [05](05-instruction-semantics.md) | Audit and consume prerequisites already delivered by 01–03 |
 | #12 handler/scope/exception semantics | [06](06-exception-semantics.md) | Actual-body plain unwind exists; it is not full SEH/C++ EH |
 | #14 residual control-flow recovery, overlap with #18/#19 | [07](07-control-flow-residuals.md) | Existing D24 use-def DAG/petgraph VF2 and table-free lowering must remain |
 | Backend instruction/copy/traffic quality | [issue #36](https://github.com/mkxto/kamy/issues/36) | Separate from coverage and protective strength; reuse completed optimizations |
 | Fantasy #2/#3/#4 and new protective strength | Not assigned | No covert expansion into these features |
 
 ## Dependency exceptions: prerequisites, not parallel architectures
+
+Handoff 01 has delivered bounded arithmetic, physical-boundary and native
+symbolic-operand prerequisites. Its
+[completion notice](01-unified-rebuild.md#completion-notice) and 05's
+[inventory requirement](05-instruction-semantics.md#1-inventory-before-changing-instructions)
+identify the scope to preserve and subtract from later residuals. Native flag
+rejection is containment, not semantic completion. Credit prerequisite work to
+its actual predecessor rather than counting it again as newly recovered work.
 
 Prompt 3 explicitly authorizes semantic work required by its std/runtime
 acceptance. If it needs an operation listed in 05, implement the proper shared
@@ -117,6 +127,11 @@ decision docs with exercised facts, not a new drifting implementation comparison
 Only close issue acceptance actually satisfied. Unimplemented ISA variants or
 EH formats must have explicit residual rows; never mark their whole umbrella
 complete because one easy fixture passed.
+
+Each numbered handoff MUST update its own completion notice and the master's
+register under the [completion contract](00-master.md#completion-notices).
+Record issue work by satisfied subset, evidence, residual owner and successor
+contract; an accepted milestone does not imply its umbrella issues may close.
 
 These files are future implementation assignments, not claims that the listed
 semantics or EH/control-flow support have already landed.

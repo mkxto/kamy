@@ -15,10 +15,9 @@ Read this file with each numbered prompt. Execute the prompts in this order:
 Prompts 01–04 retain their original order and acceptance. Prompts 05–07 extend
 the campaign with broad semantic coverage; read
 [coverage-extension.md](coverage-extension.md) for ownership and prerequisite
-rules. Handoff 1 is already in progress: these additions do not restart it,
-change its scope or authorize concurrent edits to its shared implementation.
-Semantic prerequisites pulled forward for SDK/frame acceptance MUST be reused
-by later coverage prompts, not implemented twice.
+rules. Handoff 01 is complete; the additions do not restart it or expand its
+accepted scope. Semantic prerequisites pulled forward for earlier acceptance
+MUST be reused by later prompts, not implemented twice.
 
 Each numbered file is a runnable agent assignment, not permission to call an
 intermediate architecture the finished campaign. The next assignment consumes
@@ -28,6 +27,65 @@ work or create a second convention for the same concern.
 No implementation was performed during the grilling session that produced
 these instructions. This file records the user's confirmed direction. It is
 not evidence that any future milestone has passed.
+
+## Completion register
+
+This register tracks accepted handoff scope, not remote issue closure. Pending
+means the handoff has no accepted completion notice; prerequisite work may
+already exist. Update the register and the numbered handoff's notice together.
+
+| Handoff | Status | Accepted commits | Completion notice |
+|---|---|---|---|
+| 01 — Unified symbols and single rebuild | **Completed** | Policy `5ef9b46`; implementation `feaffd8` | [01 notice](01-unified-rebuild.md#completion-notice) |
+| 02 — Concrete frames and memory-backed lowering | Pending | None recorded | [02 notice](02-memory-backed-lowering.md#completion-notice) |
+| 03 — Rust SDK, runtime and lifecycle | Pending | None recorded | [03 notice](03-rust-sdk-runtime.md#completion-notice) |
+| 04 — Whole-image virtual compaction | Pending | None recorded | [04 notice](04-whole-image-compaction.md#completion-notice) |
+| 05 — Instruction, flag and segment semantics | Pending | None recorded | [05 notice](05-instruction-semantics.md#completion-notice) |
+| 06 — Exception semantics | Pending | None recorded | [06 notice](06-exception-semantics.md#completion-notice) |
+| 07 — Control-flow residuals | Pending | None recorded | [07 notice](07-control-flow-residuals.md#completion-notice) |
+
+The next assignment is **02**. Handoff 01's exercised results and remaining
+limits are recorded in the final D40 campaign section of
+[STATUS.md](../STATUS.md); its shared contracts are in
+[architecture.md](../architecture.md). Read those records and the current code
+before taking a fresh baseline. Do not replace historical baselines with newer
+measurements or interpret completed H1 acceptance as completed SDK/runtime,
+allocation, EH or compaction work.
+
+## Completion notices
+
+Every numbered handoff MUST maintain its own `## Completion notice`. Before
+delivering a completed handoff, its owner MUST update that notice and this
+master's completion register. Mark it completed only after every required
+acceptance item passes. An unresolved blocker or missing acceptance stays
+explicitly incomplete; a narrower scope requires the user's approval.
+
+Each completion notice MUST record:
+
+- **Status and commits:** the accepted implementation/policy commits and the
+  exact handoff scope satisfied. A prerequisite or partial issue fix does not
+  complete its owning handoff.
+- **Issues worked on:** an issue-by-issue ledger of the specific work delivered,
+  evidence and disposition: satisfied acceptance scope, partial, preserved only,
+  or not worked on. State residual work and its owner. Never label an umbrella
+  issue fully resolved because one subset passed; milestone completion does not
+  authorize remote issue closure.
+- **Verification:** actual commands/results, portable regression/runtime fixture
+  references, relevant structural checks, stable-cohort coverage/rejection
+  transitions and additions/removals. Link detailed evidence in the existing
+  [STATUS.md](../STATUS.md) rather than duplicating large tables or relying on
+  ephemeral local files. Keep identity lowering and actual transformation
+  separate; record skips and expected limitations rather than counting them as
+  executed acceptance.
+- **Remaining risks:** strict failures, unsupported cases and obligations left
+  to later handoffs. Distinguish containment from root-cause implementation.
+- **Successor contract:** the concrete APIs, schemas, helpers, frame/layout
+  interfaces and fixtures the next owner MUST reuse, including any bounded
+  prerequisite work pulled forward from a later milestone.
+
+Pending notices list assigned issue scopes, not work already performed. Replace
+them with the evidence-backed ledger when that handoff completes. Successors
+MUST read completed notices before implementing residuals or reopening issues.
 
 ## Confirmed user decisions
 
@@ -321,3 +379,5 @@ vendor reference to match implementation shortcuts or claim unexercised parity.
 A milestone report MUST state: changed contracts; preserved behavior; actual
 commands/results; before/after eligibility and coverage; strict failures;
 remaining risks; and the exact contracts/artifacts consumed by the next prompt.
+The numbered handoff's completion notice and master register MUST reflect that
+report before the milestone is delivered as complete.

@@ -5,6 +5,16 @@ predecessor implementations. Default execution follows 01-05. Do not change an
 active predecessor's link/frame contracts or implement a second exception-only
 layout/backend.
 
+## Completion notice
+
+**Status: Pending; no completion accepted.** Assigned issue scopes are
+#12/#20/#23/#33 exception/handler reconstruction residuals, preserving existing
+plain-frame unwind and predecessor frame contracts. These are assignments, not
+claims of work performed. On completion, replace this notice with the
+issue-by-issue work/evidence/residual ledger, accepted commits and successor
+contracts required by the master's
+[completion contract](00-master.md#completion-notices), and update its register.
+
 ## Goal and scope
 
 Implement #12's missing handler/scope reconstruction and recover genuinely

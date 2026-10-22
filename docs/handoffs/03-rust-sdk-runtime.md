@@ -6,6 +6,15 @@ code, changed contracts and exercised evidence. Reuse their unified symbols,
 frame/memory-backed backend and single rebuild. Do not revive the old module
 append stage or synthetic address namespace.
 
+## Completion notice
+
+**Status: Pending; no completion accepted.** Assigned issue scopes are
+#32/#27/#35, with #18/#19/#20/#30/#33/#13/#28/#29 integration and bounded
+#11/#12/#26 prerequisites. These are assignments, not claims of work performed.
+On completion, replace this notice with the issue-by-issue work/evidence/residual
+ledger, accepted commits and successor contracts required by the master's
+[completion contract](00-master.md#completion-notices), and update its register.
+
 ## Goal
 
 Complete the agreed Rust SDK extension model: compiled Rust module functions
@@ -143,6 +152,26 @@ while those features still fail.
 
 The target itself may be an EXE or DLL. The packaged plugin DLL is only an
 artifact; do not confuse its PE entry with the target's actual entry lifecycle.
+
+Use the observed H1 follow-up failure as an early regression for this cutover.
+A native probe loaded the protected ordered DLL, then directly invoked its real
+target entry with thread-attach and thread-detach reasons. The observed trace
+records callback effects, not merely original DllMain visitation:
+
+| Entry event in sequence | Observed H1 trace | Required trace after this handoff |
+|---|---:|---:|
+| Process attach through LoadLibraryW | 12 | 12 |
+| Direct entry call with DLL_THREAD_ATTACH (2) | 1212 | 12 |
+| Direct entry call with DLL_THREAD_DETACH (3) | 121212 | 12 |
+
+Turn this into a portable committed fixture with Windows execution gated
+appropriately. Exercise actual Windows thread/unload notifications as well as
+direct reason calls; a direct call alone does not prove OS lifecycle ordering.
+Check that user initialization does not repeat, while the original DllMain
+still observes every notification, exact arguments and its real TRUE/FALSE
+behavior. Include process detach and unload/reload in the lifecycle matrix.
+This is an outstanding requirement, not acceptance supplied by H1's green
+identity corpus or generated-loader argument/unwind checks.
 
 - On EXE startup, execute configured initialization before the original entry,
   with the native TLS/loader ordering accurately documented.
