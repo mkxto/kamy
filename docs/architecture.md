@@ -312,7 +312,7 @@ The shared model tracks source, target, kind, per-function incoming/outgoing ref
 
 **Host:** consume relocations, unwind, directories and optional PDB first, then conservative decoded-reference/value analysis. Unknown address materialization or ambiguous consumers block movement. Confidence is evidence, not permission to omit references. A translation map (#22) is valid only at consumers that actually consult it, never a substitute for an unknown consumer.
 
-**Authored module:** compile Kamy's Rust module as a specialized DLL with data directories **unmerged, one directory per section**. Lift functions as code symbols and `.rdata`/`.data`/`.bss` as data symbols; import authored relocations directly into the same linker model. Reference coverage is **exact by construction**, not host inference, so host safe-reject does not gate module references. Instruction/ABI/unwind and D5 zero-spill correctness still apply. This is not a COFF-only SDK contract ([vendor specification](https://codedefender.io/blog/2025/03/27), [#32](https://github.com/mkxto/kamy/issues/32), D38).
+**Authored module:** compile Kamy's Rust module as a specialized DLL with dedicated data-directory ownership. Compiler-authored code/data symbols and relocation expressions enter the same shared linker model and final rebuild as host inputs. Their provenance is exact, not host inference; instruction, explicit call ABI, frame and unwind correctness still apply (D38/D40). Rust builds may require version-matched LLVM tooling to produce ABI metadata validated against the exact emitted code. Native COFF is an intermediate, not a public C/C++ SDK contract.
 
 Switch recovery remains D24's relocation evidence + per-function use-def DAG / `petgraph` VF2 + value-analysis fallback. Prove bounds and in-function targets or reject. A rejected/untouched function keeps its original table; a lowered function emits none.
 
@@ -357,7 +357,7 @@ Every pass must:
 
 ### 8.1 Code Generation
 - Instruction selection: IR ops → x86 instruction sequences
-- Register allocation: linear-scan; D5 zero-spill is a hard constraint; if reduced-intensity/identity lowering fails, reject in place, never verbatim-relocate
+- Register allocation: D40 adopts memory-backed intermediates and bounded scratch sets; handoff 2 owns that backend cutover. Until then, report pressure-driven reductions and identity lowering honestly; never verbatim-relocate failures.
 - Stack-frame reconstruction from high-water mark
 - Encode via iced-x86
 

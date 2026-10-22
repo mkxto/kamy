@@ -24,7 +24,7 @@ Commercial bin2bin protector for Windows PE (x86-64 + ARM64). No source changes 
 
 **Reference-rewriting evidence:** [#17](https://github.com/mkxto/kamy/issues/17) and [code_defender.md](code_defender.md) record 953 direct branches to moved code versus 26 image-wide base relocations (zero into moved code) in the crackme. The old inference that `NoThunkSpace` proves a thunk at every moved entry is superseded. rel32/RIP-relative rewriting is the primary mechanism; loader `.reloc` rebasing is only one reference class. Residual unwind-referenced stubs are not a reason to preserve Kamy's per-function thunk design.
 
-**Module evidence:** the vendor's [Module Extension System](https://codedefender.io/blog/2025/03/27) compiles C/C++/Rust to a specialized DLL with **unmerged data directories, one per section**; lifts functions as `CodeSymbol`s and `.rdata`/`.data`/`.bss` as `DataSymbol`s; and imports authored relocations into its linker. Kamy-authored module references are exact by construction; host references remain conservative inference with safe-reject ([#18](https://github.com/mkxto/kamy/issues/18)). This replaces the COFF-only plugin assumption, not D16's format boundary or D5's zero-spill rule.
+**Module evidence:** the vendor's [Module Extension System](https://codedefender.io/blog/2025/03/27) uses a specialized DLL with dedicated data-directory sections, code/data symbols and authored relocations. D38/D40 adopt metadata-first module inputs to the shared linker, distinct from conservative host inference. This does not waive D16 boundaries or explicit ABI/frame/unwind correctness; D40 supersedes the earlier zero-spill restriction.
 
 **Entry evidence and scope:** the [published plugin source](https://github.com/codedefender-io/plugins) shows the init loop and a past-`end` `musttail` call. [#32](https://github.com/mkxto/kamy/issues/32) records that the shipped EXE's nonreturning original startup is the final callback **inside** `[begin,end)`; the past-`end` call is dead, not a continuation to copy. A transform-only returnable DLL entry is redirected directly to moved code and returns to the loader; the status-checking EXE loader cannot front `DllMain` unchanged ([#35](https://github.com/mkxto/kamy/issues/35)). Kernel entry stays pinned. Payload injection and section-name blanking/rebranding are per-build, **off by default**, not relocation prerequisites ([#32](https://github.com/mkxto/kamy/issues/32), [#34](https://github.com/mkxto/kamy/issues/34)).
 
@@ -42,6 +42,10 @@ Custom disassembler → SSA IR → optimization pipeline → compiler backend (i
 - Dead-dependency analysis: registers/flags clobbered by the native code immediately after the exit point are dead and their symbolic expressions are dropped. Their ZF example: the IR carries the full expression tree for a symbolic ZF even though the very next native instruction overwrites it.
 - Concrete-RSP lifting: RSP starts concrete (everything else symbolic) so stack-pointer arithmetic constant-folds and the generic load/store machinery handles stack accesses with no special casing. Limitation they accept: functions with dynamic stack allocations (alloca/VLA) are unsupported.
 - Stack-frame high-water-mark reconstruction: the concretized RSP at sink points (calls, boxed instructions) reveals the original frame size, and the prolog/epilog is rebuilt from it. If spilling ever happens, the original frame is placed after the recompiler's own spill frame.
+
+These zero-spill observations concern devirtualization. They do not override
+the measured protector memory-backed model in `code_defender.md` or D40's
+confirmed lowering policy. Concrete frame reconstruction remains applicable.
 
 Sources: [Themida devirt](https://aftermathlabs.net/blog/09/05/2026/), [Tencent VM devirt](https://aftermathlabs.net/blog/31/07/2026/)
 

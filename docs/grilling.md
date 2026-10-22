@@ -166,27 +166,15 @@ The PE/COFF spec is well-documented (Microsoft's PE specification). The parsing/
 
 ---
 
-### D5 — Register Allocator
+### D5 — Register Allocator (revised by D40)
 
-**Question:** What register allocation strategy?
-
-**Options considered:**
-1. ✅ **Full register allocator (linear scan)** — standard compiler approach, highest quality output.
-2. ❌ Conservative spill-everything — correct but output too slow for hot code.
-3. ❌ Reuse original assignment — fragile, breaks on structural transforms.
-
-**Decision:** Full linear-scan register allocator.
-
-**Reasoning:** BLARE2 explicitly calls out "register pressure avoidance as first-class allocator goal" and "stack-frame high-water-mark reconstruction." The Themida devirt blog goes further: **zero-spill is a hard constraint, not a soft goal.** Any spill creates a second stack frame that breaks IDA/BinaryNinja stack-arg analysis — the protected binary looks broken to every disassembler. This is a product-quality bar, not just performance.
-
-Linear scan is the right trade: O(n) complexity, good-enough allocation quality for a protector, well-documented algorithm (Poletto & Sarkar 1999, Wimmer & Franz 2010 for SSA-based linear scan).
-
-**Implications:**
-- **Zero-spill target.** Spilling is a last resort. If the allocator can't avoid spills, the function should be flagged (not silently broken). Transforms that increase register pressure beyond available physical registers should be rejected for that function.
-- Need liveness analysis across the full function CFG.
-- Stack frame reconstruction from high-water mark (not from spill count).
-- XMM registers must participate in allocation (Win64 ABI uses XMM0-3 for float args, XMM0-5 are volatile).
-- Callee-saved register handling: if the original function saves RBX/RBP/R12-R15/XMM6-15, the allocator must respect those saves or reconstruct the prologue/epilogue.
+**Decision:** D40 supersedes the original zero-spill prohibition. Memory-backed
+intermediates and bounded scratch-register working sets are the lowering
+baseline. Register-resident optimization may avoid memory traffic, but pressure
+must not force rejection or reduce requested transform intensity for otherwise
+supported functions. Concrete frame reconstruction and actual-body unwind
+semantics remain required. The implementation cutover belongs to handoff 2;
+handoff 1 must report the existing pressure ladder's actual outcome honestly.
 
 ---
 
@@ -524,7 +512,7 @@ Together: per-build variance that breaks signature matching (SigBreaker model).
 | `StackTooLarge` | Stack frame exceeds `max_stack_copy_size` |
 | `SymbolizationUncertain` | Symbolization confidence below threshold |
 | `CodegenFailure` | Register allocator or instruction selector failed |
-| `RegisterPressure` | Transforms would require spills (violates zero-spill constraint) |
+| `RegisterPressure` | Current backend limitation until D40's memory-backed lowering cutover; never proof of full requested transformation |
 
 Output included in the protection report alongside transformation stats. Machine-readable for CI (assert rejection rate below threshold).
 
@@ -577,7 +565,7 @@ Key findings that refined or corrected earlier decisions (full dossier: `local:/
 
 | Finding | Impact on Design |
 |---------|-----------------|
-| Zero-spill is a HARD constraint (spills break disassembler stack-arg analysis) | Updated D5: register allocator must target zero spills, reject functions that can't avoid them |
+| Zero-spill observations concern devirtualization, not a universal protector constraint | D40 adopts the measured protector's memory-backed model; the earlier D5 prohibition is superseded |
 | Convergence-driven optimizer (passes run to fixed point) | Updated D21: optimizer runs iteratively, not single-shot |
 | PDB output via OMAP rewriting + address-map (elderscroll/pdbgen), NOT full PDB write | Updated D10: much simpler approach, fork pdb crate for read + OMAP write |
 | **bintests** (86★): large PE test corpus with SEH, jump tables, corkami, >200MB | Adopt as test corpus |
@@ -621,21 +609,13 @@ For parallelism determinism: per-function sub-seeds derived from `hash(global_se
 
 ---
 
-### D28 — Coverage Robustness: Depth-Adaptive Transforms (Zero-Spill Stands)
+### D28 — Coverage Robustness (revised by D40)
 
-**Decision:** Single engine stays (D1); transform intensity adapts to the register budget, **not** by adding a spill path. D37 supersedes the historical claim that relocation fallback guarantees 100% host coverage.
-
-Per-function ladder:
-1. Requested passes at full intensity; if regalloc fails `RegisterPressure`, retry at reduced intensity (fewer MBA iterations, no CFF intermediates) — deterministic per D26 sub-seed.
-2. If even identity lowering does not fit, reject in place and report via D22. No verbatim relocation fallback.
-
-**Reasoning:** D5's zero-spill bar protects disassembler stack analysis. Depth adaptation improves coverage without weakening that constraint; it cannot establish reference completeness or eliminate legitimate host safe-rejects.
-
-**Implications:**
-- Callee-saved activation (Phase 4) is the first rung: widens the pool from 8 volatile to 15 GPRs + XMM6-15.
-- XMM registers must fully participate in allocation (D5 implication).
-- Passes need an intensity parameter so the retry ladder can degrade deterministically.
-- Encode bugs (XMM5 mem-operand) fixed independently.
+**Decision:** D40 supersedes pressure-driven intensity reduction as the target
+design. Keep one SSA engine and safe rejection for genuinely unmodeled
+semantics/references. The current retry ladder remains an implementation limit
+until handoff 2 replaces it; reports must distinguish its actual intensity and
+identity outcomes from requested protection. No verbatim relocation fallback.
 
 ---
 
@@ -728,13 +708,13 @@ pass **C1/C2**.
 - [#27](https://github.com/mkxto/kamy/issues/27) makes `.kamy` the selected/lowered code home, with PIC code where possible, rebuilt Import/Debug/BaseReloc/Exception directories, and recycled/retyped empty section slots. No original-VA thunk or `0xCC` thunk-flood. Selective builds reclaim interior holes in place and truncate only a dead tail; do not slide pinned survivors. Whole-image compaction requires rebasing every affected survivor and is not implied by selective reclamation.
 - [#33](https://github.com/mkxto/kamy/issues/33) defaults to a **non-enforcing, internally consistent CFG/LoadConfig**: valid cookie references, non-enforcing check/dispatch targets, and cleared function-table-present state or valid remaining metadata. Real enforcing module CFG is a vendor claim and later opt-in, not a gate here.
 
-D5 zero-spill, D16 format-agnostic core, D22 safe rejection, and D24 use-def DAG + `petgraph` VF2 recovery/table-free lowering remain binding. PE directory interpretation belongs in PE-specific crates; shared reference kinds carry no PE layouts. Corpus/runtime acceptance in the linked issues remains required; this decision records no exercised proof.
+D40 supersedes D5's zero-spill restriction. D16 format-agnostic core, D22 safe rejection, and D24 use-def DAG + `petgraph` VF2 recovery/table-free lowering remain binding. PE directory interpretation belongs in PE-specific crates; shared reference kinds carry no PE layouts. Corpus/runtime acceptance in the linked issues remains required; this decision records no exercised proof.
 
 ### D38 — Authored Modules, Entry ABI & Optional Presentation
 
 **Decision:** Supersede D30's mandatory-runtime, COFF-only, and past-`end`-tailcall claims with the [vendor Module Extension System](https://codedefender.io/blog/2025/03/27) and [published plugin source](https://github.com/codedefender-io/plugins), as scoped by [#32](https://github.com/mkxto/kamy/issues/32) and [#35](https://github.com/mkxto/kamy/issues/35).
 
-- Host code is inferred from an already-linked image and may be safely rejected. Kamy-authored Rust modules are compiled with **unmerged DLL data directories (one directory per section)**; functions become code symbols, `.rdata`/`.data`/`.bss` become data symbols, and authored relocations enter the same linker/reference machinery directly. Their reference coverage is **exact by construction**, not guessed by host heuristics; host safe-reject does not gate module references. Module functions remain pass-eligible and need valid unwind metadata. This does not waive instruction, ABI, or zero-spill correctness.
+- Host code is inferred from an already-linked image and may be safely rejected. Kamy-authored Rust modules have dedicated DLL data-directory ownership; compiler-authored symbols and relocations enter the same shared model and final rebuild. Exact reference provenance does not waive instruction, explicit ABI, frame or unwind correctness. D40 supersedes the former zero-spill restriction and second module rebuild.
 - EP redirection and moving the original startup are independent. A transform-only returnable DLL entry points directly into `.kamy` and returns to the loader; exports are rebased and DLL header semantics preserved. Kernel EP stays pinned and untouched. EXE startup may remain resident or move according to resolved references.
 - Injection is optional, per-build, **off by default and off for kernel entries**. Preserve entry arguments, TLS ordering, stack/return ABI, and CET semantics. For an EXE init table, the final in-range original entry must not return; never execute a past-`end` slot. For DLL payloads, sequence a payload then tail-transfer to `DllMain`, preserving entry arguments and its return value, or explicitly exempt the final entry from status checking. Never interpret `DllMain`'s successful `TRUE` as a failed init status.
 - Section naming/blanking/rebranding is optional, per-build, **off by default** ([#34](https://github.com/mkxto/kamy/issues/34)); `.kamy` remains the normal name. Neither names nor payload injection are prerequisites for relocation correctness. The original public-SDK deferral is superseded by D39.
@@ -748,7 +728,37 @@ Vendor claims about enforcing CFG, longjmp/SAFESEH registration, and unwind-safe
 - A `no_std` Rust SDK defines a Win64 `extern "system"` callback receiving the original three entry arguments and returning a zero-success status. Rust's native compiler/linker outputs do not imply support for another authoring language.
 - A Cargo-based build command produces a specialized DLL with dedicated data-directory sections and versioned embedded code/data/reference metadata, derived from compiler-authored native COFF relocations and symbols. DLL consumers do not need object sidecars or host inference. This preserves D38's module model rather than replacing it with a COFF-only consumer.
 - YAML opts into an ordered list of named plugin artifacts, with paths relative to the profile. Loader mode is configurable. Qualified `plugin::symbol` names select the same transform passes as host code. No built-in payload, runtime DLL loading, or plugin execution inside the protection tool.
-- D5 zero-spill, D16 crate boundaries, D37 reference rewriting and D38 target-specific entry/unwind/TLS/CET contracts remain binding. Unsupported module constructs fail the build/injection contextually; never omit a callback or verbatim-relocate rejected module code.
+- D16 crate boundaries, D37 reference rewriting and D38 target-specific entry/unwind/TLS/CET contracts remain binding, as revised by D40. Unsupported module constructs fail contextually; never omit a callback or verbatim-relocate rejected module code.
+
+### D40 — Ordered Native Rebuild and Rust SDK Repair
+
+**Decision:** The confirmed campaign in `handoffs/00-master.md` supersedes
+incompatible implementation restrictions in D5, D28 and D37–D39.
+
+- Handoff 1 establishes stable source-qualified symbols and symbolic
+  expressions, explicit authored-call contracts, and one final layout/rebuild
+  for host code, module code/data and generated helpers. Numeric namespaces,
+  MOVABS byte normalization and a second host/module rebuild are not contracts.
+- Rust plugin builds may require version-matched LLVM tools to obtain
+  authoritative machine ABI metadata. Metadata must describe the exact emitted
+  native code; compiler diagnostics, mangled names and guessed Win64 defaults
+  are not substitutes for validated contracts. Rust-only authoring remains.
+- Handoff 2 implements concrete frames and memory-backed intermediates with
+  bounded scratch sets and explicit flags. Pressure must not reject supported
+  functions or reduce requested intensity. Register-resident optimization is
+  permitted without weakening that guarantee; unwind describes the real frame.
+- Handoff 3 integrates compiled Rust startup, ordinary imports and Rust `std`
+  with `panic=abort`. DLL initialization runs only on process attach, before
+  the original entry. No hidden worker/deferred-init workaround.
+- Handoff 4 adds whole-image virtual compaction to the same link plan, or
+  fails specifically when global placement cannot be justified. Selective
+  reclamation and raw repacking are not whole-image compaction.
+- Preserve the existing MBA baseline. Honor supported requests in declared
+  order and reject unsupported settings explicitly. Identity suppresses
+  semantic passes, not configured injection, naming or layout policy.
+- Conservative host reference completeness, no original-entry thunks, no
+  verbatim relocation, and D16/D22/D24 remain binding. These decisions are
+  target contracts, not claims that later handoffs are implemented or verified.
 
 
 
@@ -760,7 +770,7 @@ Vendor claims about enforcing CFG, longjmp/SAFESEH registration, and unwind-safe
 | D2 | Linker strategy | Superseded by D37: reference rewriting, no original-VA thunks |
 | D3 | CALL handling | Lift calls + split-on-call fallback |
 | D4 | PE parse/emit | Fully custom (kamy-pe) |
-| D5 | Register allocator | Linear scan, zero-spill hard constraint |
+| D5 | Register allocator | D40: concrete frames, memory-backed baseline, bounded scratch working sets |
 | D6 | Lifter scope | Core GPR + basic SSE data movement (~70 forms) |
 | D7 | SSA form | Proper SSA with φ-nodes |
 | D8 | Config format | YAML |
@@ -783,7 +793,7 @@ Vendor claims about enforcing CFG, longjmp/SAFESEH registration, and unwind-safe
 | D25 | Test corpus | Adopt aftermathlabs/bintests |
 | D26 | PRNG | Configurable seed, deterministic ChaCha8Rng |
 | D27 | /GL handling | Detect and warn, fall back to split-on-calls |
-| D28 | Coverage robustness | Depth-adaptive transforms; zero-spill stands |
+| D28 | Coverage robustness | D40 supersedes pressure-driven intensity reduction; report current limits honestly |
 | D29 | Stub stealth | Superseded by D37; no per-function entry stubs |
 | D30 | Runtime & plugin SDK | Superseded by D38; optional authored modules, entry-ABI-specific redirection |
 | D31 | Phase order | Unwind kernel into Phase 2; SEH before obfuscation |
@@ -795,6 +805,7 @@ Vendor claims about enforcing CFG, longjmp/SAFESEH registration, and unwind-safe
 | D37 | Relocation rebuild | Complete references, conservative host residency, no thunks, selective reclamation, consistent non-enforcing CFG |
 | D38 | Modules & entry ABI | Exact authored-module refs; returnable DLL EP direct, kernel EP pinned; injection/names optional |
 | D39 | Rust SDK/plugins | Cargo-built exact metadata modules, ordered opt-in injection, no C/C++ support |
+| D40 | Repair campaign | Unified symbols/rebuild, authoritative Rust ABI metadata, memory-backed lowering, std/runtime, global compaction in ordered handoffs |
 
 ---
 
