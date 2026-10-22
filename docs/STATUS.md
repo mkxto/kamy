@@ -770,17 +770,18 @@ Observed verification:
 
 ### Verification state and reproducible commands
 
-**H2 is completed and accepted** at implementation commit
-`278f5ef81dd096e8325c06bd02ba7c88b84b0646` (`Lower SSA through concrete
-memory-backed frames`), under D40 policy commit `5ef9b46`. Accepted scope is
-concrete frames, real memory-backed intermediates and flags, bounded scratch,
-supported call/recursion recovery and actual-frame probing/unwind through the
-shared backend. The [H2 completion notice](handoffs/02-memory-backed-lowering.md#completion-notice)
-and [master register](handoffs/00-master.md#completion-register) record the same
-acceptance; the next assignment is H3. This is not umbrella or remote issue
-closure. Historical H1 counts and accepted evidence above remain historical
-evidence; all detailed H2 measurements and residual ownership below remain in
-force.
+**H2 is Incomplete / Reopened after later analysis on 2026-10-22.** Acceptance
+of implementation `278f5ef81dd096e8325c06bd02ba7c88b84b0646` (`Lower SSA through
+concrete memory-backed frames`), published at `d1c70e1`, is withdrawn. D40 policy
+`5ef9b46` remains binding: concrete frames, memory-backed intermediates/flags,
+bounded scratch, one shared backend and one rebuild. No production fixes for
+the seven review findings have been applied. All MUST be fixed or reproducibly
+disproved before reacceptance; deferral/narrowing requires user approval.
+The [H2 completion notice](handoffs/02-memory-backed-lowering.md#completion-notice)
+and [master register](handoffs/00-master.md#completion-register) track the same
+state. **Repair and reaccept H2 before H3.** H1 acceptance remains unchanged.
+The earlier tests, corpus and full SDK/runtime/unwind successes below remain
+historical observations, not current acceptance or remote issue closure.
 
 The fresh pre-H2 baseline was **314 tests / 41 suites**, **23/23 corpus PASS**,
 **1,721 lowered / 9,481 rejected**. After the final API cutover the integration
@@ -975,17 +976,17 @@ These are semantic/ownership repairs, not pressure-masking bandaids.
 
 | Issue / scope | H2 implementation and evidence | Remaining ownership |
 |---|---|---|
-| #15 frame/pressure recovery | Concrete frames and real homes remove pressure rejection/reduced-intensity paths; stable-cohort and runtime evidence above | Dynamic/unproved frames remain explicit; this does not close every umbrella limitation |
-| #6 serial scheduling / zero-spill policy | Applicability reconciled with D40: bounded scratch plus memory homes replaces zero-spill as the default | No obligation to preserve the superseded zero-spill scheduling design |
-| #5 applicability | Requested existing MBA intensity is retained through the new backend | Nonlinear MBA/protection strength remains separate; no strength-completion claim |
-| #9 volatile-pinned live-across-call | After-definition call/native capture and homes preserve supported live values and boundary pins; pinned runtime witness executes | Unsupported native/ABI effects remain semantic limitations, not a pressure escape |
-| #10 recursion/caller-frame access | Original object/entry coordinates preserved without duplicating the original frame; 486 caller-frame and 3 recursion functions recovered, recursion 64/96 exercised | Dynamic joins and unproved frame forms remain `FrameDynamic` |
+| #15 frame/pressure recovery | Historical concrete-frame/home cutover and stable-cohort/runtime evidence above; acceptance reopened | H2 owns finite select provenance and bounded analysis/copy planning; no umbrella closure |
+| #6 serial scheduling / zero-spill policy | Historical D40 bounded-scratch/memory-home cutover; reacceptance pending | H2 owns bounded DAG/CFG/phi work and one authoritative global pin representation; no return to zero-spill |
+| #5 applicability | Historical requested existing MBA intensity retained | Reacceptance MUST preserve requested intensity; stronger/nonlinear MBA stays separate |
+| #9 volatile-pinned live-across-call | Historical after-definition capture/home delivery and runtime witness; call-result/save correctness reopened | H2 owns accepted call effects and physical writes; unsupported effects remain explicit |
+| #10 recursion/caller-frame access | Historical 486 caller-frame and 3 recursion recoveries, recursion 64/96 exercised; frame provenance reopened | H2 owns finite select provenance; truly dynamic/unproved frame forms remain explicit |
 | #13 signature precision | Existing metadata/CRT/import-thunk/inference path retained; exact authored contracts remain precise; unknown host calls consume all four GPR and XMM argument possibilities and retain RAX/XMM0 returns | No invented narrow signature or guessed unknown stack-argument count; broader signature work is not declared closed |
 | #16 dead dependencies | Successor-aware per-bit analysis admits native flag writers only when their outputs are proved dead; partial writes, native reads, calls and memory effects retain their dependencies | Unmodeled native flag effects and variable-count carry semantics remain H5 work |
 | #23 preservation | All 23 real corpus members pass without re-blessing protected outputs; actual GuardCF RAX input and phi-alias roots repaired | Handler/personality reconstruction and the disclosed INT29 paths remain H5/H6; not umbrella closure |
 | #8 preservation | Native physical operand pins/effects survive memory-backed lowering; native bit-string widths/offsets preserved | FS/GS and unknown native classes remain H5 limits |
 | #17 bounded prerequisite | Existing one-plan reference/link ownership extended for frame/probe/helper and validated typed metadata consumers | Not whole-image compaction or every reference consumer; H4 retains global compaction |
-| #20 bounded prerequisite | Actual frame saves/page probes feed real unwind generation; independent Windows native-PC oracle passes | **5 EhNoBucketCreation**, handler/scope/personality and broader EH remain H6 |
+| #20 bounded prerequisite | Historical actual-save/probe generation and Windows native-PC oracle; accepted-contract body unwind reopened | H2 owns plain body call effects/saves; **5 EhNoBucketCreation** and handler/scope/personality remain H6 |
 | #30 bounded prerequisite | Validated BaseReloc storage classification retains the real relocation records and existing field rebasing/rebuild; code-shaped scalar headers no longer pin movers | HIGHLOW/opaque-reference limits stay conservative; global layout work remains H4, not issue-wide closure |
 | #32 preserved prerequisites | The intact combined Rust callback executes identity/full MBA through the shared backend and linker | Compiled Rust startup, ordinary imports, std/runtime/TLS and lifecycle remain H3 |
 
@@ -996,5 +997,114 @@ variable-count carry semantics, broader ISA/native classes and EH remain later
 work. H3 Rust std/import/startup/lifecycle and H4 global compaction are not
 implemented here. The intentional H1 generated loader remains; this is not a
 claim to have compiled that loader or completed H3. No remote issue is claimed
-closed, and no #36 output-optimization work or stronger MBA is claimed.
+closed. The narrow read-only-pin-save and duplicate-pin-map findings below are
+H2 reacceptance requirements related to #36; this does not pull all #36 output
+optimization or stronger MBA into H2.
+
+### Post-acceptance review — 2026-10-22
+
+**Disposition: reopened; no production fixes yet.** The later findings below
+withdraw acceptance at `278f5ef81dd096e8325c06bd02ba7c88b84b0646` / publication
+`d1c70e1`, not the historical counts or successful executions above. Static
+findings are not reproduced crashes or measured slowdowns. All seven belong to
+H2 reacceptance; they do not expand H2 into all #36, H3–H7, or language-handler
+reconstruction. Preserve D40's concrete frames, memory homes, bounded scratch,
+one backend and one rebuild.
+
+| Issue | Review root | Evidence status | Current disposition |
+|---|---|---|---|
+| [#37](https://github.com/mkxto/kamy/issues/37) | Finite select provenance | Confirmed native miscompile | Unfixed; H2 reacceptance pending |
+| [#38](https://github.com/mkxto/kamy/issues/38) | Accepted call-contract unwind | Static finding; not runtime reproduced | Unfixed; reachability/native oracle required |
+| [#39](https://github.com/mkxto/kamy/issues/39) | Scalar-DAG work | Static complexity; no timings measured | Unfixed; bounded-work evidence required |
+| [#40](https://github.com/mkxto/kamy/issues/40) | Dominator storage | Static allocation; no timings measured | Unfixed; scaling/allocation evidence required |
+| [#41](https://github.com/mkxto/kamy/issues/41) | Phi-copy planning | Static complexity; no timings measured | Unfixed; scaling/results required |
+| [#42](https://github.com/mkxto/kamy/issues/42) | Read-only pin saves | Source analysis; no size/timing measurement | Unfixed; actual-write/save evidence required |
+| [#43](https://github.com/mkxto/kamy/issues/43) | Duplicate global pin map | Source analysis | Unfixed; consumer migration/allocation evidence required |
+
+
+#### Confirmed finite CMOV/select counterexample
+
+The native witness uses the Win64 six-`u64` call contract: arg1 is the condition,
+args2–4 are zero, arg5 is `0x1122334455667788` and arg6 is
+`0x8877665544332211`. Protect only this function through the existing
+`crates/kamy-link/tests/memory_frames.rs` fixture/encode/protect/native mapper,
+using the exact six-argument signature and identity (`mba=false`):
+
+```asm
+sub rsp, 24
+lea rax, [rsp+8]
+lea rdx, [rsp+16]
+test rcx, rcx
+cmovne rax, rdx
+add rax, 56
+mov rax, [rax]
+add rsp, 24
+ret
+```
+
+At entry RSP `E`, the selected pointers are `E-16` and `E-8`; adding 56
+reaches `E+40` / `E+48`, the fifth/sixth argument. The actual
+producer → SSA → link → machine path ran through `kamy_run::run_traced`:
+
+```text
+ssa_lowered=true rejected=[]
+condition=0 original=0x1122334455667788 identity=0x00000051b28ff0c0 match=false
+condition=1 original=0x8877665544332211 identity=0x00000051b28ff810 match=false
+exit=Some(0) timed_out=false fault=None
+```
+
+The wrong pointer-like values are run-specific. The harness prints comparisons
+and exits normally: exit 0 is NOT a correctness oracle. Local supporting source
+`C:/dev/kamy-handoff2-select-review.rs` and
+`target/sdk-rebuild-handoff2/select-review-runtime.txt` are supplemental, not
+portable regression prerequisites. This finite supported witness MUST lower
+correctly in identity and requested supported MBA, not be rejected wholesale,
+special-cased or run at lower intensity. Truly unprovable selections may reject
+specifically and atomically.
+
+#### Mandatory reacceptance evidence ledger
+
+The [numbered H2 acceptance matrix](handoffs/02-memory-backed-lowering.md#required-acceptance-matrix)
+retains all original gates and adds the manual CLI/runtime/IDA gate. Each of the
+seven findings MUST have a repair or reproducible disproof recorded here before
+H2 is complete. Deferral or narrower acceptance requires user approval.
+
+For each finding, record before/after tool versions (including IDA), commit and
+build identity, input/output hashes or equivalent identities, commands/results,
+old/new symbol and RVA maps, annotated relevant PC ranges, ABI and IDA analysis
+adjustments, and native/analysis oracles. Manually run the in-tree triage/bisect,
+IR dumps through regalloc, identity/requested-MBA protection and explain-reject
+tooling as applicable; retain output-value oracles for exit-0 miscompiles.
+Inspect the exact rebuilt outputs in IDA and execute those same outputs under
+identity and requested MBA. Verify frame/home/phi/flags/call-result addressing
+and preservation; use actual accepted call producers/consumers plus Windows
+`RtlLookupFunctionEntry` / `RtlVirtualUnwind` over body/epilogue PCs under forced
+ASLR for call/save/unwind findings. Record actual DAG/CFG/phi size/work/allocation
+scaling, not theoretical timings or flaky wallclock assertions. Commit portable
+regressions with platform gates; temporary local artifacts are supplemental.
+Tests alone, screenshots or decompiler prettiness are NOT correctness proof.
+
+The later scoped `demo-frame-identity.dll` observation used `frame.yml` plus
+`--ssa-identity`: **8 selected / 8 lowered / 0 transformed**, actual intensity
+**0.0**. Its headless SDK probe printed
+`frame_runtime=PASS depth=64 original_object=4096 large_object=24576 aslr=1`,
+with `exit=Some(0)`, no timeout and no fault. `frame_mix6` moved from source
+RVA `0x10c0` to `0x69a0` (VA `0x1800069a0`): **39 → 443 bytes**, frame
+**224 bytes**, **24 homes**. IDA initially split the function at state ranges
+of **7 / 435 / 1 bytes**. The integration owner coalesced IDA function
+definitions to the link report's 443-byte extent, applied the real six-`u64`
+Win64 source ABI and reanalyzed without changing binary bytes. Hex-Rays then
+returned `8*e + ((a+3*b) ^ (d+5*c)) - e - 11*f`.
+
+This is identity-only output-quality context for #36, not proof of MBA behavior,
+the select fix or custom-clobber unwind. The demo passed while the separate
+selected-pointer witness failed both conditions. IDA version evidence was not
+collected for this observation; it does not satisfy the expanded gate. Supporting
+`.dll.i64`, `.c` and `.logical.asm` files are ignored target artifacts, not portable
+prerequisites. IDA function fragmentation is not an unwind defect: equal states
+already coalesce, while distinct ranges follow the current zero-prologue
+state-snapshot model. No requirement to eliminate all memory-home traffic is
+added. Historical identity/MBA runtime and native-unwind successes above remain
+scoped to their recorded fixtures, not universal acceptance.
+
 

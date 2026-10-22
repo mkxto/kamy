@@ -6,29 +6,44 @@ its evidence. Do not recreate its symbolic model or link plan.
 
 ## Completion notice
 
-**Status: Completed.** Policy commit `5ef9b46` (D40); accepted implementation
-commit `278f5ef81dd096e8325c06bd02ba7c88b84b0646` (`Lower SSA through concrete
-memory-backed frames`). H2 acceptance covers concrete original/generated frame
-coordinates, real memory-backed intermediates and explicit flags, bounded
-scratch working sets, supported live-across-call and recursion recovery, and
-actual-frame probing/unwind through the shared host/module backend. Pressure
-rejection and transform-intensity retries are retired, not retained as fallback.
-This notice and the [master register](00-master.md#completion-register) record
-accepted handoff scope, not umbrella or remote issue closure.
+**Status: Incomplete / Reopened 2026-10-22 after later analysis.** Acceptance
+of implementation `278f5ef81dd096e8325c06bd02ba7c88b84b0646` (`Lower SSA through
+concrete memory-backed frames`), published at `d1c70e1`, is withdrawn. Policy
+`5ef9b46` (D40) and the concrete-frame/memory-backed design remain binding:
+one backend, bounded scratch, one rebuild, explicit flags and actual-body unwind.
+Pressure rejection and transform-intensity retries MUST NOT return as fallback.
+The seven findings in the [post-acceptance review ledger](../STATUS.md#post-acceptance-review--2026-10-22)
+MUST all be fixed or reproducibly disproved before reacceptance; no production
+fixes have been applied. Deferral or narrowing requires user approval.
+The earlier tests, corpus and SDK executions remain historical successes, not
+current proof for the reopened areas. H2 repair/reacceptance is next; H3 MUST wait.
+This notice and the [master register](00-master.md#completion-register) track
+handoff acceptance, not umbrella or remote issue closure.
+
+Reopened H2 issues (all unfixed; evidence status/details in STATUS):
+[select provenance #37](https://github.com/mkxto/kamy/issues/37) (confirmed native
+miscompile), [call-contract unwind #38](https://github.com/mkxto/kamy/issues/38)
+(static, not runtime reproduced), [scalar-DAG work #39](https://github.com/mkxto/kamy/issues/39),
+[dominator storage #40](https://github.com/mkxto/kamy/issues/40) and
+[phi-copy planning #41](https://github.com/mkxto/kamy/issues/41) (static complexity/
+allocation, no measured timings), [read-only pin saves #42](https://github.com/mkxto/kamy/issues/42)
+and [duplicate global pin map #43](https://github.com/mkxto/kamy/issues/43)
+(source-analysis findings). #42/#43 are narrow H2 obligations related to #36,
+not a transfer of all output optimization into H2.
 
 | Issue scope | Delivered scope and disposition | Residual owner |
 |---|---|---|
-| #15 | H2 frame/pressure acceptance satisfied: real homes, concrete coordinates and bounded resources | Unproved/dynamic frames remain explicit; no issue-wide closure |
-| #6 | Applicability satisfied under D40: memory homes replace the superseded zero-spill default | No requirement to restore the old scheduling design |
-| #5 applicability | Existing requested MBA intensity preserved; no pressure-driven reduction | Stronger/nonlinear protection remains separate |
-| #9 | Supported volatile-pinned/live-across-call acceptance satisfied by after-definition capture and homes | Unsupported native/ABI effects remain semantic limits |
-| #10 | Supported caller-frame/recursion acceptance satisfied without duplicating original storage; 486 caller-frame and 3 recursion functions recovered | Unproved frame joins/forms remain explicit |
+| #15 | Historical frame/pressure delivery: real homes, concrete coordinates and bounded resources; acceptance reopened | H2 owns finite select provenance and bounded analysis/copy planning; unproved/dynamic frames remain explicit |
+| #6 | Historical D40 cutover: memory homes replace the superseded zero-spill default; reacceptance pending | H2 owns bounded DAG/CFG/phi work and one authoritative boundary-pin map; no return to the old scheduling design |
+| #5 applicability | Historical requested MBA intensity preserved; reacceptance pending under the new witnesses | No pressure-driven reduction; stronger/nonlinear protection remains separate |
+| #9 | Historical after-definition capture/home delivery; call-result and save correctness reopened | H2 owns accepted call effects, actual physical writes and caller-state preservation |
+| #10 | Historical caller-frame/recursion delivery: 486 caller-frame and 3 recursion functions recovered; frame provenance reopened | H2 owns the finite CMOV/select witness; truly unproved frame forms remain explicit |
 | #13 | Partial: existing metadata/CRT/import-thunk/inference retained; exact authored ABI and conservative unknown-host calls preserved | Broader signature precision is not declared complete |
 | #16 | Partial: successor-aware per-bit dead-flag dependencies removed only when proved dead | H5 owns unmodeled flags and variable-count carry semantics |
 | #23 | Preserved: all 23 corpus members pass; GuardCF input and phi-alias root repairs included | H5/H6 own native termination/EH residuals, including two disclosed INT29 losses |
 | #8 | Preserved: physical native pins/effects and bit-string widths/offsets survive the cutover | H5 owns FS/GS and unknown native classes |
 | #17 | Bounded prerequisite: one-plan references extended for frame/probe/helper and typed metadata consumers | H4 global compaction and later reference residuals remain |
-| #20 | Bounded prerequisite: real saves/probes/unwind with independent Windows native-PC proof | H6 owns missing buckets and handler/scope/personality reconstruction |
+| #20 | Historical real saves/probes/unwind and Windows native-PC proof; accepted-contract body unwind reopened | H2 owns plain actual-body call effects and correct saves; H6 retains handler/scope/personality reconstruction |
 | #30 | Bounded prerequisite: validated BaseReloc scalar ownership preserves records and field rebasing/rebuild | HIGHLOW/opaque-reference limits remain conservative; H4 owns global layout |
 | #32 | Preserved prerequisite: intact combined Rust callback executes identity and full MBA through the shared backend | H3 owns compiled startup, ordinary imports, std/runtime/TLS and lifecycle |
 
@@ -36,7 +51,7 @@ accepted handoff scope, not umbrella or remote issue closure.
 
 The [H2 STATUS record](../STATUS.md#d40-repair-campaign--h2-concrete-frames-and-memory-backed-lowering)
 contains actual commands and detailed allocation, rejection, transition and
-issue tables. All four workspace gates passed: **427 tests / 47 suites**.
+issue tables. Historically all four workspace gates passed: **427 tests / 47 suites**.
 Fresh SDK `all --scope full` exited **0**, `sdk-rebuild=full PASS`, rebuilding
 hosts and regenerating **11 normal artifacts** plus the dynamic negative
 artifact before the full strict runtime matrix. No witness was skipped or
@@ -71,7 +86,7 @@ protection-strength/output-optimization work retain their scopes.
 
 ### Successor contract
 
-H3 MUST reuse the [concrete code-generation contract](../architecture.md#81-code-generation):
+After H2 reacceptance, H3 MUST reuse the [concrete code-generation contract](../architecture.md#81-code-generation):
 `FrameAnalysis`, `ConcreteFrame`, `FrameHome`, `FrameSave` and `RegAllocation`;
 `allocate_registers(func, rsp_pinned, reg_pins)` and
 `select_instructions(func, alloc)`; actual `frame.saves` rather than obsolete
@@ -290,6 +305,56 @@ before/after witnesses, not only tests that assert new internal structures.
    without using a warning to excuse reduced protection.
 9. Dynamic/unprovable frame or unsupported-semantic fixtures fail specifically
    and deterministically without emitting partially protected output.
+10. All seven [post-acceptance review findings](../STATUS.md#post-acceptance-review--2026-10-22)
+    MUST be fixed or reproducibly disproved. Commit deterministic portable
+    regressions, with Windows execution appropriately gated; supplemental local
+    artifacts MUST NOT become prerequisites. Keep every original gate above.
+    No blanket rejection, witness special case or reduced requested MBA intensity
+    may replace correct lowering of the supported finite select counterexample.
+11. Preserve finite frame-pointer provenance through CMOV/select, subsequent
+    arithmetic and phi/select/copy composition. Execute the ledger's six-argument
+    witness for constant and variable conditions in identity and requested MBA;
+    both branches MUST return the original arg5/arg6 values. Check original LOW,
+    generated HIGH, incoming/home and outgoing coordinates, flags, mixed GPR/XMM
+    homes, phi cycles and after-definition call results against native behavior.
+12. For the call-contract finding, establish reachability with a real accepted ABI
+    producer/consumer, or document reproducible producer evidence disproving it.
+    For accepted RBX/XMM6+ result/clobber cases, correctly unwind successive calls,
+    interior body PCs and epilogues, retaining real saves and standard Win64
+    behavior. Use Windows `RtlLookupFunctionEntry` / `RtlVirtualUnwind` against
+    exact rebuilt outputs under forced ASLR; a static claim or an assumed fixed
+    Win64 mask is not verification of accepted cases. Read-only pins MUST avoid
+    unnecessary saves while actual native/call/output writes retain required saves.
+13. Demonstrate bounded scalar-DAG, CFG/dominator and phi-copy analysis with
+    actual size/work/allocation scaling evidence, not claimed timings. Cover
+    shared successes/failures, cycles, overflow/resource boundaries, candidate-free
+    acyclic CFGs, reducible/irreducible loops, wide/reverse chains and copy cycles.
+    Keep facts fresh after transforms and preserve sound range/rejection semantics;
+    do not hide work with arbitrary threshold rejection or flaky timing assertions.
+    Remove the duplicate global pin map and migrate consumers without adapters.
+14. Before reacceptance, manually exercise the in-tree triage, IR, protection and
+    explain-reject tooling for the relevant witnesses. Inspect source/SSA,
+    transforms and allocation/homes with `kamy dump`; inspect the actual emitted
+    machine code in IDA using old/new symbol and RVA maps for the exact rebuilt
+    identity and requested MBA outputs. Annotate relevant PC ranges, frame/address
+    calculations, ABI and analysis adjustments, calls/results, saves, phi/flag
+    transfers and unwind states. Execute those same native outputs and compare
+    observable values and caller state, including forced-ASLR unwind probes.
+    IDA screenshots or pretty decompilation, and tests alone, are NOT correctness
+    proof.
+    Follow [the in-tree tooling contract](../tooling.md#miscompile-hunt-workflow):
+    `kamy bisect` with an output oracle when exit status alone cannot distinguish
+    failure, `kamy dump` at `lift`, `ssa`, `optimize` and `regalloc`,
+    `kamy protect` with identity and the requested MBA profile plus debug-map/link
+    reports, and `kamy explain-reject` for applicable negative fixtures. Use
+    authored module identities rather than inventing host RVAs for module code.
+15. Record before/after evidence in the existing STATUS/handoff ledger: tool
+    versions (including IDA), implementation commit, build identity, input/output
+    identities or hashes, exact commands/results, old/new symbol/RVA maps,
+    annotated PC/ABI/analysis observations, native oracles and scaling evidence.
+    Explicitly distinguish observed results, static findings and unresolved items.
+    The next owner MUST rerun all original gates after repairs; earlier successful
+    campaigns cannot substitute for this manual CLI/runtime/IDA reacceptance.
 
 The corpus cannot by itself prove this backend: it normally runs identity.
 Exercise transformed fixtures and real module outputs. Keep golden behavior

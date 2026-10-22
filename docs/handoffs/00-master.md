@@ -37,21 +37,31 @@ already exist. Update the register and the numbered handoff's notice together.
 | Handoff | Status | Accepted commits | Completion notice |
 |---|---|---|---|
 | 01 — Unified symbols and single rebuild | **Completed** | Policy `5ef9b46`; implementation `feaffd8` | [01 notice](01-unified-rebuild.md#completion-notice) |
-| 02 — Concrete frames and memory-backed lowering | **Completed** | Policy `5ef9b46`; implementation `278f5ef81dd096e8325c06bd02ba7c88b84b0646` | [02 notice](02-memory-backed-lowering.md#completion-notice) |
+| 02 — Concrete frames and memory-backed lowering | **Incomplete / Reopened 2026-10-22** | Policy `5ef9b46`; historical implementation `278f5ef81dd096e8325c06bd02ba7c88b84b0646` / acceptance publication `d1c70e1`; acceptance withdrawn | [02 notice](02-memory-backed-lowering.md#completion-notice) |
 | 03 — Rust SDK, runtime and lifecycle | Pending | None recorded | [03 notice](03-rust-sdk-runtime.md#completion-notice) |
 | 04 — Whole-image virtual compaction | Pending | None recorded | [04 notice](04-whole-image-compaction.md#completion-notice) |
 | 05 — Instruction, flag and segment semantics | Pending | None recorded | [05 notice](05-instruction-semantics.md#completion-notice) |
 | 06 — Exception semantics | Pending | None recorded | [06 notice](06-exception-semantics.md#completion-notice) |
 | 07 — Control-flow residuals | Pending | None recorded | [07 notice](07-control-flow-residuals.md#completion-notice) |
 
-The next assignment is **03**. Read the [completed H2 notice](02-memory-backed-lowering.md#completion-notice),
-the [H2 evidence and residual ledger](../STATUS.md#d40-repair-campaign--h2-concrete-frames-and-memory-backed-lowering)
-and the [concrete backend contracts](../architecture.md#81-code-generation)
-before taking a fresh baseline. H3 MUST reuse the shared frame, memory-home,
-bounded-scratch, ABI, actual-body unwind and single-link-plan contracts and
-portable fixtures. H1's accepted notice and historical measurements remain
-unchanged. Completed H2 acceptance does not complete Rust std/import/startup/
-lifecycle, broad ISA/EH, CFG enforcement or whole-image compaction.
+The next assignment is **repair and reaccept H2 before H3**. Later analysis on
+2026-10-22 withdrew H2 acceptance; the earlier tests, corpus and SDK successes
+remain historical evidence, not current acceptance. Read the
+[reopened H2 notice](02-memory-backed-lowering.md#completion-notice),
+[H2 review ledger](../STATUS.md#post-acceptance-review--2026-10-22) and
+[concrete backend contracts](../architecture.md#81-code-generation).
+All seven review findings MUST be fixed or reproducibly disproved, including
+the mandatory manual tooling, exact-output IDA and native-runtime gate, before
+H2 can be marked complete. Deferral or narrower acceptance requires user approval.
+Preserve the shared frame, memory-home, bounded-scratch, ABI, actual-body unwind
+and single-link-plan contracts and portable fixtures. H1's accepted notice and
+historical measurements remain unchanged. H3 MUST wait; Rust std/import/startup/
+lifecycle, broad ISA/EH, CFG enforcement and whole-image compaction remain outside H2.
+The reopened review scope is [#37](https://github.com/mkxto/kamy/issues/37),
+[#38](https://github.com/mkxto/kamy/issues/38), [#39](https://github.com/mkxto/kamy/issues/39),
+[#40](https://github.com/mkxto/kamy/issues/40), [#41](https://github.com/mkxto/kamy/issues/41),
+[#42](https://github.com/mkxto/kamy/issues/42) and [#43](https://github.com/mkxto/kamy/issues/43).
+The narrow #36-related items do not pull all output-quality work into H2.
 
 ## Completion notices
 
