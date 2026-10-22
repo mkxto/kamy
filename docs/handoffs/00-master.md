@@ -1,4 +1,4 @@
-# Rebuild, allocation and Rust SDK repair campaign
+# Rebuild, allocation, Rust SDK and coverage campaign
 
 ## How to use this handoff
 
@@ -8,6 +8,17 @@ Read this file with each numbered prompt. Execute the prompts in this order:
 2. [Concrete frames and memory-backed lowering](02-memory-backed-lowering.md)
 3. [Rust SDK, standard library and entry lifecycle](03-rust-sdk-runtime.md)
 4. [Whole-image virtual compaction](04-whole-image-compaction.md)
+5. [Instruction, flag and segment semantics](05-instruction-semantics.md)
+6. [SEH and language-handler reconstruction](06-exception-semantics.md)
+7. [Control-flow recovery residuals](07-control-flow-residuals.md)
+
+Prompts 01–04 retain their original order and acceptance. Prompts 05–07 extend
+the campaign with broad semantic coverage; read
+[coverage-extension.md](coverage-extension.md) for ownership and prerequisite
+rules. Handoff 1 is already in progress: these additions do not restart it,
+change its scope or authorize concurrent edits to its shared implementation.
+Semantic prerequisites pulled forward for SDK/frame acceptance MUST be reused
+by later coverage prompts, not implemented twice.
 
 Each numbered file is a runnable agent assignment, not permission to call an
 intermediate architecture the finished campaign. The next assignment consumes
@@ -24,7 +35,8 @@ These decisions were explicitly selected or confirmed during the grilling
 session:
 
 - Produce separate, ordered implementation prompts rather than one undivided
-  assignment. The confirmed order is the four stages above.
+  assignment. The confirmed core order is 01–04; the coverage extension follows
+  as 05–07 without changing the active core assignments.
 - Repair the listed architectural shortcuts. The target is a solid native
   bin2bin rewriter with statically linked SDK modules, aligned with the observed
   CodeDefender design, not merely a runnable callback demo.
@@ -35,8 +47,8 @@ session:
   remain untouched when ordinary imports are explicitly used.
 - Support Rust `std` with `panic=abort`, not only freestanding `no_std` modules.
   Include narrowly necessary operation/runtime prerequisites for the promised
-  SDK acceptance cases. Broad ISA expansion and language unwinding remain a
-  separate semantic-coverage track.
+  SDK acceptance cases. Broad ISA expansion and language unwinding remain
+  separate assignments in 05 and 06, not implicit completion of Prompt 3.
 - Follow CD's memory-backed-intermediate model as the lowering baseline:
   bounded scratch-register working sets, explicit flag state, correct frame
   reconstruction. Pressure must not force rejection or reduce the requested
@@ -107,16 +119,25 @@ claim that each issue is wholly unfinished.
 |---|---|---|
 | Reference/link/rebuild | #17, #18, #19, #20, #22, #27, #30, #33, #35 | Preserve the real thunk-free cutover; integrate symbols and final layout rather than replace it with another backend |
 | SDK/entry modules | #32; #27/#35 dependencies | Rust-only static linking, compiled loader, ordinary imports, std/runtime and correct EXE/DLL lifecycle |
-| Frame/allocation | #15, #6, #5; related #9/#10 | #15 is the concrete-frame prerequisite; #6's current pressure-bounded zero-spill thesis is not the newly agreed default; #5 mixes allocation and future MBA-strength work |
-| Cheap allocation complements | #16, #13 | #13 already has a working DB/import-thunk/inference path; inspect and extend residual gaps, do not reimplement it |
-| Broader semantics | #11, #12, #14, #26; residual #23 | Keep as a distinct track except required prerequisites for the explicitly promised SDK/frame cases |
+| Frame/allocation | #15, #6, #5; related #9/#10 | Prompt 02 owns frames, memory-backed lowering, supported live-across-call recovery and recursion; #5's strength work stays separate |
+| Cheap allocation complements | #16, #13 | Prompt 02 owns residuals; the DB/import-thunk/inference path already exists and MUST NOT be reimplemented |
+| Instruction/flag/segment semantics | #11, #26; preserve fixed #8 | Prompt 05 consumes earlier prerequisite implementations and completes the residual semantic matrix |
+| Exception semantics | #12/#20; residual #23 | Prompt 06 owns handler/scope/personality reconstruction; plain frame unwind alone does not satisfy it |
+| Control-flow residuals | #14/#18/#19 | Prompt 07 extends proved recovery and table-free lowering; #21 stays closed/not planned |
 | Naming/profiles | #28, #29, #34 | Reuse existing names, selectors, groups, xrefs, PDB work and section-name policy; fix contract behavior, not protective strength |
 | Later protection strength | strength portion of #5 and future pass work | Do not expand this campaign into new nonlinear MBA/CFF/VM/import-hiding products |
+| Backend code quality | #36 | Separate optimization milestone; do not reduce coverage or protective intensity to improve size/runtime |
+| Fantasy features | #2/#3/#4 | Not assigned by these handoffs |
 
 Examples of stale issue statements to reject: verbatim relocation on failure,
 `NoThunkSpace`, unwired callee-saved XMM pool, wholly absent Win32metadata, and
 old crash diagnoses already corrected in #23. GPR/XMM resources are separate
 register classes, not an interchangeable pool of "25 registers."
+
+#8 is closed/completed: preserve its NativeInline operand-pinning fix and
+regressions. #21 is closed/not planned: do not resurrect jump-table patching.
+The extension's historical rejection counts are not acceptance baselines;
+measure the actual integrated tree after predecessor edits have settled.
 
 Do not close or rewrite remote issues wholesale during research. Reconcile
 status locally with evidence; publish or close issues only when authorized,
@@ -196,7 +217,7 @@ invariant simply because it limits coverage:
   an approved mechanism, not automatically a bandaid. Opaque consumers still
   constrain placement; a map alone cannot make them safe.
 
-## Architecture boundaries across all four prompts
+## Architecture boundaries across all prompts
 
 One shared symbol/expression model, one lowering backend, one frame model, one
 final layout/rebuild. Host inference and compiler-authored module provenance
@@ -218,6 +239,11 @@ Prompt 1 establishes shared contracts before Prompt 2 changes frame/lowering
 consumers. Prompt 3 integrates the complete SDK/runtime through those contracts.
 Prompt 4 adds global placement to the same link plan, never a second compactor
 that independently rediscovers references or re-emits the PE.
+Prompts 05–07 extend that same pipeline with instruction semantics, exceptional
+control/state and proved control-flow recovery. They MUST consume completed
+02/03 prerequisites and preserve 04's layout constraints, not introduce another
+backend, EH frame convention or reference model. Protective strength and #36
+code-quality work remain separately accounted for.
 
 If a true dependency crosses this order, make it explicit and coordinate the
 small prerequisite rather than making a temporary parallel path. Do not
