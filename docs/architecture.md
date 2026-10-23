@@ -428,21 +428,28 @@ Every pass must:
 
 ### 8.1 Code Generation
 `allocate_registers(func, rsp_pinned, reg_pins)` returns `RegAllocation` with
-homes, boundary pins, `FrameAnalysis` and `ConcreteFrame`.
+homes, one global boundary-pin map (`pins`), `FrameAnalysis` and `ConcreteFrame`.
 `select_instructions(func, alloc)` consumes that allocation and returns symbolic
 selected instructions. There are no saved-register vectors, image-base/entry-VA
 arguments or exported callee-save-pool helpers. Canonical GPR/XMM save pools are
 internal; `frame.saves: Vec<FrameSave>` is the actual save/unwind contract.
+Dedicated preservation follows actual physical writes/effects: incoming `Undef`
+capture is read-only, but boundary argument/native-read reloads and native/call/
+output writes remain writes.
 `construct_ssa(&mut LiftResult) -> Result<(), RejectionReason>` is mandatory
 before transforms, including identity lowering.
+Selection uses bounded instruction-local operand/destination mappings and flag
+scratch, not global `assignments` or `flag_scratch` state. Pins constrain ABI/native
+boundaries; they are not register-resident live ranges.
 
 Every materialized intermediate has a width/alignment/class-aware `FrameHome`.
 Ordinary working sets are seven GPRs (RAX, RCX, RDX, R8–R11) and four XMMs
 (XMM0–XMM3). Other explicit ABI/native registers are boundary constraints, not
 extra interchangeable scratch registers. Flags are explicit memory-backed
 booleans. Definedness and class checks precede selection; after-definition
-capture preserves ABI results. Mixed memory phis use edge copies, cycle-safe
-parallel copies and critical-edge splitting, with a dedicated copy slot.
+capture preserves ABI results. Mixed memory phis use critical-edge splitting and
+simultaneous edge copies scheduled by a dependency worklist; cycles drain through
+the dedicated copy slot before it is reused.
 
 There is one frame, one backend and one link plan. Let E be actual entry RSP,
 N = `original_size`, S = `stack_size`, and B = E − S be generated body RSP:
@@ -467,6 +474,19 @@ checked pre-MBA loop bounds; rewrites MUST preserve that proof. Logical scalar
 extraction applies only to fully proved subtractive pointer pairs. Mixed
 call-returned aliases remain runtime coordinates. Unproved dynamic addresses
 fail specifically rather than acquiring fabricated bounds.
+Finite `Select`/`Phi`/`Copy` provenance retains feasible original entry-RSP
+coordinates through subsequent offsets, rather than treating gaps in a bounding
+interval as possible accesses. Constant conditions use settled facts, independent
+of block numbering. Address arithmetic uses logical coordinates when crossing
+zones, then maps the final coordinate by the rule above; relocated intermediate
+addresses are not original coordinates.
+
+Scalar range analysis memoizes shared dependencies, failed proofs and cycles for
+one immutable set of facts, definitions and loop bounds; changed IR requires fresh
+analysis. Loop analysis skips dominator construction without reachable phi
+candidates. Otherwise petgraph's compact immediate-dominator tree and Euler
+intervals use O(V + E) storage and constant-time dominance queries; construction
+has O(V²) worst-case time, not universally linear work.
 
 Checked arithmetic/resource IDs bound frames to `MAX_FRAME_SIZE` (16 MiB).
 `FrameDynamic`, `FrameConflict`, `FrameOverflow` and `FrameResourceLimit`

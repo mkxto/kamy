@@ -770,22 +770,26 @@ Observed verification:
 
 ### Verification state and reproducible commands
 
-**H2 is Incomplete / Reopened after later analysis on 2026-10-22.** Acceptance
-of implementation `278f5ef81dd096e8325c06bd02ba7c88b84b0646` (`Lower SSA through
-concrete memory-backed frames`), published at `d1c70e1`, is withdrawn. D40 policy
-`5ef9b46` remains binding: concrete frames, memory-backed intermediates/flags,
-bounded scratch, one shared backend and one rebuild. No production fixes for
-the seven review findings have been applied. All MUST be fixed or reproducibly
-disproved before reacceptance; deferral/narrowing requires user approval.
+**H2 remains Incomplete / Reopened; H3 waits.** Acceptance of implementation
+`278f5ef81dd096e8325c06bd02ba7c88b84b0646` (`Lower SSA through concrete
+memory-backed frames`), published at `d1c70e1`, was withdrawn on 2026-10-22.
+All seven review findings now have a fix or scoped producer disproof in the
+authoritative ledger below. The sole remaining formal H2 gate is the unavailable
+original 23-member locked corpus; the available four-member run is not a substitute.
+D40 policy `5ef9b46` remains binding: concrete frames, memory-backed
+intermediates/flags, bounded scratch, one shared backend and one rebuild.
 The [H2 completion notice](handoffs/02-memory-backed-lowering.md#completion-notice)
 and [master register](handoffs/00-master.md#completion-register) track the same
 state. **Repair and reaccept H2 before H3.** H1 acceptance remains unchanged.
 The earlier tests, corpus and full SDK/runtime/unwind successes below remain
 historical observations, not current acceptance or remote issue closure.
 
-The fresh pre-H2 baseline was **314 tests / 41 suites**, **23/23 corpus PASS**,
-**1,721 lowered / 9,481 rejected**. After the final API cutover the integration
-owner ran all four workspace gates green: **427 tests / 47 suites**.
+The following implementation-era receipts, through the pre-repair NOW evidence,
+are **historical snapshots**, not the current repair result. The fresh pre-H2
+baseline was **314 tests / 41 suites**, **23/23 corpus PASS**, **1,721 lowered /
+9,481 rejected**. After the API cutover all four workspace gates passed:
+**427 tests / 47 suites**. Current evidence is in the
+[2026-10-23 repair section](#current-h2-repair-evidence--2026-10-23).
 
 ```sh
 cargo fmt --all --check
@@ -976,53 +980,52 @@ These are semantic/ownership repairs, not pressure-masking bandaids.
 
 | Issue / scope | H2 implementation and evidence | Remaining ownership |
 |---|---|---|
-| #15 frame/pressure recovery | Historical concrete-frame/home cutover and stable-cohort/runtime evidence above; acceptance reopened | H2 owns finite select provenance and bounded analysis/copy planning; no umbrella closure |
-| #6 serial scheduling / zero-spill policy | Historical D40 bounded-scratch/memory-home cutover; reacceptance pending | H2 owns bounded DAG/CFG/phi work and one authoritative global pin representation; no return to zero-spill |
-| #5 applicability | Historical requested existing MBA intensity retained | Reacceptance MUST preserve requested intensity; stronger/nonlinear MBA stays separate |
-| #9 volatile-pinned live-across-call | Historical after-definition capture/home delivery and runtime witness; call-result/save correctness reopened | H2 owns accepted call effects and physical writes; unsupported effects remain explicit |
-| #10 recursion/caller-frame access | Historical 486 caller-frame and 3 recursion recoveries, recursion 64/96 exercised; frame provenance reopened | H2 owns finite select provenance; truly dynamic/unproved frame forms remain explicit |
+| #15 frame/pressure recovery | Historical concrete-frame/home cutover; finite select repair #37 and bounded analysis/copy repairs #39–41 below | Original-population H2 gate remains open; no umbrella closure |
+| #6 serial scheduling / zero-spill policy | Bounded scratch/memory homes retained; bounded DAG/CFG/phi work and one global pin map repaired | No return to zero-spill; no umbrella closure |
+| #5 applicability | Requested existing MBA intensity retained in genuine transforming native/SDK cases below | Stronger/nonlinear MBA remains separate; raw normalized select ledger has no eligible MBA |
+| #9 volatile-pinned live-across-call | After-definition capture/home delivery retained; supported-producer #38 disproof and actual-write saves #42 below | Arbitrary custom ABI and unsupported effects are not covered |
+| #10 recursion/caller-frame access | Historical 486 caller-frame and 3 recursion recoveries; recursion 64/96 exercised; finite frame provenance repaired | Truly dynamic/unproved frame forms remain explicit; no umbrella closure |
 | #13 signature precision | Existing metadata/CRT/import-thunk/inference path retained; exact authored contracts remain precise; unknown host calls consume all four GPR and XMM argument possibilities and retain RAX/XMM0 returns | No invented narrow signature or guessed unknown stack-argument count; broader signature work is not declared closed |
 | #16 dead dependencies | Successor-aware per-bit analysis admits native flag writers only when their outputs are proved dead; partial writes, native reads, calls and memory effects retain their dependencies | Unmodeled native flag effects and variable-count carry semantics remain H5 work |
-| #23 preservation | All 23 real corpus members pass without re-blessing protected outputs; actual GuardCF RAX input and phi-alias roots repaired | Handler/personality reconstruction and the disclosed INT29 paths remain H5/H6; not umbrella closure |
+| #23 preservation | Historical 23/23 receipt above; current available 4/4 and stable 3,532-identity cohort below, without re-blessing originals/goldens | Original 23-member gate remains open; handler/personality and INT29 paths remain H5/H6; no umbrella closure |
 | #8 preservation | Native physical operand pins/effects survive memory-backed lowering; native bit-string widths/offsets preserved | FS/GS and unknown native classes remain H5 limits |
 | #17 bounded prerequisite | Existing one-plan reference/link ownership extended for frame/probe/helper and validated typed metadata consumers | Not whole-image compaction or every reference consumer; H4 retains global compaction |
-| #20 bounded prerequisite | Historical actual-save/probe generation and Windows native-PC oracle; accepted-contract body unwind reopened | H2 owns plain body call effects/saves; **5 EhNoBucketCreation** and handler/scope/personality remain H6 |
+| #20 bounded prerequisite | Actual-write saves and registered native-PC oracle below; ordinary supported call-contract concern scoped-disproved | **5 historical EhNoBucketCreation** and handler/scope/personality remain H6; arbitrary ABI is not proved |
 | #30 bounded prerequisite | Validated BaseReloc storage classification retains the real relocation records and existing field rebasing/rebuild; code-shaped scalar headers no longer pin movers | HIGHLOW/opaque-reference limits stay conservative; global layout work remains H4, not issue-wide closure |
 | #32 preserved prerequisites | The intact combined Rust callback executes identity/full MBA through the shared backend and linker | Compiled Rust startup, ordinary imports, std/runtime/TLS and lifecycle remain H3 |
 
-After this campaign **5 FrameDynamic** and **5 EhNoBucketCreation** rejections
-remain genuine current limits. Other unchanged semantic/reference reasons in the
-table are not declared repaired merely because the suite passes. FS/GS,
-variable-count carry semantics, broader ISA/native classes and EH remain later
-work. H3 Rust std/import/startup/lifecycle and H4 global compaction are not
-implemented here. The intentional H1 generated loader remains; this is not a
-claim to have compiled that loader or completed H3. No remote issue is claimed
-closed. The narrow read-only-pin-save and duplicate-pin-map findings below are
-H2 reacceptance requirements related to #36; this does not pull all #36 output
-optimization or stronger MBA into H2.
+The implementation-era snapshot retained **5 FrameDynamic** and **5
+EhNoBucketCreation** rejections. Other unchanged semantic/reference reasons are
+not declared repaired merely because the suite passes. FS/GS, variable-count
+carry semantics, broader ISA/native classes and EH remain later work. H3 Rust
+std/import/startup/lifecycle and H4 global compaction are not implemented here.
+The intentional H1 generated loader remains; this is not a claim to have compiled
+that loader or completed H3. **No remote issue is claimed closed.** The narrow
+read-only-pin-save and duplicate-pin-map findings below are disposed within H2;
+this does not pull all #36 output optimization or stronger MBA into H2.
 
 ### Post-acceptance review — 2026-10-22
 
-**Disposition: reopened; no production fixes yet.** The later findings below
-withdraw acceptance at `278f5ef81dd096e8325c06bd02ba7c88b84b0646` / publication
-`d1c70e1`, not the historical counts or successful executions above. Static
-findings are not reproduced crashes or measured slowdowns. All seven belong to
-H2 reacceptance; they do not expand H2 into all #36, H3–H7, or language-handler
-reconstruction. Preserve D40's concrete frames, memory homes, bounded scratch,
-one backend and one rebuild.
+The **historical review** withdrew acceptance at
+`278f5ef81dd096e8325c06bd02ba7c88b84b0646` / publication `d1c70e1`, not the
+historical counts or successful executions above. At that time #37 was a native
+wrong-result reproduction; #38–43 were source findings, not measured native
+crashes or wallclock slowdowns. The table is the **current authoritative
+seven-finding disposition**, backed by the current repair section. Its scope
+does not expand H2 into all #36, H3–H7 or language-handler reconstruction.
 
-| Issue | Current evidence / status | Required result before H2 reacceptance | Regression / oracle | Unresolved question |
+| Issue | Current evidence / status | Implemented result | Regression / oracle | Evidence limit |
 |---|---|---|---|---|
-| [#37](https://github.com/mkxto/kamy/issues/37) — finite select provenance | Confirmed native wrong-result miscompile with normal exit 0; unfixed | Preserve finite selected-frame coordinates through subsequent addressing; supported witness MUST lower correctly in identity and requested supported MBA, without blanket rejection or reduced intensity | `dll_frame_select` original arg5/arg6 output oracle through `kamy corpus verify`; portable constant/variable-condition and phi/select/copy composition cases across both coordinate zones; emitted-address inspection and native comparison | Which finite provenance representation preserves all supported compositions while rejecting truly unprovable selections specifically and atomically? |
-| [#38](https://github.com/mkxto/kamy/issues/38) — accepted call-contract unwind | Static finding, not a native unwind reproduction; real accepted producer reachability unresolved; unfixed | Establish actual accepted ABI producer/consumer reachability and caller-state loss, or reproducibly disprove it; use resolved call effects and genuine save provenance in plain-body unwind | Real RBX/XMM6+ result/clobber contracts, successive calls and standard Win64 controls; forced-ASLR `RtlLookupFunctionEntry` / `RtlVirtualUnwind` over body/epilogue PCs with real prologue saves | Can the actual accepted producer emit the concerning nonvolatile result/clobber contract? Arbitrary invented ABI metadata does not answer this. |
-| [#39](https://github.com/mkxto/kamy/issues/39) — scalar-DAG work | Static repeated-traversal finding; no timings measured; unfixed | Bound shared-dependency evaluation, including failed results and cycles, while preserving range/overflow/resource distinctions and refreshed transform facts | Deterministic shared-DAG, cycle, overflow and boundary cases; actual work/size evidence plus indexed-frame native output/addressing oracle; no huge potentially hanging input or flaky wallclock assertion | What measured work bound applies to shared scalar DAGs without accepting unsound ranges? |
-| [#40](https://github.com/mkxto/kamy/issues/40) — dominator storage | Static quadratic-entry allocation finding; no timings or OOM measured; unfixed | Skip candidate-free analysis and bound needed dominator storage without threshold rejection, discarded blocks or stale facts | Acyclic and loop scaling/allocation evidence; correct headers/bounds for reducible and irreducible CFGs; native control-flow/addressing comparison | What actual allocation/scaling remains when loop candidates do require analysis? |
-| [#41](https://github.com/mkxto/kamy/issues/41) — phi-copy planning | Static worst-case complexity finding; no timings or hang measured; unfixed | Bound dependency planning using the existing cycle-scratch convention and single backend; preserve consumer results | Wide/reverse-chain work scaling; mixed GPR/XMM/flag homes, constants/frame-address sources, self copies and multiple cycles; emitted-transfer inspection and native results, not incidental register sequences | What deterministic planning-work bound holds for wide chains and multiple cycles? |
-| [#42](https://github.com/mkxto/kamy/issues/42) — read-only pin saves | Source-analysis finding; no size/frame reduction or timing measured; unfixed | Derive required saves from actual physical writes/effects in the shared frame/save/unwind model; avoid extra read-only-input saves while retaining real write saves | Read-only RBX/XMM6 inputs versus native/call/output writes and boundary loads; compare actual frame/prologue/body/epilogue, outputs and native unwind state | Which boundary operations really write each nonvolatile register? A native read loaded into a register is still a physical write. |
-| [#43](https://github.com/mkxto/kamy/issues/43) — duplicate global pin map | Source-analysis finding; allocation impact unmeasured; unfixed | One authoritative global boundary-pin representation; instruction-local mapping only where consumed; migrate all callers/tests/docs without aliases or shims | Reference/consumer audit before exported-shape changes; identity/MBA/native/call/phi behavior preservation, actual allocation evidence and native output/unwind inspection | Which consumers require instruction-local assignments rather than global pins, and what allocation is actually removed? |
+| [#37](https://github.com/mkxto/kamy/issues/37) — finite select provenance | **Fixed**, `d87d989`; original wrong-result witness now passes both conditions | Finite Select/Phi/Copy provenance and final logical-coordinate mapping; delayed constants and separated final zones included | [Core frame regressions](../crates/kamy-core/src/frame.rs): `delayed_select_condition_is_independent_of_block_order`, `split_select_accesses_expand_only_actual_offset_alternatives`; [full-link native regressions](../crates/kamy-link/tests/memory_frames.rs): `exact_six_argument_select_ledger_witness_lowers_in_both_profiles`, finite phi/select/index/flags/call compositions; [actual values](../target/h2-repair/final-dll-values.log) | Exact normalized ledger has **0 eligible MBA**; adjacent and SDK witnesses genuinely transform at requested intensity **1.0**; truly unproved choices still reject specifically |
+| [#38](https://github.com/mkxto/kamy/issues/38) — accepted call-contract unwind | **Scoped disproof**, `19bffa6`, for current supported ordinary Rust 1.95 / LLVM 22.1.2 CCC/FastCC producer | Actual compiled module, parsed definitions, resolved real CALL targets and reachable integer/Float64/mixed/aggregate/**24-byte SRet** contracts preserve Win64 nonvolatiles | [Ignored genuine-producer regression](../tests/sdk-rebuild/src/main.rs): `real_rust_llvm_call_contracts_preserve_win64_nonvolatiles`, explicitly rerun **PASS** after committed source; [final producer receipt](../target/h2-repair/real-producer-contract-final.log), SDK native-PC oracle | Not fabricated RBX/XMM6 metadata; not arbitrary LLVM/custom ABI or preservation-override attribute proof |
+| [#39](https://github.com/mkxto/kamy/issues/39) — scalar-DAG work | **Fixed**, `b6f94b2` | Immutable-analysis cache memoizes success, failure and cycles; changed transform facts get fresh analysis | [Bounds regressions](../crates/kamy-core/src/frame/bounds/tests.rs): `scalar_shared_success_and_failure_dags_evaluate_once`, cycle/width/overflow/resource/fact-refresh cases; native indexed-frame consumers | Evaluated nodes **20,003/20,003 success**, **20,001/20,001 failure**; **40,002/40,000 edges**; no wallclock guarantee |
+| [#40](https://github.com/mkxto/kamy/issues/40) — dominator storage | **Fixed**, `c0bfb28` | Candidate-free skip; petgraph immediate dominators plus Euler intervals, **linear storage**, **O(V²) worst-case time** | [Bounds regressions](../crates/kamy-core/src/frame/bounds/tests.rs): candidate-free 20,000-block CFG, loop scaling and **625** small-graph oracle choices; [allocation before](../target/h2-repair/frame-before.csv) / [after](../target/h2-repair/frame-after.csv) | No linear-time claim, threshold rejection or discarded CFG blocks; irreducible unproved frame bounds remain `FrameDynamic` |
+| [#41](https://github.com/mkxto/kamy/issues/41) — phi-copy planning | **Fixed**, `32aaeb4` | Dependency/ready worklist and existing single cycle slot preserve simultaneous transfers | [Parallel-copy tests](../crates/kamy-codegen/src/isel/memory.rs), [native mixed-home phi-cycle consumer](../crates/kamy-link/tests/memory_frames.rs); [work receipt](../target/h2-repair/phi-planning-work.log): **16,384** chain/wide transfers use **98,303 / 81,920** work units | Constants, frame addresses, self copies, multiple cycles, GPR/XMM/flags covered; no incidental-register or elapsed-time oracle |
+| [#42](https://github.com/mkxto/kamy/issues/42) — read-only pin saves | **Fixed**, `3a68d4c`; actual-write frame/save model and registered native unwind evidence | Read-only entry capture needs no dedicated save; native boundary reloads, partial/output/call writes still require real saves | [Codegen native regression](../crates/kamy-codegen/tests/memory_frames.rs): `nonvolatile_read_only_and_real_writes_preserve_results_and_caller_state`; [receipt](../target/h2-repair/nonvolatile-after.log); [full-width native oracle](../tests/sdk-rebuild/src/native_probe.rs) | Full 128-bit XMM preservation; read-only/native-read/partial-write registered PC checks **21/40/32**, body **14/28/19**, epilogue **3/7/7**; not arbitrary handler unwind |
+| [#43](https://github.com/mkxto/kamy/issues/43) — duplicate global pin map | **Fixed**, `57eb3b1` | One authoritative global pins map; private instruction-local state bounded to four values, consumers migrated without compatibility aliases | [Memory selector](../crates/kamy-codegen/src/isel/memory.rs), native identity/MBA/call/phi consumers; [isolated pin receipt](../target/h2-repair/pin43-only.csv) and metric table below | Object and allocator reductions are measured separately; whole-campaign allocator reduction also includes other repairs, not all attributable to #43 |
 
 
-#### Confirmed finite CMOV/select counterexample
+#### Historical finite CMOV/select counterexample — before #37 repair
 
 The native witness uses the Win64 six-`u64` call contract: arg1 is the condition,
 args2–4 are zero, arg5 is `0x1122334455667788` and arg6 is
@@ -1062,15 +1065,15 @@ correctly in identity and requested supported MBA, not be rejected wholesale,
 special-cased or run at lower intensity. Truly unprovable selections may reject
 specifically and atomically.
 
-#### NOW pre-repair acceptance net — not an H2 repair
+#### Historical NOW pre-repair acceptance net — not an H2 repair
 
-The immediate work makes bad verdicts observable through the existing tools;
-it does not change frame proof, lifting, code generation or unwind. All seven
-findings above remain unfixed and H2 remains reopened. In particular, the
-confirmed #37 witness MUST be re-caught **through `kamy corpus verify`**, not
-only a standalone harness or an exit-code check. This intentionally failing
-external corpus case is not a deliberately red workspace test. No new timing
-measurements for #39–41 or accepted-producer proof for #38 are implied.
+This historical work made bad verdicts observable through existing tools; it did
+not change frame proof, lifting, code generation or unwind. At this snapshot all
+seven findings remained unfixed. It re-caught #37 **through `kamy corpus verify`**,
+not only a standalone harness or exit-code check. The intentionally failing
+external case was not a deliberately red workspace test. These receipts do not
+imply then-unmeasured #39–41 work or the later #38 producer disproof; current
+dispositions and passing native evidence are recorded separately below.
 
 Corpus source identity is distinct from the historical lock. The available
 checkout is `C:/dev/kamy-corpus`, with published source HEAD
@@ -1248,10 +1251,10 @@ temporary EXE form of the same witness with `--expect-exit 0`,
 `--expect-stdout <expected-output>`, `--stdin-file <input>`, `--timeout 10` and
 `--keep`; removing `probe-1.exe` after the traced baseline run failed with access
 denied. Runner/debugger handle and evidence ownership require lifecycle repair,
-not ignored cleanup errors or blind retries. No successful actual CLI replay is
-established by this snapshot. Do not treat unit-test/gate success as completed
-CLI replay evidence or claim the NOW deliverable complete. H2 remains reopened;
-no #37–43 repair is claimed.
+not ignored cleanup errors or blind retries. No successful actual CLI replay was
+established by this snapshot. Unit-test/gate success did not establish completed
+CLI replay or the NOW deliverable; H2 was reopened and no #37–43 repair was then
+claimed.
 
 The subsequent runner/triage lifecycle implementation now acknowledges debug
 exit events and waits for process termination; preserves the first second-chance
@@ -1260,12 +1263,12 @@ debug events and reaps processes under a separate 10-second cleanup bound.
 Its regression uses copied test executables and immediately removes each image
 after context, fault and timeout runs. No H2 backend change is included.
 
-##### Final NOW acceptance-net evidence — lifecycle repaired, H2 still reopened
+##### Historical final NOW acceptance net — lifecycle repaired, H2 still reopened
 
 After removal of incidental elapsed-time assertions, the integration owner ran
 format check, denied-warning clippy, workspace all-target build and tests:
 **all PASS, 455 tests / 47 suites**. The initial 451 and intermediate 454 totals
-above are historical integration snapshots. The latest exercised root CLI is
+above are historical integration snapshots. That snapshot's exercised root CLI was
 `target/debug/kamy.exe` (snapshot `target/pre-repair-now/tools-current`), SHA-256
 `aa724a6156a8416a326f9acb9bcdfa0ff20b4d2fcad8e6693e8a1ca55772f52c`;
 loader SHA-256
@@ -1315,36 +1318,34 @@ console comparison passed with normal exit **7**. These controls are not corpus
 baseline members. Quarantined `dll_strutil` remains user-skipped, not PASS;
 there is no full historical four- or 23-member baseline claim.
 
-The **NOW evidence net is complete**, including actual same-oracle EXE replay,
-required failing corpus witness and run-health checks. This is not protected
-correctness acceptance: **H2 remains reopened; all seven #37–43 findings remain
-unfixed**.
+The **historical NOW evidence net was complete**, including actual same-oracle
+EXE replay, the required failing corpus witness and run-health checks. It did not
+constitute protected correctness acceptance: H2 remained reopened and all seven
+#37–43 findings were unfixed **at that pre-repair snapshot**.
 
 
 
 #### Mandatory reacceptance evidence ledger
 
 The [numbered H2 acceptance matrix](handoffs/02-memory-backed-lowering.md#required-acceptance-matrix)
-retains all original gates and adds the manual CLI/runtime/IDA gate. Each of the
-seven findings MUST have a repair or reproducible disproof recorded here before
-H2 is complete. Deferral or narrower acceptance requires user approval.
+retains its semantic, runtime and original-population gates. The user explicitly
+authorized this **Kamy-only headless campaign, without IDA/x64dbg**, replacing
+literal debugger-tool wording, not the required machine/ABI/manual proof. No
+IDA/x64dbg gate was executed or is claimed green. Truly debugger-dependent
+findings would stay blocked; none was found in the exercised evidence.
 
-For each finding, record before/after tool versions (including IDA), commit and
-build identity, input/output hashes or equivalent identities, commands/results,
-old/new symbol and RVA maps, annotated relevant PC ranges, ABI and IDA analysis
-adjustments, and native/analysis oracles. Manually run the in-tree triage/bisect,
-IR dumps through regalloc, identity/requested-MBA protection and explain-reject
-tooling as applicable; retain output-value oracles for exit-0 miscompiles.
-Inspect the exact rebuilt outputs in IDA and execute those same outputs under
-identity and requested MBA. Verify frame/home/phi/flags/call-result addressing
-and preservation; use actual accepted call producers/consumers plus Windows
-`RtlLookupFunctionEntry` / `RtlVirtualUnwind` over body/epilogue PCs under forced
-ASLR for call/save/unwind findings. Record actual DAG/CFG/phi size/work/allocation
-scaling, not theoretical timings or flaky wallclock assertions. Commit portable
-regressions with platform gates; temporary local artifacts are supplemental.
-Tests alone, screenshots or decompiler prettiness are NOT correctness proof.
+The current section records source/build/input/output identities, commands,
+symbol/RVA and native-PC/address annotations, exact output-value oracles,
+accepted producer/call-result contracts and independent Windows
+`RtlLookupFunctionEntry` / `RtlVirtualUnwind` checks under forced ASLR. Manual
+triage/bisect, lift/SSA/optimize/regalloc/native dumps, identity/requested-MBA
+protection and explain-reject evidence remain required as applicable. Actual
+DAG/CFG/phi work/allocation is evidence, not flaky wallclock assertions. Portable
+regressions carry platform gates; local receipts are supplemental, not portable
+fixture prerequisites. Tests alone, screenshots or decompiler prettiness are not
+correctness proof. The original locked-corpus gate remains **incomplete**.
 
-The later scoped `demo-frame-identity.dll` observation used `frame.yml` plus
+The following **historical, pre-repair** `demo-frame-identity.dll` observation used `frame.yml` plus
 `--ssa-identity`: **8 selected / 8 lowered / 0 transformed**, actual intensity
 **0.0**. Its headless SDK probe printed
 `frame_runtime=PASS depth=64 original_object=4096 large_object=24576 aslr=1`,
@@ -1367,4 +1368,124 @@ state-snapshot model. No requirement to eliminate all memory-home traffic is
 added. Historical identity/MBA runtime and native-unwind successes above remain
 scoped to their recorded fixtures, not universal acceptance.
 
+
+### Current H2 repair evidence — 2026-10-23
+
+**All seven findings are disposed as recorded in the ledger above; formal H2
+remains incomplete solely for the original-population corpus gate. H3 waits.**
+This is the user-authorized Kamy-only campaign: **no IDA/x64dbg was run**. Exact
+machine bytes/PCs, ABI/address math, native outputs and independent Windows unwind
+proof were exercised; debugger-specific proof was not silently declared green.
+D16/D22/D24/D40, the source schemas, originals/goldens and security policy are unchanged.
+
+**Fresh integration gates:** format check, `clippy --all-targets -- -D warnings`,
+workspace all-target build and workspace tests all **PASS: 503 tests / 47 suites,
+1 ignored**; [gate receipt](../target/h2-repair/refined-gates.json) and
+[`refined-{fmt-check,clippy,build,tests}.log`](../target/h2-repair).
+The ignored genuine-producer test was separately invoked with explicit
+`SDK_ABI_{KAMY,CARGO,RUSTC,LINKER,OUT}` and `KAMY_LLVM_TOOLS_DIR`, and **PASS**:
+`cargo test -p kamy-sdk-rebuild-acceptance --bin sdk-rebuild tests::real_rust_llvm_call_contracts_preserve_win64_nonvolatiles -- --ignored --exact --nocapture`.
+Its [final committed-source rerun receipt](../target/h2-repair/real-producer-contract-final.log) records actual
+Rust **1.95.0** (`59807616e1fa2540724bfbac14d7976d7e4a3860`), LLVM
+**22.1.2-rust-1.95.0-stable**, target **x86_64-pc-windows-msvc**, parsed compiler
+metadata and resolved reachable calls, not arbitrary ABI labels. The genuine
+24-byte SRet helper is in [callback.rs](../tests/sdk-rebuild/plugins/callback.rs);
+the [producer test](../tests/sdk-rebuild/src/main.rs) checks integer, scalar
+Float64/XMM0, mixed RAX/XMM0, aggregate and hidden-return contracts. The scoped
+#38 conclusion excludes preservation-override attributes and arbitrary custom ABI.
+
+**Native #37 result and profile:** [final values](../target/h2-repair/final-dll-values.log)
+show original, identity and requested ordered probability-100 sub/add outputs all
+equal **1234605616436508552** (condition 0) / **9833440827789222417** (condition 1),
+through the traced real loader, exit **0**, no fault/timeout. The exact normalized
+ledger has **0 eligible arithmetic / 0 actually transformed**; calling it an MBA
+transformation would be false. Adjacent split-zone/scalar native cases and the
+SDK **8/8** MBA exports genuinely transform at requested intensity **1.0**.
+Portable [link fixtures](../crates/kamy-link/tests/memory_frames.rs) cover exact
+six-argument select, finite phi/copy/index, nested/mixed-zone consumers, flags and
+successive calls; [core fixtures](../crates/kamy-core/src/frame.rs) also cover bounded
+shared DAGs. Two additional before/after edges are retained: delayed dominating
+constant in a later-numbered block **`FrameDynamic` → proved E+40**
+([before](../target/h2-repair/select-order-before.log) / [after](../target/h2-repair/select-order-after.log));
+finite **E−32/E−16 + 24 → safe E−8/E+8** alternatives
+**`FrameConflict` → accepted**, without inventing a crossing interval
+([before](../target/h2-repair/select-split-before.log) / [after](../target/h2-repair/select-split-after.log)).
+
+**Representative machine annotations:** source body **RVA 0x2000..0x2021 (33 B)**
+becomes **0x4000..0x409c (156 B)**; original reservation **N=24**, generated **S=136**,
+entry RSP **E**, final body RSP **B=E−136**. At **0x4048** CMOV selects
+**B+8/B+16**; **0x4056** adds **S−N=112**, **0x405a** adds **56**, reaching
+**E+40/E+48**. Load **0x4068**, stack restore **0x4094**, return **0x409b** are
+in the [exact native dump](../target/h2-repair/final-native-fixed-inspection.log).
+Real ABI scalar call **source 0x104b → 0x11c0**, final **0xa04c8 → 0xa0b70**,
+captures XMM0 at **0xa04cd `[rsp+0x150]`**; mixed call **0xa0579** captures
+RAX/XMM0 at **0xa057e/0xa0586**, before later calls
+([caller dump](../target/h2-repair/final-abi-caller-native.log)). These are RVAs,
+not claimed runtime ASLR addresses.
+
+**Bounded work/allocation:** #39 caches success/failure/cycles; #41 chain/wide work is bounded as measured above. #40 skips candidate-free dominators; needed storage is linear, worst-case time **O(V²)**.
+Measured comparisons below use bytes unless marked; old CFG runs safely stop at **256/512 blocks**.
+
+| Metric | Before | After | Scope |
+|---|---:|---:|---|
+| #40 requested allocation | 857,582,864 | 27,792 | Acyclic 512; [before](../target/h2-repair/frame-before.csv) / [after](../target/h2-repair/frame-after.csv) |
+| #40 peak live delta | 2,770,024 | 25,140 | Same acyclic 512; reducible bounds / irreducible `FrameDynamic` preserved |
+| #42 frame size | 96 | 64 | Read-only entry pins |
+| #42 dedicated save count | 2 | 0 | Read-only entry pins; count, not bytes |
+| #42 save storage | 24 | 0 | Read-only entry pins |
+| #42 code size | 115 | 95 | Read-only entry pins; [native receipt](../target/h2-repair/nonvolatile-after.log) |
+| #43 `RegAllocation` size | 680 | 624 | Duplicate global map removed |
+| #43 allocator bytes | 6,547,182 | 6,399,346 | 8,192 pins; [before](../target/h2-repair/pin-before.csv) / [isolated #43](../target/h2-repair/pin43-only.csv) |
+| Campaign allocator bytes | 6,547,182 | 6,350,178 | Same pins; [campaign](../target/h2-repair/pin-after.csv), includes other repairs, not all #43 |
+
+New-only **2,048/8,192** CFG cases imply no old large-input run; no timing claims/assertions.
+#42 real native-read/partial-write cases still save RBX/XMM6: **128 B** frames,
+**187/150 B** code. Registered native checks preserve full **128-bit XMM** state, not only Float64 lanes.
+
+**Fresh SDK full:** the documented `sdk-rebuild all --scope full` command was run
+with explicit compiler/linker/library paths into `target/h2-repair/sdk-final`:
+**exit 0 / full PASS**, rebuilding **11 normal artifacts + 1 dynamic negative**
+([full command/log](../target/h2-repair/sdk-final-all-full.log),
+[summary](../target/h2-repair/sdk-final-summary.json)). Intact combined callback
+identity/MBA executes **trace 12 / bounds 24**, frames **176/320 B**, without split,
+skip or intensity reduction. Standalone identity/MBA each lower **8 exports**,
+transforming **0/8** respectively, and execute depth **64**, original object
+**4,096 B**, actual guard-page object **24,576 B**, forced ASLR. Independent `RtlLookupFunctionEntry` /
+`RtlVirtualUnwind` probes cover **1,155/1,920 PCs**, **87/87 epilogue PCs**,
+max frames **25,208/25,640 B**, saved **3 GPR / 1 XMM**. The ordinary dynamic
+negative fails specifically `FrameDynamic`, with no output. These are real SDK
+and registered native oracle results, not execution of every corpus body or EH parity.
+
+**Available corpus:** measured source revision **`0664dda`**, **4/4 PASS** (now README-only HEAD `fdede7e`; binaries/goldens unchanged): three historical members
+plus `dll_frame_select`; **935 historical lowered + 1 new witness**, identity
+**0 transformed**. [Final stable-cohort receipt](../target/h2-repair/final-stable-cohorts.json)
+compares exactly **3,532 historical identities**: **0 added / removed /
+classification changes / rejection-reason migrations**; final per-member baselines
+are `target/h2-repair/final-<member>.yml`. This is not a recovered 23-member run.
+The lock's original revision **`d9bc70d9970d3e1988203acd3415b103bcb62197`** is absent
+locally (`cat-file` exit 128; prior fetch `not our ref`); the original population or
+published revision is required. Original `dll_strutil` stays **quarantined/user-skipped**,
+never restored, rebuilt or re-blessed. No original, golden or security baseline changed.
+
+**Manual tooling:** actual `dump` lift/SSA/optimize/regalloc and exact
+`dump --stage native --size` inspected selected/indexed/phi/call consumers;
+`explain-reject` reports host `LiftFailure`, mandatory dynamic injection reports
+`FrameDynamic` with no output. Same-oracle stdin/stdout-aware EXE bisect now has
+all-lowered success and exits **1 / nothing to bisect**, not a new failure
+([receipt](../target/h2-repair/final-bisect-after.log)); historical culprit **0x19000**
+remains the before-repair receipt. Official rust-analyzer **1.95** direct LSP
+references/diagnostics worked; host-mounted transport timed out and one cross-package
+`#[path]` **E0583** remains despite actual compiler/native PASS. Session-private mode
+was left unsaved as requested. Local logs/probe binaries are evidence, not new
+portable prerequisites; source fixtures linked above are authoritative.
+
+**Final identities:** [final-identities.json](../target/h2-repair/final-identities.json)
+records all **17** exercised tool/input/output identities, byte sizes and full versions,
+including Kamy **0.0.0**, rust-analyzer **1.95.0** and LLD **22.1.7**. SHA-256:
+CLI `d0591b66a70d0cc515b6df457e579cc4c65ee86cafd5af701ee706d06a70c2f6`;
+loader `d658e3514720ad2da33135d43c8df9e4d69092312056066dd4096faac9a4988a`;
+original select input `1e33abcfb8cbae9cd5b195985616154dc46c4a680e1ed6d0925d3c82805e4a60`;
+identity and requested-profile outputs both `44a34ee2c424d07d215a9f05d87af8dda7c83f8605212a707c14eeb5ace61a50`
+(identical bytes agree with **0 eligible MBA**, not a transformation claim).
+SDK frame original / identity / MBA hashes are respectively `9109fb244d752fee873d339ffbbf7bffea89502fcb2965feb4461ea74db632b6`, `5bed2fc49132f7a591f1bc5c0b592599cf3c7d66c1460cbaf8d7c280625a02d3`, `a29f9550390800b98167d375dbdfc9ee4c33e2d003df72365c265548662e0df6`.
 

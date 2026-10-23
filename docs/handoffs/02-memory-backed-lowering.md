@@ -6,83 +6,81 @@ its evidence. Do not recreate its symbolic model or link plan.
 
 ## Completion notice
 
-**Status: Incomplete / Reopened 2026-10-22 after later analysis.** Acceptance
-of implementation `278f5ef81dd096e8325c06bd02ba7c88b84b0646` (`Lower SSA through
-concrete memory-backed frames`), published at `d1c70e1`, is withdrawn. Policy
-`5ef9b46` (D40) and the concrete-frame/memory-backed design remain binding:
-one backend, bounded scratch, one rebuild, explicit flags and actual-body unwind.
-Pressure rejection and transform-intensity retries MUST NOT return as fallback.
-The seven findings in the [post-acceptance review ledger](../STATUS.md#post-acceptance-review--2026-10-22)
-MUST all be fixed or reproducibly disproved before reacceptance; no production
-fixes have been applied. Deferral or narrowing requires user approval.
-The earlier tests, corpus and SDK executions remain historical successes, not
-current proof for the reopened areas. H2 repair/reacceptance is next; H3 MUST wait.
-This notice and the [master register](00-master.md#completion-register) track
-handoff acceptance, not umbrella or remote issue closure.
+**Status: Incomplete / Reopened 2026-10-22; repairs evidenced 2026-10-23.**
+Acceptance of implementation `278f5ef81dd096e8325c06bd02ba7c88b84b0646`
+(`Lower SSA through concrete memory-backed frames`), published at `d1c70e1`,
+remains withdrawn. Policy `5ef9b46` (D40) remains binding: one backend, concrete
+memory-backed frames, bounded scratch, explicit flags, one rebuild and actual-body
+unwind. Pressure rejection and transform-intensity retries MUST NOT return.
 
-Reopened H2 issues (all unfixed; evidence status/details in STATUS):
-[select provenance #37](https://github.com/mkxto/kamy/issues/37) (confirmed native
-miscompile), [call-contract unwind #38](https://github.com/mkxto/kamy/issues/38)
-(static, not runtime reproduced), [scalar-DAG work #39](https://github.com/mkxto/kamy/issues/39),
-[dominator storage #40](https://github.com/mkxto/kamy/issues/40) and
-[phi-copy planning #41](https://github.com/mkxto/kamy/issues/41) (static complexity/
-allocation, no measured timings), [read-only pin saves #42](https://github.com/mkxto/kamy/issues/42)
-and [duplicate global pin map #43](https://github.com/mkxto/kamy/issues/43)
-(source-analysis findings). #42/#43 are narrow H2 obligations related to #36,
-not a transfer of all output optimization into H2.
+All seven [review findings](../STATUS.md#post-acceptance-review--2026-10-22)
+now have a repair or scoped disproof:
+
+- **#37 fixed** (`d87d989`): finite conditional/phi/copy provenance and final
+  logical-frame mapping, including delayed dominating constants and separated
+  E−8/E+8 alternatives; real native identity/MBA and shared-DAG witnesses retained.
+- **#38 scoped disproof** (`19bffa6`): actual compiled, parsed and resolved ordinary
+  Rust 1.95 / LLVM 22.1.2 CCC/FastCC contracts, including a genuine 24-byte SRet,
+  disprove the current supported-producer concern. This is not fabricated
+  RBX/XMM6 metadata or proof for arbitrary LLVM/custom ABIs; preservation-override
+  attributes remain outside the evidence.
+- **#39 fixed** (`b6f94b2`): per-analysis scalar success/failure/cycle caching.
+- **#40 fixed** (`c0bfb28`): candidate-free skip and compact petgraph dominators;
+  linear storage, not a linear-time claim (worst-case time remains O(V²)).
+- **#41 fixed** (`32aaeb4`): bounded simultaneous phi scheduling with one cycle slot.
+- **#42 fixed** (`3a68d4c`): saves follow actual physical writes, not read-only entry capture;
+  registered native Windows unwind checks preserve full 128-bit XMM state.
+- **#43 fixed** (`57eb3b1`): one global pins map and private four-value local allocation.
+
+**Formal H2 acceptance is still blocked:** the original 23-member population at
+locked corpus revision `d9bc70d9970d3e1988203acd3415b103bcb62197` is unavailable.
+The available subset is not a replacement. The original `dll_strutil` remains
+quarantined/user-skipped, not restored, rebuilt, reblessed or counted PASS.
+No original/golden/security policy was changed. H3 MUST wait; this notice and
+the [master register](00-master.md#completion-register) track handoff acceptance,
+not remote or umbrella issue closure.
 
 | Issue scope | Delivered scope and disposition | Residual owner |
 |---|---|---|
-| #15 | Historical frame/pressure delivery: real homes, concrete coordinates and bounded resources; acceptance reopened | H2 owns finite select provenance and bounded analysis/copy planning; unproved/dynamic frames remain explicit |
-| #6 | Historical D40 cutover: memory homes replace the superseded zero-spill default; reacceptance pending | H2 owns bounded DAG/CFG/phi work and one authoritative boundary-pin map; no return to the old scheduling design |
-| #5 applicability | Historical requested MBA intensity preserved; reacceptance pending under the new witnesses | No pressure-driven reduction; stronger/nonlinear protection remains separate |
-| #9 | Historical after-definition capture/home delivery; call-result and save correctness reopened | H2 owns accepted call effects, actual physical writes and caller-state preservation |
-| #10 | Historical caller-frame/recursion delivery: 486 caller-frame and 3 recursion functions recovered; frame provenance reopened | H2 owns the finite CMOV/select witness; truly unproved frame forms remain explicit |
-| #13 | Partial: existing metadata/CRT/import-thunk/inference retained; exact authored ABI and conservative unknown-host calls preserved | Broader signature precision is not declared complete |
+| #15 | Concrete homes/coordinates and bounded resources; finite provenance repaired | H2 corpus reacceptance; truly unproved/dynamic frames remain explicit |
+| #6 | D40 memory-home cutover plus bounded DAG/CFG/phi work and one global pins map | H2 reacceptance; no return to zero-spill scheduling |
+| #5 applicability | Requested supported MBA intensity retained in fresh witnesses | No pressure-driven reduction; stronger/nonlinear protection stays separate |
+| #9 | After-definition captures/homes preserved; actual-write saves and supported call contracts evidenced | Arbitrary custom ABI/preservation overrides are not established |
+| #10 | Historical caller-frame/recursion recovery retained; finite selected-frame addressing repaired | Truly unproved frame forms remain explicit |
+| #13 | Partial: metadata/CRT/import-thunk/inference retained; actual authored ABI and conservative unknown calls preserved | Broader signature precision is not declared complete |
 | #16 | Partial: successor-aware per-bit dead-flag dependencies removed only when proved dead | H5 owns unmodeled flags and variable-count carry semantics |
-| #23 | Preserved: all 23 corpus members pass; GuardCF input and phi-alias root repairs included | H5/H6 own native termination/EH residuals, including two disclosed INT29 losses |
-| #8 | Preserved: physical native pins/effects and bit-string widths/offsets survive the cutover | H5 owns FS/GS and unknown native classes |
-| #17 | Bounded prerequisite: one-plan references extended for frame/probe/helper and typed metadata consumers | H4 global compaction and later reference residuals remain |
-| #20 | Historical real saves/probes/unwind and Windows native-PC proof; accepted-contract body unwind reopened | H2 owns plain actual-body call effects and correct saves; H6 retains handler/scope/personality reconstruction |
+| #23 | Historical 23-member success retained as history; available population reverified, original full gate unavailable | H2 original corpus gate; H5/H6 retain native termination/EH residuals, including the two historical INT29 losses |
+| #8 | Physical native pins/effects and bit-string widths/offsets preserved | H5 owns FS/GS and unknown native classes |
+| #17 | Bounded prerequisite: one-plan frame/probe/helper and typed metadata references retained | H4 global compaction and later reference residuals remain |
+| #20 | Actual-body saves/probes/unwind retained; registered Windows read/partial/write-state proof refreshed | H6 retains handler/scope/personality reconstruction |
 | #30 | Bounded prerequisite: validated BaseReloc scalar ownership preserves records and field rebasing/rebuild | HIGHLOW/opaque-reference limits remain conservative; H4 owns global layout |
-| #32 | Preserved prerequisite: intact combined Rust callback executes identity and full MBA through the shared backend | H3 owns compiled startup, ordinary imports, std/runtime/TLS and lifecycle |
+| #32 | Intact combined Rust callback executes identity and full MBA through the shared backend | H3 owns compiled startup, ordinary imports, std/runtime/TLS and lifecycle |
 
 ### Verification and remaining limits
 
-The [H2 STATUS record](../STATUS.md#d40-repair-campaign--h2-concrete-frames-and-memory-backed-lowering)
-contains actual commands and detailed allocation, rejection, transition and
-issue tables. Historically all four workspace gates passed: **427 tests / 47 suites**.
-Fresh SDK `all --scope full` exited **0**, `sdk-rebuild=full PASS`, rebuilding
-hosts and regenerating **11 normal artifacts** plus the dynamic negative
-artifact before the full strict runtime matrix. No witness was skipped or
-accepted through an expected-pressure branch.
+The [current H2 STATUS evidence](../STATUS.md#current-h2-repair-evidence--2026-10-23)
+records current commands, versions, source/output identities, exact PC/ABI
+annotations, native oracles, work/allocation scaling and stable-population
+transitions separately from historical results. Fresh workspace gates, full
+SDK rebuild/runtime, the explicitly ignored genuine producer test and all
+available corpus members passed; numerical detail belongs there. Identity
+lowering is not actual MBA: the exact normalized select ledger has no eligible
+arithmetic, while nearby witnesses and the standalone frame SDK genuinely
+transform at requested intensity. The intact combined callback, depth-64
+recursion, large guard frame and independent Windows native unwind proofs
+remain load-bearing, not substitutes for the missing full corpus.
 
-Identity corpus: **23/23 PASS**, **3,173/11,202 lowered**, **8,029 rejected**,
-**0 actually transformed**, **0 verbatim-relocated**. The stable source cohort
-has **12,848 identities**, **0 added / 0 removed**, **11,202 classified** and
-**1,646 unchanged skipped identities**; **1,454 recovered / 2 lost**, net
-**+1,452**. Reject-to-reject migrations are not recovery. The two previously
-lowered INT29 helpers now reject `UnsupportedInstruction`; their exact source
-coordinates and evidence remain in the
-[cohort ledger](../STATUS.md#stable-source-function-cohort-not-an-aggregate-recovery-estimate).
+Manual in-tree CLI/IR/protection/rejection work and exact native byte/PC, frame,
+ABI/call/result, save, phi/flag and unwind inspection were exercised under the
+user's explicit **Kamy-only** campaign authorization. No IDA/x64dbg was run or
+is claimed. The semantic/manual proof obligations remain; any genuinely
+debugger-dependent residual must stay blocked. None was established here.
 
-Actual transformation proof is separate: the standalone eight-export frame
-fixture executes original, protected identity (**8 lowered / 0 transformed**)
-and protected MBA (**8 lowered / 8 transformed**) under forced ASLR, including
-mixed ABI, depth-64 recursion and a 24 KiB guard frame. Independent Windows
-native unwind probes cover **1,161 identity / 1,926 MBA PCs**, **90 epilogue
-PCs each**, maximum frames **25,208 / 25,640 bytes**, saved **3 GPRs / 1 XMM**.
-The intact combined callback executes **trace 12 / span 24** in both modes:
-actual intensity **0.0 identity / 1.0 MBA**, frames **176 / 320 bytes**.
-See the [runtime proof](../STATUS.md#runtime-and-independent-native-unwind-evidence).
-
-Strict remaining limits include **5 FrameDynamic / 5 EhNoBucketCreation**,
-unproved native/frame effects, FS/GS, variable-count carry semantics and the
-other unchanged semantic/reference rejections. The checked frame bound is
-**16 MiB**, not unbounded memory. GuardCF target repair is not a claim of CFG
-enforcement. Plain-frame unwind is not arbitrary EH; neither Rust-std parity,
-compiled startup nor whole-image compaction is claimed. H3–H7 and separate
-protection-strength/output-optimization work retain their scopes.
+Dynamic/unproved frames, unsupported native effects, FS/GS, variable-count carry
+and unchanged semantic/reference rejections remain explicit. The checked frame
+bound remains 16 MiB. GuardCF repair is not CFG enforcement; plain-frame unwind
+is not arbitrary EH. H3–H7, stronger protection and broader output optimization
+retain their scopes; no std/startup or whole-image compaction completion is claimed.
 
 ### Successor contract
 
@@ -91,11 +89,13 @@ After H2 reacceptance, H3 MUST reuse the [concrete code-generation contract](../
 `allocate_registers(func, rsp_pinned, reg_pins)` and
 `select_instructions(func, alloc)`; actual `frame.saves` rather than obsolete
 save-vector helpers. `FrameHome` is the memory-home representation, not a second
-`MemoryHome` API. The scratch/ABI contract is seven ordinary GPRs and four XMMs,
-explicit native/ABI boundary pins, after-definition result capture, explicit
-flag homes and memory-phi/cycle scratch. Preserve original LOW storage,
-generated HIGH homes/saves, entry-relative incoming coordinates and original
-outgoing storage; the known outgoing minimum is not a guessed argument extent.
+`MemoryHome` API. Keep one authoritative global pins map and private bounded
+four-value instruction-local allocation; no duplicate map or adapter. The
+scratch/ABI contract is seven ordinary GPRs and four XMMs, explicit native/ABI
+boundary pins, after-definition result capture, explicit flag homes and
+memory-phi/cycle scratch. Preserve original LOW storage, generated HIGH
+homes/saves, entry-relative incoming coordinates and original outgoing storage;
+the known outgoing minimum is not a guessed argument extent.
 
 `construct_ssa(&mut LiftResult) -> Result<(), RejectionReason>` is mandatory
 before transforms, including identity. Reuse
@@ -113,6 +113,7 @@ Portable fixtures H3 MUST retain and reuse:
 [standalone frame host](../../tests/sdk-rebuild/hosts/frame.rs),
 [frame runner](../../tests/sdk-rebuild/src/frame.rs),
 [native unwind oracle](../../tests/sdk-rebuild/src/native.rs),
+[shared native probe helper](../../tests/sdk-rebuild/src/native_probe.rs),
 [probe support](../../tests/sdk-rebuild/src/probe.rs), intact combined callback
 [original](../../tests/sdk-rebuild/plugins/pressure/original.rs) and
 [protected source](../../tests/sdk-rebuild/plugins/pressure/lib.rs), codegen
@@ -296,10 +297,11 @@ before/after witnesses, not only tests that assert new internal structures.
 6. Flags/partial-register behavior survives arithmetic, compound branches,
    native/call clobbers and phi transfers. No ambient RFLAGS assumption or
    accidentally preserved scratch register may carry the oracle.
-7. All previously passing identity corpus members remain passing. Recover
-   measurable pressure/caller-frame cases over a stable target population;
-   report genuine remaining semantic/reference limits separately. Exact
-   percentages are not invented before measuring the new baseline.
+7. All previously passing identity corpus members remain passing, including
+   the original 23-member locked population; an available subset does not waive
+   that gate. Recover measurable pressure/caller-frame cases over a stable
+   target population; report genuine remaining semantic/reference limits and
+   additions/removals separately. Do not invent unmeasured percentages.
 8. Supported requested MBA intensity/order is preserved on recovered functions;
    expose actual memory-backed allocation, frame size and resource diagnostics
    without using a warning to excuse reduced protection.
@@ -334,27 +336,31 @@ before/after witnesses, not only tests that assert new internal structures.
     Remove the duplicate global pin map and migrate consumers without adapters.
 14. Before reacceptance, manually exercise the in-tree triage, IR, protection and
     explain-reject tooling for the relevant witnesses. Inspect source/SSA,
-    transforms and allocation/homes with `kamy dump`; inspect the actual emitted
-    machine code in IDA using old/new symbol and RVA maps for the exact rebuilt
-    identity and requested MBA outputs. Annotate relevant PC ranges, frame/address
-    calculations, ABI and analysis adjustments, calls/results, saves, phi/flag
-    transfers and unwind states. Execute those same native outputs and compare
-    observable values and caller state, including forced-ASLR unwind probes.
-    IDA screenshots or pretty decompilation, and tests alone, are NOT correctness
-    proof.
+    transforms and allocation/homes with `kamy dump`; inspect exact emitted
+    native bytes/PCs using old/new symbol and RVA maps for the rebuilt identity
+    and requested MBA outputs. Annotate frame/address calculations, ABI and
+    analysis adjustments, calls/results, saves, phi/flag transfers and unwind
+    states. Execute those same outputs and compare observable values and caller
+    state, including independent forced-ASLR Windows unwind probes.
+    The user's explicit Kamy-only authorization supersedes the literal IDA tool
+    requirement for this campaign, not these semantic/manual evidence duties.
+    No IDA/x64dbg execution may be claimed; any genuinely debugger-dependent
+    residual stays blocked. Screenshots, pretty decompilation and tests alone
+    are NOT correctness proof.
     Follow [the in-tree tooling contract](../tooling.md#miscompile-hunt-workflow):
     `kamy bisect` with an output oracle when exit status alone cannot distinguish
-    failure, `kamy dump` at `lift`, `ssa`, `optimize` and `regalloc`,
+    failure, `kamy dump` at `lift`, `ssa`, `optimize`, `regalloc` and `native`,
     `kamy protect` with identity and the requested MBA profile plus debug-map/link
     reports, and `kamy explain-reject` for applicable negative fixtures. Use
     authored module identities rather than inventing host RVAs for module code.
-15. Record before/after evidence in the existing STATUS/handoff ledger: tool
-    versions (including IDA), implementation commit, build identity, input/output
+15. Record before/after evidence in the existing STATUS/handoff ledger: versions
+    of tools actually used, implementation commits, build identity, input/output
     identities or hashes, exact commands/results, old/new symbol/RVA maps,
     annotated PC/ABI/analysis observations, native oracles and scaling evidence.
-    Explicitly distinguish observed results, static findings and unresolved items.
-    The next owner MUST rerun all original gates after repairs; earlier successful
-    campaigns cannot substitute for this manual CLI/runtime/IDA reacceptance.
+    Explicitly distinguish observed results, static findings, unavailable tools
+    and unresolved gates. All original gates require fresh repair evidence;
+    earlier successful campaigns cannot substitute for manual CLI/native-runtime
+    reacceptance or the original locked corpus population.
 
 The corpus cannot by itself prove this backend: it normally runs identity.
 Exercise transformed fixtures and real module outputs. Keep golden behavior
