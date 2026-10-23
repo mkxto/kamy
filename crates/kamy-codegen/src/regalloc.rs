@@ -14,12 +14,10 @@ use kamy_core::ir::{
 
 #[derive(Debug, Default)]
 pub struct RegAllocation {
-    // Boundary hints, not register-resident live ranges.
-    pub assignments: HashMap<ValueId, PhysReg>,
-    pub flag_scratch: Option<PhysReg>,
     pub homes: HashMap<ValueId, FrameHome>,
     pub frame: ConcreteFrame,
     pub analysis: FrameAnalysis,
+    // Boundary hints, not register-resident live ranges.
     pub pins: HashMap<ValueId, PhysReg>,
     pub constants: HashMap<ValueId, u64>,
     pub value_types: HashMap<ValueId, IrType>,
@@ -892,7 +890,6 @@ pub fn allocate_registers(
     i32::try_from(frame.address_offset(native_highest))
         .map_err(|_| RejectionReason::FrameOverflow)?;
     Ok(RegAllocation {
-        assignments: pins.clone(),
         homes,
         frame,
         analysis,
@@ -904,7 +901,6 @@ pub fn allocate_registers(
             .map(|&value| (value, model.definitions[&value].ty()))
             .collect(),
         used: model.used,
-        ..RegAllocation::default()
     })
 }
 
@@ -1014,7 +1010,7 @@ mod tests {
         assert_eq!(allocation.constants[&ValueId(1)], 20);
         assert!(!allocation.used.contains(&ValueId(5)));
         assert!(!allocation.used.contains(&ValueId(6)));
-        assert!(allocation.assignments.is_empty());
+        assert!(allocation.pins.is_empty());
     }
 
     #[test]

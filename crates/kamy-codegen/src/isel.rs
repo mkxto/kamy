@@ -11,6 +11,51 @@ use crate::regalloc::RegAllocation;
 
 mod memory;
 
+/// Ordinary selection consumes at most three inputs and one destination.
+/// Native instructions need no mapping; indirect calls map only their target.
+#[derive(Default)]
+struct InstructionAllocation {
+    values: [Option<(ValueId, PhysReg, IrType)>; 4],
+    flag_scratch: Option<PhysReg>,
+}
+
+impl InstructionAllocation {
+    fn clear(&mut self) {
+        self.values.fill(None);
+        self.flag_scratch = None;
+    }
+
+    fn contains(&self, value: ValueId) -> bool {
+        self.values.iter().flatten().any(|entry| entry.0 == value)
+    }
+
+    fn insert(&mut self, value: ValueId, register: PhysReg, ty: IrType) {
+        let index = self
+            .values
+            .iter()
+            .position(|entry| entry.is_some_and(|entry| entry.0 == value))
+            .or_else(|| self.values.iter().position(Option::is_none))
+            .expect("instruction-local allocation is bounded by its operands");
+        self.values[index] = Some((value, register, ty));
+    }
+
+    fn get(&self, value: ValueId) -> (PhysReg, IrType) {
+        self.values
+            .iter()
+            .flatten()
+            .find_map(|&(id, register, ty)| (id == value).then_some((register, ty)))
+            .expect("selected instruction operand has a local allocation")
+    }
+
+    fn register(&self, value: ValueId) -> PhysReg {
+        self.get(value).0
+    }
+
+    fn ty(&self, value: ValueId) -> IrType {
+        self.get(value).1
+    }
+}
+
 // Synthetic branch-target labels: unique, non-zero IPs placed far above any real
 // image VA. iced's BlockEncoder links a branch to an in-block instruction by
 // matching the instruction's ip(); stamping each block's first instruction with
@@ -118,9 +163,8 @@ fn phys_to_register(phys: PhysReg, ty: IrType) -> Register {
     }
 }
 
-fn reg_of(alloc: &RegAllocation, vid: ValueId, ty: IrType) -> Register {
-    let phys = alloc.assignments[&vid];
-    phys_to_register(phys, ty)
+fn reg_of(alloc: &InstructionAllocation, vid: ValueId, ty: IrType) -> Register {
+    phys_to_register(alloc.register(vid), ty)
 }
 
 fn alu_code(op: &IrOp, ty: IrType) -> Code {
@@ -248,7 +292,7 @@ fn cmp_code(ty: IrType) -> Code {
 
 /// Reconstruct an individual SSA flag before materializing its 0/1 value.
 fn emit_flag_compare(
-    alloc: &RegAllocation,
+    alloc: &InstructionAllocation,
     producer: &kamy_core::ir::Inst,
     constants: &HashMap<ValueId, u64>,
     out: &mut Vec<Instruction>,
@@ -256,7 +300,7 @@ fn emit_flag_compare(
     match &producer.op {
         IrOp::IsZero | IrOp::IsNeg | IrOp::Parity => {
             if let Some(&arg) = producer.args.first() {
-                let ty = value_type(alloc, arg);
+                let ty = alloc.ty(arg);
                 let reg = reg_of(alloc, arg, ty);
                 out.push(Instruction::with2(test_code(ty), reg, reg).unwrap());
             }
@@ -264,7 +308,7 @@ fn emit_flag_compare(
         IrOp::BorrowSub | IrOp::OverflowSub | IrOp::AuxBorrowSub => {
             let a = producer.args[0];
             let b = producer.args[1];
-            let ty = value_type(alloc, a);
+            let ty = alloc.ty(a);
             let ra = reg_of(alloc, a, ty);
             let rb = reg_of(alloc, b, ty);
             out.push(Instruction::with2(cmp_code(ty), ra, rb).unwrap());
@@ -272,7 +316,7 @@ fn emit_flag_compare(
         IrOp::CarryAdd | IrOp::OverflowAdd | IrOp::AuxCarryAdd => {
             let a = producer.args[0];
             let b = producer.args[1];
-            let ty = value_type(alloc, a);
+            let ty = alloc.ty(a);
             let ra = reg_of(alloc, a, ty);
             let rb = reg_of(alloc, b, ty);
             let scratch = phys_to_register(alloc.flag_scratch.expect("flag scratch reserved"), ty);
@@ -282,7 +326,7 @@ fn emit_flag_compare(
         IrOp::CarryShl | IrOp::CarryShr | IrOp::CarrySar => {
             let orig = producer.args[0];
             let count = producer.args[1];
-            let ty = value_type(alloc, orig);
+            let ty = alloc.ty(orig);
             let ro = reg_of(alloc, orig, ty);
             let scratch = phys_to_register(alloc.flag_scratch.expect("flag scratch reserved"), ty);
             let shift_kind = match producer.op {
@@ -399,7 +443,7 @@ pub fn select_instructions(
 }
 
 fn select_inst(
-    alloc: &RegAllocation,
+    alloc: &InstructionAllocation,
     inst: &kamy_core::ir::Inst,
     constants: &HashMap<ValueId, u64>,
     out: &mut Vec<Instruction>,
@@ -412,7 +456,7 @@ fn select_inst(
             let dest = inst.dest.unwrap();
             let dest_reg = reg_of(alloc, dest, ty);
             if *imm == 0 {
-                if is_xmm(alloc.assignments[&dest]) {
+                if is_xmm(alloc.register(dest)) {
                     out.push(
                         Instruction::with2(Code::Xorps_xmm_xmmm128, dest_reg, dest_reg).unwrap(),
                     );
@@ -425,7 +469,7 @@ fn select_inst(
                     IrType::I8 => Code::Xor_rm8_r8,
                 };
                 let zero_reg = if matches!(ty, IrType::I64 | IrType::I128) {
-                    phys_to_register(alloc.assignments[&dest], IrType::I32)
+                    phys_to_register(alloc.register(dest), IrType::I32)
                 } else {
                     dest_reg
                 };
@@ -511,13 +555,10 @@ fn select_inst(
         IrOp::Copy => {
             let dest = inst.dest.unwrap();
             let src = inst.args[0];
-            match (
-                is_xmm(alloc.assignments[&dest]),
-                is_xmm(alloc.assignments[&src]),
-            ) {
+            match (is_xmm(alloc.register(dest)), is_xmm(alloc.register(src))) {
                 (false, false) => {
                     let dest_reg = reg_of(alloc, dest, ty);
-                    let src_ty = value_type(alloc, src);
+                    let src_ty = alloc.ty(src);
                     let src_reg = reg_of(alloc, src, src_ty);
                     if dest_reg != src_reg {
                         out.push(Instruction::with2(mov_code(ty), dest_reg, src_reg).unwrap());
@@ -550,7 +591,7 @@ fn select_inst(
             let dest = inst.dest.unwrap();
             let lhs = inst.args[0];
             let rhs = inst.args[1];
-            if is_xmm(alloc.assignments[&dest]) {
+            if is_xmm(alloc.register(dest)) {
                 // Only xorps (Xor) produces an XMM ALU value; packed logical op.
                 let dest_reg = reg_of(alloc, dest, IrType::I128);
                 let lhs_reg = reg_of(alloc, lhs, IrType::I128);
@@ -691,7 +732,7 @@ fn select_inst(
             let addr = inst.args[0];
             let addr_reg = reg_of(alloc, addr, IrType::I64);
             let mem = MemoryOperand::with_base(addr_reg);
-            if is_xmm(alloc.assignments[&dest]) {
+            if is_xmm(alloc.register(dest)) {
                 let dest_reg = reg_of(alloc, dest, IrType::I128);
                 out.push(Instruction::with2(xmm_load_code(ty), dest_reg, mem).unwrap());
             } else {
@@ -705,7 +746,7 @@ fn select_inst(
             let val = inst.args[1];
             let addr_reg = reg_of(alloc, addr, IrType::I64);
             let mem = MemoryOperand::with_base(addr_reg);
-            if is_xmm(alloc.assignments[&val]) {
+            if is_xmm(alloc.register(val)) {
                 let val_reg = reg_of(alloc, val, IrType::I128);
                 out.push(Instruction::with2(xmm_store_code(ty), mem, val_reg).unwrap());
             } else {
@@ -718,7 +759,7 @@ fn select_inst(
             let dest = inst.dest.unwrap();
             let src = inst.args[0];
             let dest_reg = reg_of(alloc, dest, ty);
-            let src_ty = value_type(alloc, src);
+            let src_ty = alloc.ty(src);
             let src_reg = reg_of(alloc, src, src_ty);
             let code = match (src_ty, ty) {
                 (IrType::I8, IrType::I16) => Code::Movzx_r16_rm8,
@@ -727,8 +768,8 @@ fn select_inst(
                 (IrType::I16, IrType::I32) => Code::Movzx_r32_rm16,
                 (IrType::I16, IrType::I64) => Code::Movzx_r64_rm16,
                 (IrType::I32, IrType::I64) => {
-                    let dest32 = phys_to_register(alloc.assignments[&dest], IrType::I32);
-                    let src32 = phys_to_register(alloc.assignments[&src], IrType::I32);
+                    let dest32 = phys_to_register(alloc.register(dest), IrType::I32);
+                    let src32 = phys_to_register(alloc.register(src), IrType::I32);
                     out.push(Instruction::with2(Code::Mov_r32_rm32, dest32, src32).unwrap());
                     return;
                 }
@@ -744,7 +785,7 @@ fn select_inst(
             let dest = inst.dest.unwrap();
             let src = inst.args[0];
             let dest_reg = reg_of(alloc, dest, ty);
-            let src_ty = value_type(alloc, src);
+            let src_ty = alloc.ty(src);
             let src_reg = reg_of(alloc, src, src_ty);
             let code = match (src_ty, ty) {
                 (IrType::I8, IrType::I16) => Code::Movsx_r16_rm8,
@@ -765,7 +806,7 @@ fn select_inst(
             let dest = inst.dest.unwrap();
             let src = inst.args[0];
             let dest_reg = reg_of(alloc, dest, ty);
-            let src_reg = phys_to_register(alloc.assignments[&src], ty);
+            let src_reg = phys_to_register(alloc.register(src), ty);
             if dest_reg != src_reg {
                 out.push(Instruction::with2(mov_code(ty), dest_reg, src_reg).unwrap());
             }
@@ -855,8 +896,8 @@ fn select_inst(
         IrOp::Mov128 => {
             let dest = inst.dest.unwrap();
             let src = inst.args[0];
-            let dest_is_xmm = matches!(alloc.assignments[&dest], PhysReg::Xmm(_));
-            let src_is_xmm = matches!(alloc.assignments[&src], PhysReg::Xmm(_));
+            let dest_is_xmm = matches!(alloc.register(dest), PhysReg::Xmm(_));
+            let src_is_xmm = matches!(alloc.register(src), PhysReg::Xmm(_));
             match (dest_is_xmm, src_is_xmm) {
                 (true, true) => {
                     let dest_reg = reg_of(alloc, dest, IrType::I128);
@@ -1261,6 +1302,17 @@ mod tests {
                         arithmetic_write(regs, inst.op0_register(), value);
                     }
                 }
+                Mnemonic::Movsx | Mnemonic::Movsxd | Mnemonic::Movzx => {
+                    let source = inst.op1_register();
+                    let value = arithmetic_read(regs, source);
+                    let value = if inst.mnemonic() == Mnemonic::Movzx {
+                        value
+                    } else {
+                        let shift = 64 - source.size() * 8;
+                        ((value << shift) as i64 >> shift) as u64
+                    };
+                    arithmetic_write(regs, inst.op0_register(), value);
+                }
                 Mnemonic::Div | Mnemonic::Idiv | Mnemonic::Mul | Mnemonic::Imul => {
                     let source = inst.op0_register();
                     let bits = source.size() as u32 * 8;
@@ -1422,8 +1474,14 @@ mod tests {
                         }
                         let actual = execute_arithmetic(&decoded, &mut regs).map(|()| {
                             (
-                                arithmetic_read(&regs, reg_of(&alloc, outputs[0], ty)),
-                                arithmetic_read(&regs, reg_of(&alloc, outputs[1], ty)),
+                                arithmetic_read(
+                                    &regs,
+                                    phys_to_register(alloc.pins[&outputs[0]], ty),
+                                ),
+                                arithmetic_read(
+                                    &regs,
+                                    phys_to_register(alloc.pins[&outputs[1]], ty),
+                                ),
                             )
                         });
                         assert_eq!(
@@ -1475,16 +1533,107 @@ mod tests {
                         u128::from(left) * u128::from(right)
                     };
                     assert_eq!(
-                        arithmetic_read(&regs, reg_of(&alloc, outputs[0], ty)),
+                        arithmetic_read(&regs, phys_to_register(alloc.pins[&outputs[0]], ty)),
                         ((product >> bits) as u64) & mask,
                         "{ty:?} signed={signed}"
                     );
                     assert_eq!(
-                        arithmetic_read(&regs, reg_of(&alloc, outputs[1], ty)),
+                        arithmetic_read(&regs, phys_to_register(alloc.pins[&outputs[1]], ty)),
                         product as u64 & mask,
                         "{ty:?} signed={signed}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn emitted_extensions_preserve_signed_and_unsigned_narrow_values() {
+        for (source_ty, dest_ty) in [
+            (IrType::I8, IrType::I16),
+            (IrType::I8, IrType::I32),
+            (IrType::I8, IrType::I64),
+            (IrType::I16, IrType::I32),
+            (IrType::I16, IrType::I64),
+            (IrType::I32, IrType::I64),
+        ] {
+            let mut func = IrFunction {
+                entry: BlockId(0),
+                blocks: vec![],
+                next_value: 0,
+            };
+            let input = func.alloc_value();
+            let narrow = func.alloc_value();
+            let signed = func.alloc_value();
+            let unsigned = func.alloc_value();
+            func.blocks.push(IrBlock {
+                id: BlockId(0),
+                phis: vec![],
+                insts: vec![
+                    Inst {
+                        dest: Some(input),
+                        op: IrOp::Undef,
+                        args: vec![],
+                        ty: IrType::I64,
+                    },
+                    Inst {
+                        dest: Some(narrow),
+                        op: IrOp::Trunc,
+                        args: vec![input],
+                        ty: source_ty,
+                    },
+                    Inst {
+                        dest: Some(signed),
+                        op: IrOp::Sext,
+                        args: vec![narrow],
+                        ty: dest_ty,
+                    },
+                    Inst {
+                        dest: Some(unsigned),
+                        op: IrOp::Zext,
+                        args: vec![narrow],
+                        ty: dest_ty,
+                    },
+                    Inst {
+                        dest: None,
+                        op: IrOp::Use,
+                        args: vec![signed, unsigned],
+                        ty: dest_ty,
+                    },
+                ],
+                term: IrTerminator::Ret,
+            });
+            let pins = HashMap::from([
+                (input, PhysReg::Gpr(Gpr::Rcx)),
+                (signed, PhysReg::Gpr(Gpr::R8)),
+                (unsigned, PhysReg::Gpr(Gpr::R9)),
+            ]);
+            let alloc = crate::allocate_registers(&func, &HashSet::new(), &pins).unwrap();
+            let selected = select_for_test(&func, &alloc, 0);
+            let encoded = crate::relocate(&selected, 0x1000).unwrap();
+            let decoded: Vec<_> = Decoder::with_ip(64, &encoded, 0x1000, DecoderOptions::NONE)
+                .into_iter()
+                .collect();
+            let source_bits = source_ty.bits();
+            let source_mask = u64::MAX >> (64 - source_bits);
+            let dest_mask = u64::MAX >> (64 - dest_ty.bits());
+            for value in [0, source_mask >> 1, 1 << (source_bits - 1), source_mask] {
+                let mut regs = [0xfeed_beef_cafe_babe; 16];
+                // Truncation must discard unrelated high bits before extension.
+                regs[Gpr::Rcx.index()] = (0xfeed_beef_cafe_babe & !source_mask) | value;
+                execute_arithmetic(&decoded, &mut regs).unwrap();
+                let shift = 64 - source_bits;
+                let expected_signed = (((value << shift) as i64 >> shift) as u64) & dest_mask;
+                assert_eq!(
+                    arithmetic_read(&regs, phys_to_register(alloc.pins[&signed], dest_ty)),
+                    expected_signed,
+                    "{source_ty:?} -> {dest_ty:?} signed value={value:#x}"
+                );
+                assert_eq!(
+                    arithmetic_read(&regs, phys_to_register(alloc.pins[&unsigned], dest_ty)),
+                    value,
+                    "{source_ty:?} -> {dest_ty:?} unsigned value={value:#x}"
+                );
             }
         }
     }
@@ -1529,11 +1678,7 @@ mod tests {
             args: vec![],
             ty: IrType::I128,
         };
-        let alloc = RegAllocation {
-            assignments: HashMap::new(),
-            flag_scratch: None,
-            ..RegAllocation::default()
-        };
+        let alloc = InstructionAllocation::default();
         let mut selected = crate::SelectedInstructions::default();
         selected.instructions.extend(Decoder::with_ip(
             64,
@@ -1623,18 +1768,6 @@ mod tests {
         alloc: &RegAllocation,
         image_base: u64,
     ) -> Vec<Instruction> {
-        let rebuilt;
-        let alloc = if alloc.frame.stack_size == 0 {
-            let rsp = alloc
-                .assignments
-                .iter()
-                .filter_map(|(&value, &reg)| (reg == PhysReg::Gpr(Gpr::Rsp)).then_some(value))
-                .collect();
-            rebuilt = crate::allocate_registers(func, &rsp, &alloc.assignments).unwrap();
-            &rebuilt
-        } else {
-            alloc
-        };
         let mut selected = select_instructions(func, alloc);
         crate::bind_references(&mut selected, image_base, |symbol| match symbol {
             kamy_core::SymbolId::Host { rva } => image_base.checked_add(u64::from(rva.get())),
@@ -1711,16 +1844,13 @@ mod tests {
             term: IrTerminator::Ret,
         });
 
-        let mut assignments = HashMap::new();
-        assignments.insert(addr, PhysReg::Gpr(Gpr::Rcx));
-        assignments.insert(zero, PhysReg::Xmm(XmmReg::Xmm1));
-        assignments.insert(load128, PhysReg::Xmm(XmmReg::Xmm5));
-        assignments.insert(load64, PhysReg::Xmm(XmmReg::Xmm0));
-        let alloc = RegAllocation {
-            assignments,
-            flag_scratch: None,
-            ..RegAllocation::default()
-        };
+        let pins = HashMap::from([
+            (addr, PhysReg::Gpr(Gpr::Rcx)),
+            (zero, PhysReg::Xmm(XmmReg::Xmm1)),
+            (load128, PhysReg::Xmm(XmmReg::Xmm5)),
+            (load64, PhysReg::Xmm(XmmReg::Xmm0)),
+        ]);
+        let alloc = crate::allocate_registers(&func, &HashSet::new(), &pins).unwrap();
 
         let instrs = select_for_test(&func, &alloc, 0x140000000);
 
@@ -1857,14 +1987,8 @@ mod tests {
             ],
             term: IrTerminator::Ret,
         });
-        let mut assignments = HashMap::new();
-        assignments.insert(v0, PhysReg::Gpr(Gpr::Rcx));
-        assignments.insert(v1, PhysReg::Gpr(Gpr::Rcx));
-        let alloc = RegAllocation {
-            assignments,
-            flag_scratch: None,
-            ..RegAllocation::default()
-        };
+        let pins = HashMap::from([(v0, PhysReg::Gpr(Gpr::Rcx)), (v1, PhysReg::Gpr(Gpr::Rcx))]);
+        let alloc = crate::allocate_registers(&func, &HashSet::new(), &pins).unwrap();
         let instrs = select_for_test(&func, &alloc, 0x140000000);
         assert!(
             instrs
@@ -1934,16 +2058,13 @@ mod tests {
                 term: IrTerminator::Ret,
             });
         }
-        let mut assignments = HashMap::new();
-        assignments.insert(a, PhysReg::Gpr(Gpr::Rcx));
-        assignments.insert(b, PhysReg::Gpr(Gpr::Rdx));
-        assignments.insert(r, PhysReg::Gpr(Gpr::R8));
-        assignments.insert(cf, PhysReg::Gpr(Gpr::Rax));
-        let alloc = RegAllocation {
-            assignments,
-            flag_scratch: Some(PhysReg::Gpr(Gpr::R11)),
-            ..RegAllocation::default()
-        };
+        let pins = HashMap::from([
+            (a, PhysReg::Gpr(Gpr::Rcx)),
+            (b, PhysReg::Gpr(Gpr::Rdx)),
+            (r, PhysReg::Gpr(Gpr::R8)),
+            (cf, PhysReg::Gpr(Gpr::Rax)),
+        ]);
+        let alloc = crate::allocate_registers(&func, &HashSet::new(), &pins).unwrap();
         let instrs = select_for_test(&func, &alloc, 0x140000000);
         crate::relocate(&instrs, 0x140001000).expect("branch on add flag must encode");
         use iced_x86::Mnemonic;
@@ -2032,13 +2153,8 @@ mod tests {
             },
         });
 
-        let mut assignments = HashMap::new();
-        assignments.insert(v0, PhysReg::Gpr(Gpr::Rbx));
-        let alloc = RegAllocation {
-            assignments,
-            flag_scratch: None,
-            ..RegAllocation::default()
-        };
+        let pins = HashMap::from([(v0, PhysReg::Gpr(Gpr::Rbx))]);
+        let alloc = crate::allocate_registers(&func, &HashSet::new(), &pins).unwrap();
 
         let instrs = select_for_test(&func, &alloc, 0x140000000);
         let mnem: Vec<iced_x86::Mnemonic> = instrs.iter().map(|i| i.mnemonic()).collect();
@@ -2116,15 +2232,12 @@ mod tests {
             ],
             term: IrTerminator::Ret,
         });
-        let mut assignments = HashMap::new();
-        assignments.insert(v_val, PhysReg::Gpr(Gpr::Rax));
-        assignments.insert(v_cnt, PhysReg::Gpr(Gpr::Rcx));
-        assignments.insert(v_res, PhysReg::Gpr(Gpr::Rax));
-        let alloc = RegAllocation {
-            assignments,
-            flag_scratch: None,
-            ..RegAllocation::default()
-        };
+        let pins = HashMap::from([
+            (v_val, PhysReg::Gpr(Gpr::Rax)),
+            (v_cnt, PhysReg::Gpr(Gpr::Rcx)),
+            (v_res, PhysReg::Gpr(Gpr::Rax)),
+        ]);
+        let alloc = crate::allocate_registers(&func, &HashSet::new(), &pins).unwrap();
         let instrs = select_for_test(&func, &alloc, 0x140000000);
         use iced_x86::{Mnemonic, OpKind};
         let shl = instrs

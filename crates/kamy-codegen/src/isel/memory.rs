@@ -486,11 +486,15 @@ fn emit_epilogue(
 }
 
 struct SelectionScratch {
-    allocation: RegAllocation,
+    allocation: InstructionAllocation,
     instruction: kamy_core::ir::Inst,
 }
 
-fn local_allocation(alloc: &RegAllocation, inst: &kamy_core::ir::Inst, local: &mut RegAllocation) {
+fn local_allocation(
+    alloc: &RegAllocation,
+    inst: &kamy_core::ir::Inst,
+    local: &mut InstructionAllocation,
+) {
     local.flag_scratch = Some(PhysReg::Gpr(Gpr::Rax));
     let gprs = [Gpr::R8, Gpr::R9, Gpr::R10];
     let xmms = [XmmReg::Xmm0, XmmReg::Xmm1, XmmReg::Xmm2];
@@ -503,7 +507,7 @@ fn local_allocation(alloc: &RegAllocation, inst: &kamy_core::ir::Inst, local: &m
         ) && class(alloc, dest, inst.ty) == ValueClass::Xmm
     }) || (matches!(inst.op, IrOp::Xor) && inst.ty == IrType::I128);
     for (index, &arg) in inst.args.iter().enumerate() {
-        if local.assignments.contains_key(&arg) {
+        if local.contains(arg) {
             continue;
         }
         let use_xmm = match inst.op {
@@ -526,25 +530,24 @@ fn local_allocation(alloc: &RegAllocation, inst: &kamy_core::ir::Inst, local: &m
             gi += 1;
             phys
         };
-        local.assignments.insert(arg, phys);
-        local.value_types.insert(arg, value_type(alloc, arg));
+        local.insert(arg, phys, value_type(alloc, arg));
     }
     if let Some(dest) = inst.dest {
-        local.value_types.insert(dest, inst.ty);
-        local.assignments.insert(
+        local.insert(
             dest,
             if dest_xmm {
                 PhysReg::Xmm(XmmReg::Xmm3)
             } else {
                 PhysReg::Gpr(Gpr::R11)
             },
+            inst.ty,
         );
     }
 }
 
 fn emit_aux_flag(
     alloc: &RegAllocation,
-    local: &RegAllocation,
+    local: &InstructionAllocation,
     inst: &kamy_core::ir::Inst,
     out: &mut Vec<Instruction>,
 ) {
@@ -573,8 +576,12 @@ fn emit_aux_flag(
     );
 }
 
-fn emit_select(local: &RegAllocation, inst: &kamy_core::ir::Inst, out: &mut Vec<Instruction>) {
-    let dest = local.assignments[&inst.dest.unwrap()];
+fn emit_select(
+    local: &InstructionAllocation,
+    inst: &kamy_core::ir::Inst,
+    out: &mut Vec<Instruction>,
+) {
+    let dest = local.register(inst.dest.unwrap());
     let cond = reg_of(local, inst.args[0], IrType::I8);
     if matches!(dest, PhysReg::Xmm(_)) {
         let false_label = 0x7FFF_C000_0000 + out.len() as u64 * 16;
@@ -758,22 +765,18 @@ fn emit_boundary(
     alloc: &RegAllocation,
     location: (BlockId, usize),
     inst: &kamy_core::ir::Inst,
-    local: &mut RegAllocation,
+    local: &mut InstructionAllocation,
     out: &mut Vec<Instruction>,
     references: &mut Vec<crate::references::InstructionReference>,
 ) {
     let (block, index) = location;
-    local.assignments.clear();
-    local.value_types.clear();
-    local.flag_scratch = None;
+    local.clear();
     if let IrOp::NativeInline(native) = &inst.op {
         for (&arg, &phys) in inst.args.iter().zip(&native.reads) {
             if phys == PhysReg::Gpr(Gpr::Rsp) {
                 continue;
             }
             load_value(alloc, arg, phys, out);
-            local.assignments.insert(arg, phys);
-            local.value_types.insert(arg, value_type(alloc, arg));
         }
         let decoded = Decoder::new(64, &native.bytes, DecoderOptions::NONE).decode();
         let direct_rsp = (0..decoded.op_count()).any(|operand| {
@@ -900,8 +903,9 @@ fn emit_boundary(
             continue;
         }
         load_value(alloc, arg, phys, out);
-        local.assignments.insert(arg, phys);
-        local.value_types.insert(arg, value_type(alloc, arg));
+        if matches!(inst.op, IrOp::CallIndirect { .. }) && position == 0 {
+            local.insert(arg, phys, value_type(alloc, arg));
+        }
     }
     let delta = alloc.analysis.call_deltas[&(block, index)];
     let adjustment = i64::from(alloc.frame.original_size) + delta;
@@ -1014,9 +1018,7 @@ fn emit_instruction(
         allocation: local,
         instruction: temporary,
     } = scratch;
-    local.assignments.clear();
-    local.value_types.clear();
-    local.flag_scratch = None;
+    local.clear();
     let mut fixed_inst = None;
     if matches!(
         inst.op,
@@ -1035,25 +1037,23 @@ fn emit_instruction(
         temporary.args.extend_from_slice(&inst.args);
         let mut next = u32::MAX;
         for (index, (&arg, &register)) in inst.args.iter().zip(registers).enumerate() {
-            while Some(ValueId(next)) == inst.dest || local.assignments.contains_key(&ValueId(next))
-            {
+            while Some(ValueId(next)) == inst.dest || local.contains(ValueId(next)) {
                 next -= 1;
             }
             let value = ValueId(next);
             next -= 1;
             temporary.args[index] = value;
-            local.assignments.insert(value, PhysReg::Gpr(register));
-            local.value_types.insert(value, inst.ty);
+            local.insert(value, PhysReg::Gpr(register), inst.ty);
             load_value(alloc, arg, PhysReg::Gpr(register), out);
         }
-        local.value_types.insert(inst.dest.unwrap(), inst.ty);
-        local.assignments.insert(
+        local.insert(
             inst.dest.unwrap(),
             PhysReg::Gpr(if matches!(inst.op, IrOp::UDiv | IrOp::SDiv) {
                 Gpr::Rax
             } else {
                 Gpr::Rdx
             }),
+            inst.ty,
         );
         fixed_inst = Some(&*temporary);
     } else {
@@ -1088,9 +1088,9 @@ fn emit_instruction(
                 continue;
             }
             if logical_pair {
-                load_logical_value(alloc, arg, local.assignments[&arg], Register::RAX, out);
+                load_logical_value(alloc, arg, local.register(arg), Register::RAX, out);
             } else {
-                load_value(alloc, arg, local.assignments[&arg], out);
+                load_value(alloc, arg, local.register(arg), out);
             }
         }
     }
@@ -1108,7 +1108,7 @@ fn emit_instruction(
         );
     }
     if let Some(dest) = inst.dest {
-        save_value(alloc, dest, local.assignments[&dest], out);
+        save_value(alloc, dest, local.register(dest), out);
         if matches!(
             inst.op,
             IrOp::UDiv | IrOp::SDiv | IrOp::UMulHi | IrOp::SMulHi
@@ -1217,11 +1217,7 @@ pub(super) fn select(
     let mut out = Vec::new();
     let mut references = Vec::new();
     let mut scratch = SelectionScratch {
-        allocation: RegAllocation {
-            assignments: HashMap::with_capacity(32),
-            value_types: HashMap::with_capacity(32),
-            ..RegAllocation::default()
-        },
+        allocation: InstructionAllocation::default(),
         instruction: kamy_core::ir::Inst {
             dest: None,
             op: IrOp::Undef,
