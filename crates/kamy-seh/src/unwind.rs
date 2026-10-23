@@ -1413,4 +1413,48 @@ mod tests {
         );
         assert_eq!(gprs[3], 0x1234);
     }
+
+    #[test]
+    fn successive_win64_results_never_replace_genuine_gpr_and_xmm_saves() {
+        let code = [
+            0x48, 0x83, 0xec, 0x78, // sub rsp, 120
+            0x48, 0x89, 0x5c, 0x24, 0x68, // mov [rsp+104], rbx
+            0x0f, 0x11, 0x74, 0x24, 0x50, // movups [rsp+80], xmm6
+            0x31, 0xdb, 0x66, 0x0f, 0xef, 0xf6, // dirty RBX and XMM6
+            0xe8, 0x00, 0x10, 0x00, 0x00, // first ordinary Win64 call
+            0x48, 0x89, 0x44, 0x24, 0x20, // capture RAX below the real saves
+            0x0f, 0x11, 0x44, 0x24, 0x30, // capture XMM0
+            0xe8, 0x00, 0x10, 0x00, 0x00, // second ordinary Win64 call
+            0x48, 0x89, 0x44, 0x24, 0x28, // capture the second RAX
+            0x0f, 0x11, 0x44, 0x24, 0x40, // capture the second XMM0
+            0x0f, 0x10, 0x74, 0x24, 0x50, // restore XMM6
+            0x48, 0x8b, 0x5c, 0x24, 0x68, // restore RBX
+            0x48, 0x83, 0xc4, 0x78, 0xc3,
+        ];
+        let ranges = unwind_ranges(&code, ENTRY).unwrap();
+        let original_gpr = 0x1357_2468_abcd_ef01;
+        let original_xmm = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
+        let stack = BTreeMap::from([
+            (-16, original_gpr as u128),
+            (-40, original_xmm),
+            (-88, 0xdead),
+            (-72, 0xbeef),
+            (-80, 0xfeed),
+            (-56, 0xcafe),
+        ]);
+        for offset in [25, 30, 35, 40, 45, 50, 55, 60, 64] {
+            let mut gprs = [0; 16];
+            let mut xmms = [0; 16];
+            gprs[3] = if offset >= 60 { original_gpr } else { 0 };
+            xmms[6] = if offset >= 55 { original_xmm } else { 0 };
+            let rsp = if offset == 64 { 0 } else { -120 };
+            assert_eq!(
+                restore(info_at(&ranges, offset), rsp, &mut gprs, &mut xmms, &stack),
+                8,
+                "caller RSP at body/epilogue +{offset:#x}"
+            );
+            assert_eq!(gprs[3], original_gpr, "RBX at +{offset:#x}");
+            assert_eq!(xmms[6], original_xmm, "XMM6 at +{offset:#x}");
+        }
+    }
 }

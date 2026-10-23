@@ -188,6 +188,46 @@ mod tests {
     }
 
     #[test]
+    fn successive_win64_calls_keep_original_sentinels_out_of_result_homes() {
+        let code = [
+            0x48, 0x83, 0xec, 0x78, 0x48, 0x89, 0x5c, 0x24, 0x68, 0x0f, 0x11, 0x74, 0x24, 0x50,
+            0x31, 0xdb, 0x66, 0x0f, 0xef, 0xf6, 0xe8, 0x00, 0x10, 0x00, 0x00, 0x48, 0x89, 0x44,
+            0x24, 0x20, 0x0f, 0x11, 0x44, 0x24, 0x30, 0xe8, 0x00, 0x10, 0x00, 0x00, 0x48, 0x89,
+            0x44, 0x24, 0x28, 0x0f, 0x11, 0x44, 0x24, 0x40, 0x0f, 0x10, 0x74, 0x24, 0x50, 0x48,
+            0x8b, 0x5c, 0x24, 0x68, 0x48, 0x83, 0xc4, 0x78, 0xc3,
+        ];
+        let snapshots = machine_snapshots(&code, 0x5000).unwrap();
+        for offset in [25, 35, 40, 50] {
+            let machine = &snapshots
+                .iter()
+                .find(|snapshot| snapshot.pc == 0x5000 + offset)
+                .unwrap()
+                .machine;
+            assert_eq!(
+                machine.stack[&-16].value,
+                Value::Bits(gpr_sentinel(3).into())
+            );
+            assert_eq!(machine.stack[&-40].value, Value::Bits(xmm_sentinel(6)));
+            assert_eq!(machine.registers[3], Value::Unknown);
+            assert_eq!(machine.vectors[6], Value::Bits(0));
+            for home in [-88, -72, -80, -56] {
+                assert!(
+                    !machine.stack.contains_key(&home),
+                    "result home {home} at +{offset}"
+                );
+            }
+        }
+        let returned = snapshots.last().unwrap();
+        assert!(returned.epilogue);
+        assert_eq!(returned.machine.rsp().unwrap(), 0);
+        assert_eq!(
+            returned.machine.registers[3],
+            Value::Bits(gpr_sentinel(3).into())
+        );
+        assert_eq!(returned.machine.vectors[6], Value::Bits(xmm_sentinel(6)));
+    }
+
+    #[test]
     fn bl_and_register_movss_preserve_the_other_nonvolatile_bits() {
         let code = [
             0xb3, 0x5a, // mov bl,0x5a

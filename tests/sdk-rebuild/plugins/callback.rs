@@ -34,6 +34,32 @@ pub static SDK_INTERIOR: &'static u64 = &SDK_READ_ONLY[1];
 #[unsafe(no_mangle)]
 pub static mut SDK_MODULE_BSS: [u64; 1024] = [0; 1024];
 
+#[cfg(feature = "abi")]
+#[repr(C)]
+pub struct SdkRebuildAggregate {
+    first: u64,
+    second: u64,
+    third: u64,
+}
+
+// Keep a real externally visible C ABI boundary: LTO may remove the sret
+// attribute from the original internal Rust aggregate helper's pointer ABI.
+#[cfg(feature = "abi")]
+#[inline(never)]
+#[unsafe(no_mangle)]
+pub extern "C" fn sdk_rebuild_hidden_aggregate(
+    first: u64,
+    second: u64,
+    third: u64,
+) -> SdkRebuildAggregate {
+    let value = SdkRebuildAggregate {
+        first,
+        second,
+        third,
+    };
+    unsafe { core::ptr::read_volatile(&value) }
+}
+
 unsafe extern "system" fn initialize(a1: *mut c_void, a2: *mut c_void, a3: *mut c_void) -> i32 {
     let state = (core::ptr::addr_of!(__ImageBase) as usize + TRACE_RVA) as *mut u64;
     #[cfg(feature = "first")]
@@ -61,23 +87,42 @@ unsafe extern "system" fn initialize(a1: *mut c_void, a2: *mut c_void, a3: *mut 
     #[cfg(feature = "abi")]
     unsafe {
         let bss = core::ptr::addr_of_mut!(SDK_MODULE_BSS).cast::<u64>();
-        if state.add(7).read_volatile() == 0 && (bss.read_volatile() != 0 || bss.add(1023).read_volatile() != 0) {
+        if state.add(7).read_volatile() == 0
+            && (bss.read_volatile() != 0 || bss.add(1023).read_volatile() != 0)
+        {
             return 41;
         }
         bss.write_volatile(0x1357);
         bss.add(1023).write_volatile(0x2468);
         let read_only = core::ptr::addr_of!(SDK_READ_ONLY).cast::<u64>();
         let integer = sdk_rebuild_dependency::integer(read_only.read_volatile());
-        let floating = sdk_rebuild_dependency::floating(f64::from_bits(state.add(3).read_volatile()));
+        let floating =
+            sdk_rebuild_dependency::floating(f64::from_bits(state.add(3).read_volatile()));
         let interior = core::ptr::addr_of!(SDK_INTERIOR).read_volatile();
-        let mixed = sdk_rebuild_dependency::mixed((core::ptr::read_volatile(interior), f64::from_bits(state.add(5).read_volatile())));
-        let aggregate = sdk_rebuild_dependency::aggregate([read_only.add(2).read_volatile(), read_only.read_volatile(), read_only.add(3).read_volatile()]);
+        let mixed = sdk_rebuild_dependency::mixed((
+            core::ptr::read_volatile(interior),
+            f64::from_bits(state.add(5).read_volatile()),
+        ));
+        let aggregate = sdk_rebuild_dependency::aggregate([
+            read_only.add(2).read_volatile(),
+            read_only.read_volatile(),
+            read_only.add(3).read_volatile(),
+        ]);
+        let hidden = sdk_rebuild_hidden_aggregate(aggregate[0], aggregate[1], aggregate[2]);
         state.add(2).write_volatile(integer);
         state.add(3).write_volatile(floating.to_bits());
         state.add(4).write_volatile(mixed.0);
         state.add(5).write_volatile(mixed.1.to_bits());
-        state.add(6).write_volatile(aggregate[0].wrapping_add(aggregate[1]).wrapping_add(aggregate[2]));
-        state.add(7).write_volatile(bss.read_volatile().wrapping_add(bss.add(1023).read_volatile()));
+        state.add(6).write_volatile(
+            hidden
+                .first
+                .wrapping_add(hidden.second)
+                .wrapping_add(hidden.third),
+        );
+        state.add(7).write_volatile(
+            bss.read_volatile()
+                .wrapping_add(bss.add(1023).read_volatile()),
+        );
     }
     let _ = (state, a1, a2, a3, TABLE_BYTES);
     #[cfg(feature = "fastfail")]

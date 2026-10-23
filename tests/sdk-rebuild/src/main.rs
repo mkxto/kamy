@@ -769,3 +769,286 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
+    use kamy_core::{LinkField, SymbolicExpression};
+    use kamy_pe::module::{AuthoredModule, CodeSymbol};
+
+    fn real_call_contract<'a>(
+        module: &'a AuthoredModule,
+        caller: &CodeSymbol,
+        instruction: &iced_x86::Instruction,
+    ) -> Result<&'a CodeSymbol> {
+        let field = u32::try_from(instruction.next_ip() - 4)? - caller.start.get();
+        let mut references = module.references.iter().filter(|reference| {
+            reference.source == caller.symbol
+                && reference.offset == field
+                && matches!(reference.field, LinkField::Relative32 { bias: 0 })
+        });
+        let reference = references
+            .next()
+            .context("real call lacks its COFF reference")?;
+        ensure!(references.next().is_none(), "ambiguous real call reference");
+        let mut expression = reference.expression.clone();
+        for _ in 0..=module.bindings.len() {
+            let SymbolicExpression::Symbol { symbol, addend } = expression else {
+                anyhow::bail!("real call target is not a single authored symbol");
+            };
+            if addend == 0
+                && let Some(function) = module.code.iter().find(|code| code.symbol == symbol)
+            {
+                ensure!(
+                    u64::from(function.start.get()) == instruction.near_branch64(),
+                    "resolved call contract differs from its encoded target"
+                );
+                return Ok(function);
+            }
+            expression = module
+                .bindings
+                .get(&symbol)
+                .context("real call target lacks an accepted authored contract")?
+                .clone()
+                .with_addend(addend)
+                .context("real call alias addend overflows")?;
+        }
+        anyhow::bail!("cyclic real call target bindings")
+    }
+
+    #[test]
+    #[ignore = "requires explicit SDK_ABI_* CLI/compiler paths and matching LLVM 22.1.2 tools"]
+    fn real_rust_llvm_call_contracts_preserve_win64_nonvolatiles() -> Result<()> {
+        use kamy_core::ir::{AbiClass, AbiPassing, win64_volatiles};
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        let parameter = |name| -> Result<PathBuf> {
+            Ok(PathBuf::from(std::env::var_os(name).with_context(
+                || {
+                    format!(
+                        "{name} MUST explicitly select the real producer tool or evidence directory"
+                    )
+                },
+            )?))
+        };
+        let kamy = parameter("SDK_ABI_KAMY")?;
+        let cargo = parameter("SDK_ABI_CARGO")?;
+        let rustc = parameter("SDK_ABI_RUSTC")?;
+        let linker = parameter("SDK_ABI_LINKER")?;
+        let llvm = parameter("KAMY_LLVM_TOOLS_DIR")?;
+        let out = parameter("SDK_ABI_OUT")?;
+        std::fs::create_dir_all(&out)?;
+        let artifact = out.join("real-rust-call-contracts.dll");
+        let rust_version = crate::invoke(Command::new(&rustc).arg("-vV"))?;
+        let llvm_version = crate::invoke(
+            Command::new(llvm.join(if cfg!(windows) { "llc.exe" } else { "llc" })).arg("--version"),
+        )?;
+        crate::invoke(
+            Command::new(&kamy)
+                .args(["plugin", "build", "--manifest-path"])
+                .arg(crate::source().join("plugins/abi/Cargo.toml"))
+                .arg("--output")
+                .arg(&artifact)
+                .arg("--linker")
+                .arg(&linker)
+                .env("CARGO", &cargo)
+                .env("RUSTC", &rustc)
+                .env("KAMY_LLVM_TOOLS_DIR", &llvm)
+                .env("SDK_TRACE_RVA", "4096")
+                .env("SDK_TABLE_BYTES", "24"),
+        )?;
+        let mut evidence = format!(
+            "artifact={}\nrustc={}\nllc={}\n",
+            artifact.display(),
+            String::from_utf8(rust_version.stdout)?,
+            String::from_utf8(llvm_version.stdout)?,
+        );
+        std::fs::write(out.join("call-contracts.txt"), &evidence)?;
+        let pe = crate::pe::Pe::read(&artifact)?;
+        let metadata = pe
+            .sections
+            .iter()
+            .find(|section| section.name == ".kmod")
+            .context("real producer omitted its compiler evidence")?;
+        std::fs::write(
+            out.join("compiler-metadata.bin"),
+            pe.slice(metadata.rva, metadata.virtual_size as usize)?,
+        )?;
+        // Save raw compiler evidence before the normal public parser can reject it.
+        let module = AuthoredModule::parse(&pe.bytes, "abi")?;
+        let mut calls = Vec::new();
+        let mut invalid = Vec::new();
+        for function in &module.code {
+            let signature = &function.signature;
+            evidence.push_str(&format!(
+                "symbol={} begin={:#x} end={:#x} abi={signature:?}\n",
+                function.name,
+                function.start.get(),
+                function.end.get()
+            ));
+            let decoder = Decoder::with_ip(
+                64,
+                pe.slice(
+                    function.start.get(),
+                    (function.end.get() - function.start.get()) as usize,
+                )?,
+                u64::from(function.start.get()),
+                DecoderOptions::NONE,
+            );
+            for instruction in decoder {
+                if instruction.is_invalid()
+                    || instruction.flow_control() == FlowControl::IndirectCall
+                {
+                    invalid.push(format!(
+                        "invalid or unresolved producer instruction at {:#x}: {instruction:?}",
+                        instruction.ip()
+                    ));
+                }
+                if instruction.flow_control() == FlowControl::Call
+                    && instruction.op0_kind() == OpKind::NearBranch64
+                {
+                    let contract = real_call_contract(&module, function, &instruction);
+                    evidence.push_str(&format!(
+                        "caller={:#x} call={:#x} target={:#x} resolved_contract={contract:?}\n",
+                        function.start.get(),
+                        instruction.ip(),
+                        instruction.near_branch64(),
+                    ));
+                    calls.push((function.start.get(), instruction.ip(), contract));
+                }
+            }
+        }
+        for error in &invalid {
+            evidence.push_str(&format!("decode_error={error}\n"));
+        }
+        // AuthoredModule has per-target contracts, derived from consensus native
+        // CALL masks, not separate per-PC signatures. Resolve every actual CALL
+        // through its accepted COFF reference/bindings, as the authored lifter does.
+        std::fs::write(out.join("call-contracts.txt"), &evidence)?;
+        ensure!(invalid.is_empty(), "{}", invalid.join("\n"));
+        let volatile = win64_volatiles();
+        let preserves_nonvolatiles = |signature: &kamy_core::ir::FnSignature| {
+            signature.clobbers.iter().all(|reg| volatile.contains(reg))
+                && signature.returns.iter().all(|value| {
+                    value
+                        .register_location()
+                        .is_some_and(|reg| volatile.contains(&reg))
+                })
+        };
+        for function in &module.code {
+            ensure!(
+                preserves_nonvolatiles(&function.signature),
+                "real compiler defines a Win64 nonvolatile in {}: {:?}",
+                function.name,
+                function.signature
+            );
+        }
+        for (caller, pc, contract) in &calls {
+            let target = contract
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+            ensure!(
+                preserves_nonvolatiles(&target.signature),
+                "accepted real call defines a Win64 nonvolatile: caller={caller:#x} pc={pc:#x} target={} abi={:?}",
+                target.name,
+                target.signature
+            );
+        }
+        let mut reachable = std::collections::BTreeSet::from([module.entry.get()]);
+        loop {
+            let before = reachable.len();
+            for (caller, _, contract) in &calls {
+                if reachable.contains(caller) {
+                    let target = contract
+                        .as_ref()
+                        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                    reachable.insert(target.start.get());
+                }
+            }
+            if before == reachable.len() {
+                break;
+            }
+        }
+        crate::report::inspect_scalar_producer(&artifact)?;
+        for helper in [
+            "integer",
+            "sdk_rebuild_scalar_f64",
+            "mixed",
+            "aggregate",
+            "sdk_rebuild_hidden_aggregate",
+        ] {
+            let mut matching = module.code.iter().filter(|function| {
+                if helper == "sdk_rebuild_hidden_aggregate" {
+                    function.name == helper
+                } else {
+                    function.name.contains(helper)
+                        && function.name != "sdk_rebuild_hidden_aggregate"
+                }
+            });
+            let function = matching
+                .next()
+                .with_context(|| format!("producer lost {helper}"))?;
+            ensure!(matching.next().is_none(), "producer duplicated {helper}");
+            ensure!(
+                reachable.contains(&function.start.get())
+                    && calls.iter().any(|(caller, _, contract)| {
+                        reachable.contains(caller)
+                            && *caller != function.start.get()
+                            && contract
+                                .as_ref()
+                                .is_ok_and(|target| target.symbol == function.symbol)
+                    }),
+                "callback has no reachable real cross-function call to {helper}"
+            );
+            if helper == "integer" {
+                ensure!(
+                    function.signature.returns.iter().any(|value| {
+                        value.class == AbiClass::Integer
+                            && value.bits == 64
+                            && value.passing == AbiPassing::Direct
+                    }),
+                    "real integer helper did not exercise a direct integer result"
+                );
+            }
+            if helper == "mixed" {
+                ensure!(
+                    function
+                        .signature
+                        .returns
+                        .iter()
+                        .any(|value| value.class == AbiClass::Integer)
+                        && function
+                            .signature
+                            .returns
+                            .iter()
+                            .any(|value| value.class == AbiClass::Float)
+                        && function
+                            .signature
+                            .returns
+                            .iter()
+                            .all(|value| value.passing == AbiPassing::Direct),
+                    "real mixed tuple did not exercise integer/float result pieces"
+                );
+            }
+            if helper == "sdk_rebuild_hidden_aggregate" {
+                ensure!(
+                    function.signature.args.iter().any(|value| {
+                        value.class == AbiClass::Pointer
+                            && value.bits == 64
+                            && matches!(value.passing, AbiPassing::Sret { size: 24, align: 8 })
+                    }) && function.signature.returns.iter().any(|value| {
+                        value.class == AbiClass::Pointer
+                            && value.bits == 64
+                            && value.passing == AbiPassing::Direct
+                    }),
+                    "real extern C aggregate lacks the hidden 24-byte result pointer input/return: {:?}",
+                    function.signature
+                );
+            }
+        }
+        println!("{evidence}real_rust_call_contracts=PASS");
+        Ok(())
+    }
+}
