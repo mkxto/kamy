@@ -28,8 +28,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use windows::Win32::Foundation::{
-    CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, HANDLE, HANDLE_FLAG_INHERIT,
-    HANDLE_FLAGS, SetHandleInformation, TRUE, WAIT_TIMEOUT,
+    CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, ERROR_SEM_TIMEOUT, HANDLE,
+    HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, TRUE, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
@@ -52,6 +53,10 @@ use windows::Win32::System::Threading::{
 use windows::core::{PCWSTR, PWSTR};
 
 const EXCEPTION_BREAKPOINT: u32 = 0x8000_0003;
+// Termination is asynchronous, and an exit debug event still needs to be
+// continued. Bound that final event drain and process wait independently of
+// the target's execution timeout (which may be disabled).
+const TRACE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How to launch a target process.
 #[derive(Clone, Debug, Default)]
@@ -101,6 +106,10 @@ pub fn run(opts: &RunOptions) -> Result<RunOutcome> {
 /// [`RunOutcome::fault`] is populated with the faulting address and its offset
 /// from the image base. First-chance exceptions are passed to the target's own
 /// handlers, so SEH that recovers is not reported as a fault.
+///
+/// Before returning, the exit event is continued and the process is awaited so
+/// its executable image is no longer mapped by the target. Fault/timeout cleanup
+/// is bounded separately; a failed or incomplete cleanup is an error.
 pub fn run_traced(opts: &RunOptions) -> Result<RunOutcome> {
     execute(opts, true)
 }
@@ -388,7 +397,11 @@ fn execute(opts: &RunOptions, traced: bool) -> Result<RunOutcome> {
     let mut outcome = RunOutcome::default();
 
     if traced {
-        debug_loop(opts, &pi, &hjob, &mut outcome)?;
+        debug_loop(opts, &pi, &hjob, &mut outcome)
+            .with_context(|| format!("tracing {}", opts.exe.display()))?;
+        // The traced process has exited; close the job before joining pipe
+        // readers so surviving descendants cannot keep inherited stdio open.
+        drop(hjob);
     } else {
         let wait_ms = timeout_ms(opts.timeout);
         let wr = unsafe { WaitForSingleObject(hprocess.get(), wait_ms) };
@@ -422,8 +435,8 @@ fn timeout_ms(timeout: Duration) -> u32 {
     }
 }
 
-/// Debug-event pump: records the image base, reports the first faulting RVA,
-/// and captures the exit code, while honoring the timeout via a deadline.
+/// Debug-event pump: records the first fault and actual exit code, then
+/// acknowledges process exit and waits for termination to finish.
 fn debug_loop(
     opts: &RunOptions,
     pi: &PROCESS_INFORMATION,
@@ -436,18 +449,28 @@ fn debug_loop(
         Some(Instant::now() + opts.timeout)
     };
     let mut image_base: u64 = 0;
+    let mut cleanup_deadline = None;
 
     loop {
-        let wait_ms = match deadline {
+        let wait_ms = match cleanup_deadline.or(deadline) {
             None => INFINITE,
             Some(d) => {
                 let now = Instant::now();
                 if now >= d {
-                    outcome.timed_out = true;
-                    unsafe {
-                        let _ = TerminateJobObject(hjob.get(), 1);
+                    if cleanup_deadline.is_some() {
+                        bail!(
+                            "traced process {} did not report exit within {:?} of fault/timeout cleanup",
+                            pi.dwProcessId,
+                            TRACE_CLEANUP_TIMEOUT
+                        );
                     }
-                    break;
+                    outcome.timed_out = true;
+                    unsafe { TerminateJobObject(hjob.get(), 1) }
+                        .context("TerminateJobObject after traced execution timeout")?;
+                    cleanup_deadline = Some(Instant::now() + TRACE_CLEANUP_TIMEOUT);
+                    // Termination is asynchronous. Keep acknowledging debug
+                    // events until EXIT_PROCESS_DEBUG_EVENT releases the target.
+                    continue;
                 }
                 // Cap each wait so the deadline is re-checked responsively.
                 ((d - now).as_millis().min(50) as u32).max(1)
@@ -455,13 +478,11 @@ fn debug_loop(
         };
 
         let mut ev = DEBUG_EVENT::default();
-        let r = unsafe { WaitForDebugEvent(&mut ev, wait_ms) };
-        if r.is_err() {
-            match deadline {
-                // A finite per-iteration wait timed out; loop to re-check.
-                Some(_) => continue,
-                None => bail!("WaitForDebugEvent failed"),
+        if let Err(error) = unsafe { WaitForDebugEvent(&mut ev, wait_ms) } {
+            if error.code() == ERROR_SEM_TIMEOUT.to_hresult() {
+                continue;
             }
+            return Err(error).context("WaitForDebugEvent while awaiting traced process exit");
         }
 
         match ev.dwDebugEventCode {
@@ -497,36 +518,54 @@ fn debug_loop(
                     };
                     continue_event(&ev, disp)?;
                 } else {
-                    // Second chance: unhandled and fatal. Record where it died.
-                    let address = ex.ExceptionRecord.ExceptionAddress as usize as u64;
-                    outcome.fault = Some(Fault {
-                        code,
-                        address,
-                        image_base,
-                        rva: address.wrapping_sub(image_base),
-                    });
-                    unsafe {
-                        let _ = TerminateJobObject(hjob.get(), 1);
+                    // Preserve the first actual fault, including its address.
+                    // Continuing a second-chance exception as not handled lets
+                    // Windows terminate with its real exception exit code.
+                    if outcome.fault.is_none() {
+                        let address = ex.ExceptionRecord.ExceptionAddress as usize as u64;
+                        outcome.fault = Some(Fault {
+                            code,
+                            address,
+                            image_base,
+                            rva: address.wrapping_sub(image_base),
+                        });
                     }
-                    break;
+                    cleanup_deadline.get_or_insert_with(|| Instant::now() + TRACE_CLEANUP_TIMEOUT);
+                    continue_event(&ev, DBG_EXCEPTION_NOT_HANDLED.0)?;
                 }
             }
             EXIT_PROCESS_DEBUG_EVENT => {
                 let code = unsafe { ev.u.ExitProcess.dwExitCode };
                 outcome.exit_code = Some(code as i32);
                 continue_event(&ev, DBG_CONTINUE.0)?;
-                break;
+                // The event precedes completion of process teardown. Its
+                // acknowledgement closes debug-event handles, not our separate
+                // CreateProcess handle; wait for that handle to become signaled
+                // before the caller can remove the executable.
+                let cleanup_deadline =
+                    cleanup_deadline.unwrap_or_else(|| Instant::now() + TRACE_CLEANUP_TIMEOUT);
+                let wait_ms = cleanup_deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u32;
+                match unsafe { WaitForSingleObject(pi.hProcess, wait_ms) } {
+                    WAIT_OBJECT_0 => return Ok(()),
+                    WAIT_TIMEOUT => bail!(
+                        "traced process {} did not finish termination within {:?}",
+                        pi.dwProcessId,
+                        TRACE_CLEANUP_TIMEOUT
+                    ),
+                    WAIT_FAILED => {
+                        return Err(windows::core::Error::from_win32())
+                            .context("WaitForSingleObject after continuing traced process exit");
+                    }
+                    status => bail!("unexpected traced process wait status {:#x}", status.0),
+                }
             }
             _ => {
                 continue_event(&ev, DBG_CONTINUE.0)?;
             }
         }
     }
-
-    // The process handle is unused here; the job tore the child down. Suppress
-    // the unused-binding by referencing it explicitly.
-    let _ = pi.hProcess;
-    Ok(())
 }
 
 fn continue_event(ev: &DEBUG_EVENT, status: i32) -> Result<()> {
