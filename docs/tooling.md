@@ -488,16 +488,29 @@ An injection failure already naming `plugin::function` can be inspected directly
 in its original authored DLL. Do not pass a module's final map RVA to host
 `dump --rva`, or invent a host source RVA to make bisection find it.
 
-### `kamy bisect <input> --expect-exit <int> [--expect-stdout <path>] [--stdin-file <path>] [--timeout <secs>]`
+### `kamy bisect <input> --expect-exit <int> [--expect-stdout <path>] [--stdin-file <path>] [--timeout <secs>] [--keep]`
 
-Binary-search the set of protected functions to the minimal culprit set whose
-protection makes the program diverge. Each probe protects a candidate subset,
-runs it headless, and checks the observed exit code against `--expect-exit`; a
-crash counts as divergence (any unhandled exception terminates with its NTSTATUS
-as the exit code). Add `--expect-stdout <file>` to also require matching output
-(trailing whitespace ignored), which catches wrong-output miscompiles that still
-exit cleanly. `--stdin-file` feeds the run's stdin; `--timeout` defaults to 30
-seconds. Reports the culprit RVAs, candidate count, and step count.
+Narrow the protected-function set to the minimal culprit set whose protection
+makes the program diverge. Every probe and the final replay use the same stdin,
+timeout and exit/output predicate. Timeout or missing termination always fails;
+an unexpected traced fatal exception fails, while an explicitly declared matching
+negative fault is accepted. An exit code that merely resembles an NTSTATUS is
+not fault evidence. Add `--expect-stdout <file>` to require matching output
+(trailing whitespace ignored), catching wrong-output miscompiles that exit
+cleanly. `--stdin-file` supplies stdin; `--timeout` defaults to 30 seconds.
+The final replay must still fail that same predicate. `--keep` retains its exact
+executed protected artifact, not a newly rebuilt approximation. Each invocation
+exclusively reserves its own artifact directory; retained evidence is not reused
+or overwritten after PID reuse. Unretained probes clean up only their own
+directory. Reports include culprit RVAs, candidate and step counts, and replay
+outcome/artifact information.
+This is an EXE replay interface, not a replacement for a DLL corpus loader's
+export-call protocol.
+The initial smoke failed deleting a traced probe; the runner/debugger lifecycle
+repair resolved it. The actual stdin/output-aware replay then succeeded with
+43 candidates, 13 steps and culprit `0x19000`; retained command/log:
+`target/pre-repair-now/current-bisect.txt`. See STATUS and
+`target/pre-repair-now/receipt.json` for the latest exercised CLI/artifact hashes.
 
 ```sh
 kamy bisect app.exe --expect-exit 0 --stdin-file input.bin --timeout 30
@@ -514,10 +527,17 @@ kamy explain-reject app.exe --rva 0x1400
 
 ### `kamy corpus verify [--corpus <dir>] [--member <name>] [--keep] [--baseline <file>] [--write-baseline <file>]`
 
-Protect and run every corpus member, collecting coverage. `--member` limits the
-run to one member; `--keep` retains the protected artifacts; `--baseline`
-compares coverage against a saved baseline and reports the delta;
-`--write-baseline` saves the current coverage as the new baseline.
+Protect and run corpus members, collecting coverage. `--member` limits the
+run to one member. `--keep` retains the exact executed protected binary plus
+its debug-map CSV (`kamy-debug-map,2`) and link-report JSON
+(`schema="kamy-link-report"`, `version=1`), using the same serializers as
+`protect`. Sidecars append `.debug-map.csv` and `.link-report.json` to the
+protected binary's full path (for example, `x.dll.link-report.json`). Use
+per-function `selected`, `eligible` and `lowered` results and source/final
+mappings, not just aggregate coverage, to establish what lowered. Every corpus
+command rejects an empty campaign; member selection must identify a real member.
+`--baseline` compares coverage against a saved baseline and reports the delta;
+`--write-baseline` saves current coverage, not new behavior goldens.
 
 Coverage records distinguish `selected`, `eligible`, `ssa_lowered` and
 `transformed`, with `actual_intensity` mapping successful lowering intensities
@@ -528,22 +548,55 @@ source-function identities and rejection transitions, reporting population
 additions/removals separately from recovery. A green identity verdict does not
 prove a configured MBA pass ran or a required authored callback was lowered.
 
+Manifest `lower_exports` is an opt-in list of named **host** exports for identity
+selection. Each target is REQUIRED to lower: missing exports, safe rejection or
+selected-but-unlowered functions fail the campaign. An empty list retains
+all-functions identity behavior. It does not alter `exports`, whose loader calls
+still supply exact argument tokens and may call the same export more than once.
+
+Manifest `expected_exit` optionally requires an exact terminal code. Timeout or
+missing termination always fails. An actual traced fault is invalid unless
+explicitly declared by a matching expected code. That fault can terminate without
+a normal exit event; its validated traced code is recorded in the existing
+golden exit field, not described as normal exit. Normal nonzero exits remain
+valid when no exact expectation is declared. Fault classification uses actual
+runner fault events, not an exit-code range or PE/NTSTATUS guess. Generic
+`kamy verify` has no expected-fault policy. The DLL loader protocol always
+requires exit 0, no traced fault and a real typed return; two failed/empty loader
+runs cannot pass by equality. GUI oracles require a nonempty trace. Invalid or
+empty golden records fail rather than becoming successful empty comparisons.
+Protected observation failures retain coverage and diagnostics. Golden equality
+never substitutes for run health.
+
 ```sh
 kamy corpus verify --corpus corpus --baseline cov.json
 kamy corpus verify --member hello --keep --write-baseline cov.json
 ```
 
-### `kamy corpus doctor [--corpus <dir>]`
+### `kamy corpus doctor [--corpus <dir>] [--member <name>]`
 
-Health-check the corpus: report each member, whether it is well-formed, and any
-problems found.
+Run each selected unprotected original's oracle against its golden and report
+per-member health/golden failures. `--member` limits the health check without
+touching unavailable members; disclose skipped members rather than reporting
+a subset as a full-corpus PASS. Use this before trusting a protected verdict. Timeout or
+a broken loader is never an oracle; only an explicitly declared matching fault
+in a policy that permits it is an accepted negative termination. Doctor does
+not repair or re-bless a golden.
 
 ```sh
 kamy corpus doctor --corpus corpus
 ```
 
+### `kamy corpus bless [--corpus <dir>] [--member <name>]`
+
+Bless goldens from **originals**, never protected output. `--member` restricts
+blessing to that member; a missing selection or empty population fails. Omitting
+it retains all-member blessing, so use `--member dll_frame_select` when adding
+the pre-repair witness and leave every existing original/golden untouched.
+Independently check both original return values before blessing.
+
 Unchanged commands: `kamy analyze`, `kamy verify --original --protected`,
-`kamy corpus build|bless|list`.
+`kamy corpus build|list`.
 
 ## Miscompile-hunt workflow
 
@@ -562,6 +615,61 @@ corpus verify  →  bisect  →  dump --stage regalloc  →  x64dbg (deep-dive o
    `optimize` dumps when frame proof or allocation fails, or to isolate a phase.
 4. x64dbg — manual deep-dive on that single isolated culprit, only when the IR
    does not already explain the fault.
+
+### Pre-repair #37 corpus witness
+
+The available corpus checkout is `C:/dev/kamy-corpus`, published source HEAD
+`df9431c03da55fe0432608740ba5d29c78951860` with four historical members, not the
+historical 23-member campaign. The locked revision
+`d9bc70d9970d3e1988203acd3415b103bcb62197` could not be fetched (`not our ref`).
+Record source HEAD and local witness changes separately from `corpus.lock`;
+do not silently relabel the checkout or update historical counts. The initially
+modified `members/dll_strutil/orig/dll_strutil.dll` was subsequently confirmed
+quarantined by Windows Defender; its original directory is empty. The user
+directed that it be skipped; no exclusion or restore was executed. Report it
+unavailable/skipped, never PASS. Do not rebuild/re-bless it, modify existing
+goldens, or claim a subset establishes a healthy full published baseline. See
+[STATUS.md](STATUS.md#now-pre-repair-acceptance-net--not-an-h2-repair) for the
+seven-finding acceptance ledger, quarantine evidence and actual results.
+
+`dll_frame_select` selects `lower_exports: [frame_select]`. Its `frame_select`
+export accepts six `u64`s; args2–4 are zero, arg5 is
+`u64:1234605616436508552` (`0x1122334455667788`), and arg6 is
+`u64:9833440827789222417` (`0x8877665544332211`). Two loader calls use arg1
+`u64:0` and `u64:1` and independently require arg5 and arg6 respectively.
+No `expected_exit` override is needed; the loader must exit 0 with both real
+return values. Exit 0 alone cannot detect this confirmed wrong-result defect.
+
+The local member now has a source-built original and independently blessed
+`expected.yml`. To reproduce the required failure without changing that golden:
+
+```sh
+kamy corpus doctor --corpus C:/dev/kamy-corpus --member dll_frame_select
+kamy corpus verify --corpus C:/dev/kamy-corpus --member dll_frame_select --keep
+```
+
+Observed after runner-lifecycle repair: the selected doctor exited 0 and
+verification exited 1, with **1 selected / 1 lowered / 0 transformed**. Condition
+0 expected **1234605616436508552**, observed **500008219856**; condition 1 expected
+**9833440827789222417**, observed **0**. The retained artifact is
+`C:/dev/kamy-corpus/protected/kamy-protected-dll_frame_select-21892.dll` plus
+sidecars. Current logs/baselines use `target/pre-repair-now/current-` prefixes.
+This is a real required
+failure, not protected correctness success. Re-bless only when independently
+establishing a new original, never to accommodate protected output.
+
+Keep the original oracle/golden stable and retain binary/maps/report plus actual
+build/input/output hashes, stage dumps and observed values. Required-lowering
+failures retain actual coverage and diagnostics. H2 remains reopened and #37–43
+unfixed; this acceptance net does not authorize backend repairs, transforms,
+ASan, Rocq or CI work, or a commit/push. Bisect must preserve the same real EXE
+oracle for probes and replay in its exclusively owned evidence directory; a bare
+DLL is not that executable replay contract. The actual stdin/output-aware CLI
+smoke with `--timeout 10 --keep` succeeded after lifecycle repair; final gates
+passed **455 tests / 47 suites** plus fmt/clippy/build. The NOW evidence net is
+complete, not H2 acceptance. The earlier 451/454 gates and failed probe cleanup
+are historical snapshots, not the current replay verdict.
+
 
 ## Crates
 

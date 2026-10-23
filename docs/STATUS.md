@@ -1011,15 +1011,15 @@ H2 reacceptance; they do not expand H2 into all #36, H3–H7, or language-handle
 reconstruction. Preserve D40's concrete frames, memory homes, bounded scratch,
 one backend and one rebuild.
 
-| Issue | Review root | Evidence status | Current disposition |
-|---|---|---|---|
-| [#37](https://github.com/mkxto/kamy/issues/37) | Finite select provenance | Confirmed native miscompile | Unfixed; H2 reacceptance pending |
-| [#38](https://github.com/mkxto/kamy/issues/38) | Accepted call-contract unwind | Static finding; not runtime reproduced | Unfixed; reachability/native oracle required |
-| [#39](https://github.com/mkxto/kamy/issues/39) | Scalar-DAG work | Static complexity; no timings measured | Unfixed; bounded-work evidence required |
-| [#40](https://github.com/mkxto/kamy/issues/40) | Dominator storage | Static allocation; no timings measured | Unfixed; scaling/allocation evidence required |
-| [#41](https://github.com/mkxto/kamy/issues/41) | Phi-copy planning | Static complexity; no timings measured | Unfixed; scaling/results required |
-| [#42](https://github.com/mkxto/kamy/issues/42) | Read-only pin saves | Source analysis; no size/timing measurement | Unfixed; actual-write/save evidence required |
-| [#43](https://github.com/mkxto/kamy/issues/43) | Duplicate global pin map | Source analysis | Unfixed; consumer migration/allocation evidence required |
+| Issue | Current evidence / status | Required result before H2 reacceptance | Regression / oracle | Unresolved question |
+|---|---|---|---|---|
+| [#37](https://github.com/mkxto/kamy/issues/37) — finite select provenance | Confirmed native wrong-result miscompile with normal exit 0; unfixed | Preserve finite selected-frame coordinates through subsequent addressing; supported witness MUST lower correctly in identity and requested supported MBA, without blanket rejection or reduced intensity | `dll_frame_select` original arg5/arg6 output oracle through `kamy corpus verify`; portable constant/variable-condition and phi/select/copy composition cases across both coordinate zones; emitted-address inspection and native comparison | Which finite provenance representation preserves all supported compositions while rejecting truly unprovable selections specifically and atomically? |
+| [#38](https://github.com/mkxto/kamy/issues/38) — accepted call-contract unwind | Static finding, not a native unwind reproduction; real accepted producer reachability unresolved; unfixed | Establish actual accepted ABI producer/consumer reachability and caller-state loss, or reproducibly disprove it; use resolved call effects and genuine save provenance in plain-body unwind | Real RBX/XMM6+ result/clobber contracts, successive calls and standard Win64 controls; forced-ASLR `RtlLookupFunctionEntry` / `RtlVirtualUnwind` over body/epilogue PCs with real prologue saves | Can the actual accepted producer emit the concerning nonvolatile result/clobber contract? Arbitrary invented ABI metadata does not answer this. |
+| [#39](https://github.com/mkxto/kamy/issues/39) — scalar-DAG work | Static repeated-traversal finding; no timings measured; unfixed | Bound shared-dependency evaluation, including failed results and cycles, while preserving range/overflow/resource distinctions and refreshed transform facts | Deterministic shared-DAG, cycle, overflow and boundary cases; actual work/size evidence plus indexed-frame native output/addressing oracle; no huge potentially hanging input or flaky wallclock assertion | What measured work bound applies to shared scalar DAGs without accepting unsound ranges? |
+| [#40](https://github.com/mkxto/kamy/issues/40) — dominator storage | Static quadratic-entry allocation finding; no timings or OOM measured; unfixed | Skip candidate-free analysis and bound needed dominator storage without threshold rejection, discarded blocks or stale facts | Acyclic and loop scaling/allocation evidence; correct headers/bounds for reducible and irreducible CFGs; native control-flow/addressing comparison | What actual allocation/scaling remains when loop candidates do require analysis? |
+| [#41](https://github.com/mkxto/kamy/issues/41) — phi-copy planning | Static worst-case complexity finding; no timings or hang measured; unfixed | Bound dependency planning using the existing cycle-scratch convention and single backend; preserve consumer results | Wide/reverse-chain work scaling; mixed GPR/XMM/flag homes, constants/frame-address sources, self copies and multiple cycles; emitted-transfer inspection and native results, not incidental register sequences | What deterministic planning-work bound holds for wide chains and multiple cycles? |
+| [#42](https://github.com/mkxto/kamy/issues/42) — read-only pin saves | Source-analysis finding; no size/frame reduction or timing measured; unfixed | Derive required saves from actual physical writes/effects in the shared frame/save/unwind model; avoid extra read-only-input saves while retaining real write saves | Read-only RBX/XMM6 inputs versus native/call/output writes and boundary loads; compare actual frame/prologue/body/epilogue, outputs and native unwind state | Which boundary operations really write each nonvolatile register? A native read loaded into a register is still a physical write. |
+| [#43](https://github.com/mkxto/kamy/issues/43) — duplicate global pin map | Source-analysis finding; allocation impact unmeasured; unfixed | One authoritative global boundary-pin representation; instruction-local mapping only where consumed; migrate all callers/tests/docs without aliases or shims | Reference/consumer audit before exported-shape changes; identity/MBA/native/call/phi behavior preservation, actual allocation evidence and native output/unwind inspection | Which consumers require instruction-local assignments rather than global pins, and what allocation is actually removed? |
 
 
 #### Confirmed finite CMOV/select counterexample
@@ -1061,6 +1061,266 @@ portable regression prerequisites. This finite supported witness MUST lower
 correctly in identity and requested supported MBA, not be rejected wholesale,
 special-cased or run at lower intensity. Truly unprovable selections may reject
 specifically and atomically.
+
+#### NOW pre-repair acceptance net — not an H2 repair
+
+The immediate work makes bad verdicts observable through the existing tools;
+it does not change frame proof, lifting, code generation or unwind. All seven
+findings above remain unfixed and H2 remains reopened. In particular, the
+confirmed #37 witness MUST be re-caught **through `kamy corpus verify`**, not
+only a standalone harness or an exit-code check. This intentionally failing
+external corpus case is not a deliberately red workspace test. No new timing
+measurements for #39–41 or accepted-producer proof for #38 are implied.
+
+Corpus source identity is distinct from the historical lock. The available
+checkout is `C:/dev/kamy-corpus`, with published source HEAD
+`df9431c03da55fe0432608740ba5d29c78951860` (four historical members).
+`corpus.lock` instead names `d9bc70d9970d3e1988203acd3415b103bcb62197`;
+fetching that revision failed with `not our ref`. Do not label this checkout a
+reproduction of the historical 23-member locked campaign, change those historical
+counts, or claim the lock was retrieved. Record local witness additions and the
+actual source/build/input/output identities separately. Immediately after clone,
+`members/dll_strutil/orig/dll_strutil.dll` appeared modified; the integration
+owner subsequently confirmed Windows Defender quarantine, not a source edit.
+`Get-MpThreatDetection` reported `ActionSuccess=true`, `ThreatID2147902117`
+and that exact file resource; its original directory is now empty. The user
+directed **skip it** because Defender cannot be disabled. No security setting
+was changed and no original restored. Report `dll_strutil` as unavailable /
+skipped, never PASS; a subset run cannot establish an all-green full published
+baseline. Do not rebuild, overwrite or re-bless this original. All existing
+goldens remain untouched. Available members may be exercised individually,
+with their exact population and this exclusion disclosed.
+
+The new `dll_frame_select` original implements the six-`u64` witness above,
+exported as `frame_select`, with `lower_exports: [frame_select]`. Its two loader
+calls exercise conditions 0 and 1 independently and MUST return arg5 and arg6
+respectively before blessing. No `expected_exit` override is needed: the loader
+requires exit 0 and both real return values. Keep the original and its golden
+distinct from protected output. Use `kamy corpus bless --corpus <checkout>
+--member dll_frame_select` to bless only that member; never re-bless existing
+members or bless the known-bad protected result. A missing/empty selection fails.
+
+Before blessing, the integration owner executed the original in a child through
+`kamy_run::run_traced` and recorded `target/pre-repair-now/original-native.txt`:
+
+| Condition | Observed original result | Independent expected result | Match |
+|---|---|---|---|
+| 0 | `0x1122334455667788` | arg5: `0x1122334455667788` | true |
+| 1 | `0x8877665544332211` | arg6: `0x8877665544332211` | true |
+
+The reported original run exited `Some(0)`, with `timed_out=false` and
+`fault=None`.
+
+This independently establishes both original return oracles, not a protected
+verdict or workspace-gate result. The user subsequently entered a Defender
+preference themselves; the integration owner's read-only query showed no
+matching visible exclusion, which does not prove the user's command failed.
+No agent changed security settings or restored the old DLL; `dll_strutil`
+remains skipped.
+
+
+The member's opt-in `lower_exports` selects named **host exports** for identity
+lowering, and every named target MUST actually lower. A missing, rejected or
+unlowered target fails the campaign; matching a name or receiving any aggregate
+coverage is not enough. Empty `lower_exports` preserves all-functions identity
+selection for existing members. The loader `exports` entries still carry the
+exact six argument tokens, including two calls to the same selected export.
+
+Run health is separate from equality: timeout or missing termination always
+fails. An actual traced fault fails unless the member explicitly declares its
+matching `expected_exit`. Such a fault may have no normal exit event; the
+validated traced terminal code populates the existing golden exit field, not
+a claim of normal exit. Normal nonzero exit remains valid without an exact
+expectation, and a declared `expected_exit` must match. Do not classify faults
+by guessed PE/NTSTATUS-shaped exit values. Generic differential verification
+has no expected-fault exception; the DLL loader protocol always requires exit 0
+and real result output, never equal empty failures.
+
+Use `corpus doctor --member dll_frame_select` to validate that original against
+its golden, then `corpus verify --member dll_frame_select --keep` to retain the
+exact protected binary plus the
+existing versioned debug-map CSV and link-report JSON. Inspect selected/eligible/
+lowered per-function outcomes and exact source-to-final mappings. For a runnable
+EXE replay, `bisect --stdin-file ... --timeout ... --expect-stdout ... --keep`
+must preserve the same stdin, timeout and output oracle in every probe and the
+final replay, retaining the actual final failing artifact rather than rebuilding
+a different one. DLL loader calls remain corpus oracles; do not pretend bare-DLL
+EXE bisection replays their protocol. Capture actual commands, hashes, IR and
+native output evidence. Observations below are initial integration evidence,
+not final gates or H2 acceptance. No commit or push is part of this work.
+
+##### Initial pre-repair integration observations — 2026-10-23
+
+After the independent native original checks above, selected blessing succeeded
+with **1 member / 1 blessed / 0 failed**, without re-blessing existing members.
+The integration owner then observed the required corpus detection:
+
+```sh
+kamy corpus verify --corpus C:/dev/kamy-corpus --member dll_frame_select --keep --write-baseline target/pre-repair-now/frame-select-initial.yml
+```
+
+The command exited **1**, with both return-value comparisons failing:
+
+| Condition | Golden return | Observed protected return |
+|---|---:|---:|
+| 0 | 1234605616436508552 | 593721617664 |
+| 1 | 9833440827789222417 | 0 |
+
+This re-catches confirmed #37 through **`kamy corpus verify`**, not just a local
+harness or process exit. Initial coverage was **1 selected / 2 eligible /
+1 SSA-lowered / 0 transformed / 0 relocated / 1 rejected**; the sole rejection
+was deselected `DllMain`. Required host export `frame_select` lowered from RVA
+`0x2000` to `0x4000`, with **136-byte frame / 24-byte original frame / 9 homes**.
+The exact kept binary is
+`C:/dev/kamy-corpus/protected/kamy-protected-dll_frame_select-9564.dll`, with
+`.debug-map.csv` and `.link-report.json` appended to its full path. Hashes
+reported for this initial execution are:
+
+| Artifact | SHA-256 |
+|---|---|
+| CLI | `e8b0a1a91e681096af9c046c363766c93303b618d6b7b9dee3997f1494819d95` |
+| Original DLL | `1e33abcfb8cbae9cd5b195985616154dc46c4a680e1ed6d0925d3c82805e4a60` |
+| Protected DLL | `8d641395f54772160c9d9f834408dbbcf0ab7e4d3635348332e51ade02e440bd` |
+
+The integration owner retained the immutable initial CLI snapshot under
+`target/pre-repair-now/tools-initial` and used it to dump the original DLL at
+RVA `0x2000` through `lift`, `ssa`, `optimize` and `regalloc`. All four commands
+exited **0**; evidence files are `target/pre-repair-now/initial-<stage>.txt`.
+The reported allocation dump contains `Select [v56, v49, v47]` followed by an
+addition of 56 and a load. Only the `FrameAddress` alternatives appear in the
+entry-offset map; the select has no derived offset. This is observed pre-repair
+IR evidence, not proof that frame provenance was repaired.
+
+The four historical `expected.yml` records were compared with source HEAD using
+`git diff --exit-code` and were unchanged. Initial runner-health CLI probes also
+observed an empty corpus exiting **1** (`contains no members`), equal UD2-fault
+children rejected by generic differential verification with exit **1** and
+execution mismatch (fault code **3221225501**), and a healthy identical
+`console_fibmix` differential comparison passing. These scoped checks do not
+establish a full published-corpus baseline or final gates.
+
+
+The first integration workspace gates passed **451 tests / 47 suites**. Later
+integration corrections to required-rejection coverage and replay/artifact
+tests were still underway at this observation; these are not final union gates.
+No protected correctness success, doctor success, historical full-corpus PASS,
+H2 repair or acceptance is implied. `dll_strutil` remains unavailable/skipped.
+
+##### Corrected integration observations — before runner-lifecycle repair
+
+After integration corrections, the owner observed format check, denied-warning
+clippy, build and workspace tests all succeeding: **454 tests / 47 suites**.
+These supersede the initial 451-test observation only for this pre-lifecycle
+snapshot; they are not final gates after the subsequent runner repair.
+Selected `corpus doctor` runs for `console_fibmix`, `gui_msgbox`, `kernel32` and
+`dll_frame_select` each exited **0**. The corresponding available-population
+corpus runs used `--keep` and wrote
+`target/pre-repair-now/final-<member>.yml`, with logs
+`target/pre-repair-now/final-verify-<member>.txt`:
+
+| Available member | Observed command exit / protected verdict | SSA lowered / rejected |
+|---|---|---|
+| `console_fibmix` | 0 / PASS | 36 / 313 |
+| `gui_msgbox` | 0 / PASS | 139 / 383 |
+| `kernel32` | 0 / PASS | 760 / 949 |
+| `dll_frame_select` | 1 / FAIL — required known wrong-return witness | 1 selected / 1 lowered / 0 transformed |
+
+Selected doctor logs are `target/pre-repair-now/final-doctor-<member>.txt`;
+all four selected originals passed with command exit **0**. The new witness's
+independently blessed golden requires condition 0 to return
+**1234605616436508552**, but the protected observation was **38381022928**;
+condition 1 requires **9833440827789222417**, but observed **0**. The exact
+retained DLL is
+`C:/dev/kamy-corpus/protected/kamy-protected-dll_frame_select-22076.dll`,
+with its retained sidecars. Required-lowering failures also preserve actual
+coverage and diagnostics; a failed requirement is not reported as zero coverage.
+
+`dll_strutil` remains quarantined and skipped, not PASS. These are four
+individually selected available members, not the historical 23-member campaign
+or a healthy full published baseline. Final health probes again rejected the
+empty corpus and equal actual UD2-fault children with command exit **1**; an
+identical healthy `console_fibmix` original comparison passed despite its normal
+nonzero golden exit **7**. The integration owner also checked that production
+`core`, `lift`, `codegen`, `seh` and `link` had no diff.
+
+The real stdin/output-aware EXE `bisect` smoke did **not** complete. It used a
+temporary EXE form of the same witness with `--expect-exit 0`,
+`--expect-stdout <expected-output>`, `--stdin-file <input>`, `--timeout 10` and
+`--keep`; removing `probe-1.exe` after the traced baseline run failed with access
+denied. Runner/debugger handle and evidence ownership require lifecycle repair,
+not ignored cleanup errors or blind retries. No successful actual CLI replay is
+established by this snapshot. Do not treat unit-test/gate success as completed
+CLI replay evidence or claim the NOW deliverable complete. H2 remains reopened;
+no #37–43 repair is claimed.
+
+The subsequent runner/triage lifecycle implementation now acknowledges debug
+exit events and waits for process termination; preserves the first second-chance
+fault while continuing it unhandled; and checks timeout job termination, drains
+debug events and reaps processes under a separate 10-second cleanup bound.
+Its regression uses copied test executables and immediately removes each image
+after context, fault and timeout runs. No H2 backend change is included.
+
+##### Final NOW acceptance-net evidence — lifecycle repaired, H2 still reopened
+
+After removal of incidental elapsed-time assertions, the integration owner ran
+format check, denied-warning clippy, workspace all-target build and tests:
+**all PASS, 455 tests / 47 suites**. The initial 451 and intermediate 454 totals
+above are historical integration snapshots. The latest exercised root CLI is
+`target/debug/kamy.exe` (snapshot `target/pre-repair-now/tools-current`), SHA-256
+`aa724a6156a8416a326f9acb9bcdfa0ff20b4d2fcad8e6693e8a1ca55772f52c`;
+loader SHA-256
+`ac1d95e966582b76ad824a64e72d11f7bf0e924ca6c6aa5a0a6e5ba30404c334`.
+The final identities/results are in `target/pre-repair-now/receipt.json`.
+The earlier `tools-final` / `718e402d…` run is a historical successful smoke.
+
+Actual CLI bisect now succeeded with command exit **0**, **43 candidates**,
+**13 steps**, culprit **0x19000**. Full command/output is retained in
+`target/pre-repair-now/current-bisect.txt`:
+
+```powershell
+target/debug/kamy.exe bisect target/pre-repair-now/bisect_probe.exe --expect-exit 0 --expect-stdout target/pre-repair-now/bisect-expected.txt --stdin-file target/pre-repair-now/bisect-stdin.txt --timeout 10 --keep
+```
+
+The exact replay is
+`C:/Users/a930276/AppData/Local/Temp/kamy-triage-19684-0/replay.exe`, SHA-256
+`2df432c273ec5666bbd328ab2b00d54e8f8b4a8331e9c44bbbaa90e6ae52aee7`.
+An evidence copy is `target/pre-repair-now/bisect-replay.exe`; input EXE SHA-256
+is `5044514c51696dfcabebfa0ea06c4a4b5aa8c826c204eed1ac5ee6a601989fcf`.
+The earlier successful smoke's `accepted-bisect-regalloc.txt` confirms the same `Select` / add 56 / load
+witness, generated frame **136 bytes**, original reservation **24 bytes**.
+The prior access-denied cleanup failure is resolved by lifecycle ownership, not
+suppression or a blind retry. Probe sources were throwaway; immutable tools,
+input/output, maps and logs are retained.
+
+Post-lifecycle selected doctors for all four available members again **PASS**;
+the three available historical members again **PASS** protected verification.
+The new `dll_frame_select` again correctly **FAILS** the acceptance oracle:
+condition 0 expected **1234605616436508552**, observed **500008219856**;
+condition 1 expected **9833440827789222417**, observed **0**. The current exact
+artifact is `C:/dev/kamy-corpus/protected/kamy-protected-dll_frame_select-21892.dll`
+plus sidecars, SHA-256
+`8d641395f54772160c9d9f834408dbbcf0ab7e4d3635348332e51ade02e440bd`.
+Current logs and baselines use `target/pre-repair-now/current-` prefixes.
+Earlier `accepted-` logs record the historical `-17760.dll` run with condition
+0 observing **320099839520**. Wrong values differ despite identical DLL bytes;
+none is an oracle. Preserve the independently correct original/golden. All
+four historical goldens remain unchanged against published HEAD; production
+`core`, `lift`, `codegen`, `seh` and `link` remain unchanged against source HEAD.
+
+Temporary real health controls observed: declared UD2 fault
+`expected_exit: -1073741795` blessed and doctored with exit **0**; the same
+undeclared fault failed blessing with exit **1** and no golden; generic equal-
+fault verification and empty-corpus verification each exited **1**. Healthy
+console comparison passed with normal exit **7**. These controls are not corpus
+baseline members. Quarantined `dll_strutil` remains user-skipped, not PASS;
+there is no full historical four- or 23-member baseline claim.
+
+The **NOW evidence net is complete**, including actual same-oracle EXE replay,
+required failing corpus witness and run-health checks. This is not protected
+correctness acceptance: **H2 remains reopened; all seven #37–43 findings remain
+unfixed**.
+
+
 
 #### Mandatory reacceptance evidence ledger
 
