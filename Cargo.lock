@@ -299,6 +299,9 @@ dependencies = [
 [[package]]
 name = "kamy-core"
 version = "0.0.0"
+dependencies = [
+ "petgraph",
+]
 
 [[package]]
 name = "kamy-corpus"

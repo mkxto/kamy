@@ -11,6 +11,8 @@ pub(super) struct LoopBounds {
     pub scalars: HashMap<ValueId, ScalarBounds>,
     pub pointers: HashMap<ValueId, FramePointerBounds>,
     pub advances: HashMap<ValueId, (ValueId, i64)>,
+    #[cfg(test)]
+    work: LoopWork,
 }
 
 #[derive(Clone, Copy)]
@@ -124,75 +126,191 @@ fn equality_exit(
     None
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct DominatorWork {
+    graph_nodes: usize,
+    graph_edges: usize,
+    immediate_dominator_entries: usize,
+    tree_nodes: usize,
+    tree_edges: usize,
+    owned_allocated_entries: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct LoopWork {
+    candidate_blocks: usize,
+    dominators: DominatorWork,
+}
+
+fn successors(block: &crate::ir::IrBlock) -> impl Iterator<Item = BlockId> {
+    match block.term {
+        IrTerminator::Jump(target) => [Some(target), None],
+        IrTerminator::Branch {
+            taken, not_taken, ..
+        } => [Some(taken), Some(not_taken)],
+        _ => [None, None],
+    }
+    .into_iter()
+    .flatten()
+}
+
+const NO_NODE: usize = usize::MAX;
+
+struct LoopDominators {
+    numbers: HashMap<BlockId, petgraph::graph::NodeIndex>,
+    intervals: Vec<(usize, usize)>,
+    #[cfg(test)]
+    work: DominatorWork,
+}
+
+impl LoopDominators {
+    /// Petgraph's Cooper algorithm keeps O(V + E) storage, rather than a full
+    /// dominator set/bitset per block. Its documented worst-case time is O(V²).
+    /// Tree construction is O(V); Euler intervals make queries constant-time.
+    fn new(
+        entry: BlockId,
+        blocks: &HashMap<BlockId, &crate::ir::IrBlock>,
+        predecessors: &HashMap<BlockId, Vec<BlockId>>,
+        reachable: &HashSet<BlockId>,
+    ) -> Self {
+        let edges = predecessors.values().map(Vec::len).sum();
+        let mut graph = petgraph::graph::DiGraph::<(), ()>::with_capacity(reachable.len(), edges);
+        let mut numbers = HashMap::with_capacity(reachable.len());
+        for &block in blocks.keys().filter(|block| reachable.contains(*block)) {
+            numbers.insert(block, graph.add_node(()));
+        }
+        for (target, parents) in predecessors {
+            let Some(&target) = numbers.get(target) else {
+                continue;
+            };
+            for parent in parents {
+                if let Some(&parent) = numbers.get(parent) {
+                    graph.add_edge(parent, target, ());
+                }
+            }
+        }
+        let root = numbers[&entry];
+        let dominators = petgraph::algo::dominators::simple_fast(&graph, root);
+        let mut first_child = vec![NO_NODE; graph.node_count()];
+        let mut next_sibling = vec![NO_NODE; graph.node_count()];
+        #[cfg(test)]
+        let mut work = DominatorWork {
+            graph_nodes: graph.node_count(),
+            graph_edges: graph.edge_count(),
+            ..DominatorWork::default()
+        };
+        for node in graph.node_indices() {
+            if let Some(parent) = dominators.immediate_dominator(node) {
+                next_sibling[node.index()] = first_child[parent.index()];
+                first_child[parent.index()] = node.index();
+                #[cfg(test)]
+                {
+                    work.immediate_dominator_entries += 1;
+                }
+            }
+        }
+        let mut intervals = vec![(0, 0); graph.node_count()];
+        let mut tick = 1;
+        let mut pending = vec![root.index()];
+        #[cfg(test)]
+        {
+            work.tree_nodes = 1;
+        }
+        while let Some(&node) = pending.last() {
+            let child = first_child[node];
+            if child == NO_NODE {
+                intervals[node].1 = tick;
+                pending.pop();
+            } else {
+                first_child[node] = next_sibling[child];
+                intervals[child].0 = tick;
+                tick += 1;
+                pending.push(child);
+                #[cfg(test)]
+                {
+                    work.tree_nodes += 1;
+                    work.tree_edges += 1;
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            let (node_capacity, edge_capacity) = graph.capacity();
+            // Actual capacities owned by this wrapper, not a fabricated count
+            // of petgraph's private temporary allocations or fixed-point work.
+            work.owned_allocated_entries = numbers.capacity()
+                + node_capacity
+                + edge_capacity
+                + first_child.capacity()
+                + next_sibling.capacity()
+                + intervals.capacity()
+                + pending.capacity();
+        }
+        Self {
+            numbers,
+            intervals,
+            #[cfg(test)]
+            work,
+        }
+    }
+
+    fn dominates(&self, dominator: BlockId, block: BlockId) -> bool {
+        let (Some(&dominator), Some(&block)) =
+            (self.numbers.get(&dominator), self.numbers.get(&block))
+        else {
+            return false;
+        };
+        let (start, end) = self.intervals[dominator.index()];
+        start <= self.intervals[block.index()].0 && self.intervals[block.index()].0 < end
+    }
+}
+
 pub(super) fn loops(
     func: &IrFunction,
     facts: &HashMap<ValueId, Fact>,
     definitions: &HashMap<ValueId, Definition<'_>>,
     reachable: &HashSet<BlockId>,
 ) -> Result<LoopBounds, RejectionReason> {
+    let mut result = LoopBounds::default();
+    let mut candidates = HashSet::new();
+    for block in &func.blocks {
+        #[cfg(test)]
+        {
+            result.work.candidate_blocks += 1;
+        }
+        if reachable.contains(&block.id) && block.phis.iter().any(|phi| phi.args.len() >= 2) {
+            candidates.insert(block.id);
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(result);
+    }
     let blocks: HashMap<_, _> = func.blocks.iter().map(|block| (block.id, block)).collect();
     let mut predecessors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
     for block in &func.blocks {
         if !reachable.contains(&block.id) {
             continue;
         }
-        let successors = match block.term {
-            IrTerminator::Jump(target) => [Some(target), None],
-            IrTerminator::Branch {
-                taken, not_taken, ..
-            } => [Some(taken), Some(not_taken)],
-            _ => [None, None],
-        };
-        for successor in successors.into_iter().flatten() {
-            predecessors.entry(successor).or_default().push(block.id);
+        for successor in successors(block) {
+            if reachable.contains(&successor) {
+                predecessors.entry(successor).or_default().push(block.id);
+            }
         }
     }
-    let mut dominators: HashMap<_, _> = reachable
-        .iter()
-        .map(|&block| {
-            (
-                block,
-                if block == func.entry {
-                    HashSet::from([block])
-                } else {
-                    reachable.clone()
-                },
-            )
-        })
-        .collect();
-    loop {
-        let mut changed = false;
-        for block in &func.blocks {
-            if block.id == func.entry || !reachable.contains(&block.id) {
-                continue;
-            }
-            let mut parents = predecessors[&block.id].iter();
-            let Some(first) = parents.next() else {
-                continue;
-            };
-            let mut common = dominators[first].clone();
-            for parent in parents {
-                common.retain(|block| dominators[parent].contains(block));
-            }
-            common.insert(block.id);
-            if common != dominators[&block.id] {
-                dominators.insert(block.id, common);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    let dominators = LoopDominators::new(func.entry, &blocks, &predecessors, reachable);
     let mut backedges: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
     for (&target, parents) in &predecessors {
+        if !candidates.contains(&target) {
+            continue;
+        }
         for &parent in parents {
-            if dominators[&parent].contains(&target) {
+            if dominators.dominates(target, parent) {
                 backedges.entry(target).or_default().push(parent);
             }
         }
     }
-    let mut result = LoopBounds::default();
     for (header, latches) in backedges {
         let [latch] = latches.as_slice() else {
             continue;
@@ -224,7 +342,7 @@ pub(super) fn loops(
         if members.contains(&exit)
             || members
                 .iter()
-                .any(|block| !dominators[block].contains(&header))
+                .any(|block| !dominators.dominates(header, *block))
         {
             continue;
         }
@@ -334,6 +452,10 @@ pub(super) fn loops(
                 _ => {}
             }
         }
+    }
+    #[cfg(test)]
+    {
+        result.work.dominators = dominators.work;
     }
     Ok(result)
 }
