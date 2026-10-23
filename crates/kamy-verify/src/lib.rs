@@ -5,7 +5,7 @@ use anyhow::{Context as _, Result};
 use std::path::Path;
 use std::time::Duration;
 
-use kamy_run::{RunOptions, run};
+use kamy_run::{RunOptions, RunOutcome, run_traced};
 
 /// Wall-clock cap applied to every corpus/differential launch so a hung or
 /// crashed target is killed instead of stalling the harness.
@@ -18,10 +18,11 @@ pub struct DiffReport {
 }
 
 impl DiffReport {
-    /// PASS iff no observable differences were recorded.
+    /// PASS iff at least one input was exercised and every observation was valid
+    /// and equal.
     #[must_use]
     pub fn passed(&self) -> bool {
-        self.mismatches.is_empty()
+        self.runs > 0 && self.mismatches.is_empty()
     }
 }
 
@@ -53,18 +54,51 @@ impl SplitMix64 {
     }
 }
 
-/// Spawn `binary`, feed `input` on stdin, wait, and capture observable output.
-/// Returns `(exit_code, stdout, stderr)`; `exit` is `None` on signal. Routed
-/// through [`kamy_run::run`] for hang-kill and WER-popup suppression.
-pub fn run_capture(binary: &Path, input: &[u8]) -> Result<(Option<i32>, Vec<u8>, Vec<u8>)> {
+/// Spawn `binary`, feed `input` on stdin, and retain execution health as well as
+/// output. Tracing distinguishes unhandled faults from ordinary nonzero exits.
+pub fn run_capture(binary: &Path, input: &[u8]) -> Result<RunOutcome> {
     let opts = RunOptions {
         exe: binary.to_path_buf(),
         stdin: input.to_vec(),
         timeout: RUN_TIMEOUT,
         ..RunOptions::default()
     };
-    let outcome = run(&opts).with_context(|| format!("running {}", binary.display()))?;
-    Ok((outcome.exit_code, outcome.stdout, outcome.stderr))
+    run_traced(&opts).with_context(|| format!("running {}", binary.display()))
+}
+
+/// Reject incomplete execution and unexpected unhandled faults. Ordinary
+/// nonzero exits are valid unless an exact `expected_exit` was declared.
+/// An observed fault is a terminal event even if the runner stopped before
+/// collecting an exit code; only an explicit matching expectation accepts it.
+/// Returns the observed exit or declared fault code without changing `outcome`.
+pub fn validate_outcome(outcome: &RunOutcome, expected_exit: Option<i32>) -> Result<i32> {
+    anyhow::ensure!(!outcome.timed_out, "execution timed out");
+    if let Some(fault) = outcome.fault {
+        let code = fault.code as i32;
+        anyhow::ensure!(
+            expected_exit == Some(code),
+            "unexpected unhandled fault {} at {:#x}",
+            fault.code,
+            fault.address
+        );
+        if let Some(exit) = outcome.exit_code {
+            anyhow::ensure!(
+                exit == code,
+                "fault termination {code} disagrees with exit {exit}"
+            );
+        }
+        return Ok(code);
+    }
+    let exit = outcome
+        .exit_code
+        .context("execution has no termination result")?;
+    if let Some(expected) = expected_exit {
+        anyhow::ensure!(
+            exit == expected,
+            "exit expected {expected}, observed {exit}"
+        );
+    }
+    Ok(exit)
 }
 
 /// Deterministic stdin payload for run index `run` under `seed`. Run 0 is empty;
@@ -83,7 +117,7 @@ pub fn seeded_input(seed: u64, run: u32) -> Vec<u8> {
 }
 
 fn show_code(code: Option<i32>) -> String {
-    code.map_or_else(|| "<signal>".to_string(), |c| c.to_string())
+    code.map_or_else(|| "<no exit code>".to_string(), |c| c.to_string())
 }
 
 /// Lossy, bounded preview of a byte stream for mismatch reporting.
@@ -98,9 +132,9 @@ fn preview(bytes: &[u8]) -> String {
 }
 
 /// Run `original` and `protected` against identical inputs and diff their
-/// observable behavior (exit code + stdout). Run 0 uses empty stdin; later
-/// runs feed a deterministic seeded random payload so input-consuming binaries
-/// are exercised. PASS = empty [`DiffReport::mismatches`].
+/// observable behavior (exit code, stdout, stderr). Run 0 uses empty stdin;
+/// later runs feed a deterministic seeded random payload. PASS requires valid
+/// execution on both sides and no differences on every input.
 pub fn differential(
     original: &Path,
     protected: &Path,
@@ -114,35 +148,16 @@ pub fn differential(
     for run_idx in 0..runs {
         let input = seeded_input(seed, run_idx);
 
-        let (a_exit, a_out, a_err) = run_capture(original, &input)
+        let original_outcome = run_capture(original, &input)
             .with_context(|| format!("running {}", original.display()))?;
-        let (b_exit, b_out, b_err) = run_capture(protected, &input)
+        let protected_outcome = run_capture(protected, &input)
             .with_context(|| format!("running {}", protected.display()))?;
-
-        if a_exit != b_exit {
-            mismatches.push(Mismatch {
-                run: run_idx,
-                field: "exit".to_string(),
-                original: show_code(a_exit),
-                protected: show_code(b_exit),
-            });
-        }
-        if a_out != b_out {
-            mismatches.push(Mismatch {
-                run: run_idx,
-                field: "stdout".to_string(),
-                original: preview(&a_out),
-                protected: preview(&b_out),
-            });
-        }
-        if a_err != b_err {
-            mismatches.push(Mismatch {
-                run: run_idx,
-                field: "stderr".to_string(),
-                original: preview(&a_err),
-                protected: preview(&b_err),
-            });
-        }
+        compare_outcomes(
+            run_idx,
+            &original_outcome,
+            &protected_outcome,
+            &mut mismatches,
+        );
     }
 
     let report = DiffReport { runs, mismatches };
@@ -163,47 +178,166 @@ pub fn differential(
     Ok(report)
 }
 
+fn compare_outcomes(
+    run: u32,
+    original: &RunOutcome,
+    protected: &RunOutcome,
+    mismatches: &mut Vec<Mismatch>,
+) {
+    let original_health = validate_outcome(original, None);
+    let protected_health = validate_outcome(protected, None);
+    if original_health.is_err() || protected_health.is_err() {
+        mismatches.push(Mismatch {
+            run,
+            field: "execution".to_string(),
+            original: original_health.map_or_else(|e| e.to_string(), |_| "valid".to_string()),
+            protected: protected_health.map_or_else(|e| e.to_string(), |_| "valid".to_string()),
+        });
+    }
+    if original.exit_code != protected.exit_code {
+        mismatches.push(Mismatch {
+            run,
+            field: "exit".to_string(),
+            original: show_code(original.exit_code),
+            protected: show_code(protected.exit_code),
+        });
+    }
+    for (field, a, b) in [
+        ("stdout", &original.stdout, &protected.stdout),
+        ("stderr", &original.stderr, &protected.stderr),
+    ] {
+        if a != b {
+            mismatches.push(Mismatch {
+                run,
+                field: field.to_string(),
+                original: preview(a),
+                protected: preview(b),
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Avoid spawning the test harness itself (would recurse); exercise the
-    // dependency-free pieces instead and leave live-PE diffing to orchestrator
-    // smoke, per AGENTS.md cross-platform rule.
+    fn normal_exit(exit: i32) -> RunOutcome {
+        RunOutcome {
+            exit_code: Some(exit),
+            stdout: b"answer\n".to_vec(),
+            ..RunOutcome::default()
+        }
+    }
 
-    #[test]
-    fn splitmix_is_deterministic() {
-        let mut a = SplitMix64(0xDEAD_BEEF);
-        let mut b = SplitMix64(0xDEAD_BEEF);
-        let mut c = SplitMix64(0xDEAD_BEF0);
-        assert_eq!(a.next_u64(), b.next_u64());
-        assert_ne!(SplitMix64(0xDEAD_BEEF).next_u64(), c.next_u64());
+    fn faulted() -> RunOutcome {
+        RunOutcome {
+            fault: Some(kamy_run::Fault {
+                code: 0xE000_1234,
+                address: 0x1000,
+                image_base: 0x1000,
+                rva: 0,
+            }),
+            ..RunOutcome::default()
+        }
     }
 
     #[test]
-    fn fill_covers_partial_tail() {
-        let mut rng = SplitMix64(1);
-        let mut buf = [0u8; 13];
-        rng.fill(&mut buf);
-        assert!(buf.iter().any(|&b| b != 0));
+    fn normal_nonzero_exit_is_not_a_fault() {
+        for exit in [0, 17, -17, 0xE000_1234_u32 as i32] {
+            assert_eq!(validate_outcome(&normal_exit(exit), None).unwrap(), exit);
+            assert_eq!(
+                validate_outcome(&normal_exit(exit), Some(exit)).unwrap(),
+                exit
+            );
+            assert!(validate_outcome(&normal_exit(exit), Some(exit.wrapping_add(1))).is_err());
+        }
     }
 
     #[test]
-    fn empty_report_passes() {
-        let report = DiffReport {
-            runs: 4,
-            mismatches: Vec::new(),
-        };
-        assert!(report.passed());
-        let report = DiffReport {
-            runs: 1,
-            mismatches: vec![Mismatch {
-                run: 0,
-                field: "exit".to_string(),
-                original: "0".to_string(),
-                protected: "1".to_string(),
-            }],
-        };
-        assert!(!report.passed());
+    fn fault_requires_explicit_matching_expectation() {
+        let mut outcome = faulted();
+        let code = outcome.fault.unwrap().code as i32;
+        assert!(validate_outcome(&outcome, None).is_err());
+        assert!(validate_outcome(&outcome, Some(0)).is_err());
+        assert_eq!(validate_outcome(&outcome, Some(code)).unwrap(), code);
+        assert_eq!(outcome.exit_code, None);
+        outcome.exit_code = Some(code);
+        assert_eq!(validate_outcome(&outcome, Some(code)).unwrap(), code);
+        outcome.exit_code = Some(0);
+        assert!(validate_outcome(&outcome, Some(code)).is_err());
+    }
+
+    #[test]
+    fn timeout_and_missing_termination_are_never_valid() {
+        let mut outcome = normal_exit(0);
+        outcome.timed_out = true;
+        assert!(validate_outcome(&outcome, None).is_err());
+        assert!(validate_outcome(&outcome, Some(0)).is_err());
+        assert!(validate_outcome(&RunOutcome::default(), None).is_err());
+        let mut outcome = faulted();
+        outcome.timed_out = true;
+        assert!(validate_outcome(&outcome, Some(0xE000_1234_u32 as i32)).is_err());
+    }
+
+    #[test]
+    fn equal_invalid_children_cannot_pass_differential() {
+        let mut timed_out = normal_exit(0);
+        timed_out.timed_out = true;
+        for outcome in [timed_out, faulted(), RunOutcome::default()] {
+            let mut mismatches = Vec::new();
+            compare_outcomes(0, &outcome, &outcome, &mut mismatches);
+            assert!(mismatches.iter().any(|m| m.field == "execution"));
+            assert!(
+                !DiffReport {
+                    runs: 1,
+                    mismatches,
+                }
+                .passed()
+            );
+            let valid = normal_exit(0);
+            for (a, b) in [(&outcome, &valid), (&valid, &outcome)] {
+                let mut mismatches = Vec::new();
+                compare_outcomes(0, a, b, &mut mismatches);
+                assert!(mismatches.iter().any(|m| m.field == "execution"));
+            }
+        }
+    }
+
+    #[test]
+    fn differential_accepts_equal_nonzero_and_detects_wrong_values() {
+        let original = normal_exit(17);
+        let mut protected = normal_exit(17);
+        let mut mismatches = Vec::new();
+        compare_outcomes(0, &original, &protected, &mut mismatches);
+        assert!(
+            DiffReport {
+                runs: 1,
+                mismatches,
+            }
+            .passed()
+        );
+        protected.stdout = b"wrong\n".to_vec();
+        protected.stderr = b"diagnostic\n".to_vec();
+        protected.exit_code = Some(18);
+        let mut mismatches = Vec::new();
+        compare_outcomes(0, &original, &protected, &mut mismatches);
+        assert_eq!(
+            mismatches
+                .iter()
+                .map(|m| m.field.as_str())
+                .collect::<Vec<_>>(),
+            ["exit", "stdout", "stderr"]
+        );
+    }
+
+    #[test]
+    fn no_vectors_is_not_a_passing_report() {
+        assert!(
+            !DiffReport {
+                runs: 0,
+                mismatches: Vec::new(),
+            }
+            .passed()
+        );
     }
 }

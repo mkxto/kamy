@@ -312,7 +312,7 @@ fn log_report(report: &kamy_link::Report) {
     }
 }
 
-fn write_debug_map(path: &Path, report: &kamy_link::Report) -> anyhow::Result<()> {
+pub(super) fn write_debug_map(path: &Path, report: &kamy_link::Report) -> anyhow::Result<()> {
     let file = std::fs::File::create(path)
         .with_context(|| format!("creating debug map {}", path.display()))?;
     let mut writer = BufWriter::new(file);
@@ -323,7 +323,7 @@ fn write_debug_map(path: &Path, report: &kamy_link::Report) -> anyhow::Result<()
         .with_context(|| format!("writing debug map {}", path.display()))
 }
 
-fn write_link_report(path: &Path, report: &kamy_link::Report) -> anyhow::Result<()> {
+pub(super) fn write_link_report(path: &Path, report: &kamy_link::Report) -> anyhow::Result<()> {
     let file = std::fs::File::create(path)
         .with_context(|| format!("creating link report {}", path.display()))?;
     let mut writer = BufWriter::new(file);

@@ -53,6 +53,12 @@ pub struct Member {
     pub profile: String,
     #[serde(default)]
     pub exports: Vec<Export>,
+    /// Named host exports which must be identity-lowered; empty selects all functions.
+    #[serde(default)]
+    pub lower_exports: Vec<String>,
+    /// Optional exact process exit required by the original and protected oracle.
+    #[serde(default)]
+    pub expected_exit: Option<i32>,
 }
 
 fn default_vectors() -> u32 {

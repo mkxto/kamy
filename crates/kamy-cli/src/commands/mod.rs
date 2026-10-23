@@ -123,6 +123,9 @@ pub(crate) fn print_coverage(cov: &kamy_corpus::CorpusCoverage) {
     };
     for m in &cov.members {
         row(&m.name, if m.passed { "PASS" } else { "FAIL" }, &m.coverage);
+        for diagnostic in &m.diagnostics {
+            println!("          {}: {diagnostic}", m.name);
+        }
     }
     row("TOTAL", "", &cov.total);
     println!("not covered = relocated + rejected; verbatim relocation is not SSA coverage.");

@@ -154,6 +154,9 @@ enum CorpusCmd {
     Bless {
         #[arg(long)]
         corpus: Option<PathBuf>,
+        /// Bless only this named member, preserving all other goldens.
+        #[arg(long)]
+        member: Option<String>,
     },
     /// Protect each member and diff against its golden record.
     Verify {
@@ -181,6 +184,9 @@ enum CorpusCmd {
     Doctor {
         #[arg(long)]
         corpus: Option<PathBuf>,
+        /// Check only the named member.
+        #[arg(long)]
+        member: Option<String>,
     },
 }
 
