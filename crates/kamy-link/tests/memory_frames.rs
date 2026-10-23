@@ -1212,6 +1212,208 @@ fn unwind_allocation_scalar_matching_code_address_is_not_a_pointer() {
     assert_eq!(report.rejected[0].1.tag(), "SymbolizationUncertain");
 }
 
+#[test]
+fn mixed_memory_phi_cycles_transfer_flags_widths_constants_and_frame_addresses() {
+    use kamy_core::ir::{
+        BlockId, Inst, IrBlock, IrFunction, IrOp, IrTerminator, IrType, Phi, ValueId,
+    };
+    fn value(
+        func: &mut IrFunction,
+        block: usize,
+        op: IrOp,
+        args: &[ValueId],
+        ty: IrType,
+    ) -> ValueId {
+        let dest = func.alloc_value();
+        func.blocks[block].insts.push(Inst {
+            dest: Some(dest),
+            op,
+            args: args.to_vec(),
+            ty,
+        });
+        dest
+    }
+    fn store(func: &mut IrFunction, block: usize, address: ValueId, source: ValueId, ty: IrType) {
+        func.blocks[block].insts.push(Inst {
+            dest: None,
+            op: IrOp::Store,
+            args: vec![address, source],
+            ty,
+        });
+    }
+    for reverse in [false, true] {
+        let mut func = IrFunction {
+            entry: BlockId(0),
+            next_value: 0,
+            blocks: (0..4)
+                .map(|id| IrBlock {
+                    id: BlockId(id),
+                    phis: vec![],
+                    insts: vec![],
+                    term: IrTerminator::Ret,
+                })
+                .collect(),
+        };
+        let input = value(&mut func, 0, IrOp::Undef, &[], IrType::I64);
+        let rounds = value(&mut func, 0, IrOp::Undef, &[], IrType::I64);
+        let output = value(&mut func, 0, IrOp::Undef, &[], IrType::I64);
+        let zero = value(&mut func, 0, IrOp::Const(0), &[], IrType::I64);
+        let one = value(&mut func, 0, IrOp::Const(1), &[], IrType::I64);
+        let mut lanes = Vec::new();
+        let mut seeds = Vec::new();
+        let mut types = Vec::new();
+        for ty in [
+            IrType::I8,
+            IrType::I16,
+            IrType::I32,
+            IrType::I64,
+            IrType::I128,
+        ] {
+            for lane in 0..3 {
+                let offset = value(
+                    &mut func,
+                    0,
+                    IrOp::Const(seeds.len() as u64 * 16),
+                    &[],
+                    IrType::I64,
+                );
+                let address = value(&mut func, 0, IrOp::Add, &[input, offset], IrType::I64);
+                let loaded = value(&mut func, 0, IrOp::Load, &[address], ty);
+                let initial = if ty == IrType::I8 {
+                    value(&mut func, 0, IrOp::IsZero, &[loaded], IrType::I8)
+                } else {
+                    loaded
+                };
+                seeds.push(if ty == IrType::I8 {
+                    if lane == 1 { 0x21 } else { 0 }
+                } else {
+                    0xfedc_ba98_7654_3210_0123_4567_89ab_cdefu128
+                        ^ (lane as u128 * 0x0102_0304_0506_0708)
+                });
+                lanes.push((func.alloc_value(), initial));
+                types.push(ty);
+            }
+        }
+        // Rematerialized literal sources exercise the same initial edge as memory and flags.
+        for seed in [17u64, 23, 31] {
+            let initial = value(&mut func, 0, IrOp::Const(seed), &[], IrType::I64);
+            lanes.push((func.alloc_value(), initial));
+            types.push(IrType::I64);
+        }
+        // Frame-address sources initialize a distinct three-cycle; consumers load the objects.
+        for (delta, seed) in [(-8, 41), (-16, 43), (-24, 47)] {
+            let pointer = value(&mut func, 0, IrOp::FrameAddress(delta), &[], IrType::I64);
+            let initial = value(&mut func, 0, IrOp::Const(seed), &[], IrType::I64);
+            store(&mut func, 0, pointer, initial, IrType::I64);
+            lanes.push((func.alloc_value(), pointer));
+            types.push(IrType::I64);
+        }
+        let counter = func.alloc_value();
+        let next = value(&mut func, 2, IrOp::Add, &[counter, one], IrType::I64);
+        func.blocks[1].phis.push(Phi {
+            dest: counter,
+            ty: IrType::I64,
+            args: vec![(BlockId(0), zero), (BlockId(2), next)],
+        });
+        for (index, &(dest, initial)) in lanes.iter().enumerate() {
+            let source = lanes[index / 3 * 3 + (index % 3 + 1) % 3].0;
+            func.blocks[1].phis.push(Phi {
+                dest,
+                ty: types[index],
+                args: vec![(BlockId(0), initial), (BlockId(2), source)],
+            });
+        }
+        if reverse {
+            func.blocks[1].phis.reverse();
+        }
+        let condition = value(
+            &mut func,
+            1,
+            IrOp::BorrowSub,
+            &[counter, rounds],
+            IrType::I8,
+        );
+        func.blocks[0].term = IrTerminator::Jump(BlockId(1));
+        func.blocks[1].term = IrTerminator::Branch {
+            cond: condition,
+            taken: BlockId(2),
+            not_taken: BlockId(3),
+        };
+        func.blocks[2].term = IrTerminator::Jump(BlockId(1));
+        for (index, &(lane, _)) in lanes.iter().enumerate() {
+            let offset = value(
+                &mut func,
+                3,
+                IrOp::Const(index as u64 * 16),
+                &[],
+                IrType::I64,
+            );
+            let address = value(&mut func, 3, IrOp::Add, &[output, offset], IrType::I64);
+            let transferred = if index >= 18 {
+                value(&mut func, 3, IrOp::Load, &[lane], IrType::I64)
+            } else {
+                lane
+            };
+            store(&mut func, 3, address, transferred, types[index]);
+        }
+        let returned = value(&mut func, 3, IrOp::Copy, &[counter], IrType::I64);
+        func.blocks[3].insts.push(Inst {
+            dest: None,
+            op: IrOp::Use,
+            args: vec![returned],
+            ty: IrType::I64,
+        });
+        let pins = HashMap::from([
+            (input, PhysReg::Gpr(Gpr::Rcx)),
+            (rounds, PhysReg::Gpr(Gpr::Rdx)),
+            (output, PhysReg::Gpr(Gpr::R8)),
+            (returned, PhysReg::Gpr(Gpr::Rax)),
+        ]);
+        let alloc = kamy_codegen::allocate_registers(&func, &Default::default(), &pins).unwrap();
+        let selected = kamy_codegen::select_instructions(&func, &alloc);
+        let code = kamy_codegen::relocate(&selected.instructions, BASE + u64::from(ENTRY)).unwrap();
+        let image = fixture(&[(ENTRY, code)]);
+        if let Some(directory) = std::env::var_os("KAMY_MEMORY_FRAME_WITNESS_DIR") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join(format!("phi-mixed-reverse-{reverse}.exe")),
+                &image,
+            )
+            .unwrap();
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            let mapped = native::MappedImage::new(&image);
+            let run: unsafe extern "system" fn(*const u128, u64, *mut u128) -> u64 =
+                unsafe { core::mem::transmute(mapped.at(Rva::new(ENTRY))) };
+            let mut expected = seeds.clone();
+            for (index, value) in expected.iter_mut().enumerate() {
+                let bits = types[index].bits();
+                if bits < 128 {
+                    *value &= (1u128 << bits) - 1;
+                }
+                if index < 3 {
+                    *value = u128::from(*value == 0);
+                }
+            }
+            expected.extend([17, 23, 31, 41, 43, 47]);
+            for rounds in [0, 1, 2, 3, 17, 64] {
+                let mut actual = vec![0u128; lanes.len()];
+                assert_eq!(
+                    unsafe { run(seeds.as_ptr(), rounds, actual.as_mut_ptr()) },
+                    rounds
+                );
+                let mut rotated = expected.clone();
+                for group in rotated.chunks_mut(3) {
+                    group.rotate_left(rounds as usize % 3);
+                }
+                assert_eq!(actual, rotated, "reverse={reverse} rounds={rounds}");
+            }
+        }
+    }
+}
+
 fn rejected_frames() -> &'static [(&'static str, &'static [u8])] {
     &[
         (

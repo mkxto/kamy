@@ -1130,6 +1130,115 @@ fn emit_instruction(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CopyStep {
+    Save(ValueId),
+    Transfer {
+        dest: ValueId,
+        source: ValueId,
+        saved: bool,
+    },
+}
+
+struct ParallelCopies {
+    pending: Vec<Option<(ValueId, ValueId)>>,
+    dependencies: Vec<Option<usize>>,
+    readers: Vec<usize>,
+    ready: Vec<usize>,
+    remaining: usize,
+    cycle_cursor: usize,
+    saved: Option<ValueId>,
+    #[cfg(test)]
+    work: usize,
+}
+
+impl ParallelCopies {
+    fn new(copies: impl Iterator<Item = (ValueId, ValueId)>) -> Self {
+        let mut pending = Vec::with_capacity(copies.size_hint().1.unwrap_or(0));
+        pending.extend(copies.filter(|(dest, source)| dest != source).map(Some));
+        let destinations: HashMap<_, _> = pending
+            .iter()
+            .enumerate()
+            .map(|(index, copy)| (copy.unwrap().0, index))
+            .collect();
+        let mut readers = vec![0; pending.len()];
+        let dependencies: Vec<_> = pending
+            .iter()
+            .map(|copy| {
+                let dependency = destinations.get(&copy.unwrap().1).copied();
+                if let Some(index) = dependency {
+                    readers[index] += 1;
+                }
+                dependency
+            })
+            .collect();
+        let mut ready = Vec::with_capacity(pending.len());
+        ready.extend(
+            readers
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &readers)| (readers == 0).then_some(index)),
+        );
+        Self {
+            remaining: pending.len(),
+            #[cfg(test)]
+            work: pending.len() * 4,
+            pending,
+            dependencies,
+            readers,
+            ready,
+            cycle_cursor: 0,
+            saved: None,
+        }
+    }
+
+    fn next(&mut self) -> Option<CopyStep> {
+        if self.remaining == 0 {
+            return None;
+        }
+        if let Some(index) = self.ready.pop() {
+            let (dest, source) = self.pending[index].take().expect("pending ready copy");
+            self.remaining -= 1;
+            #[cfg(test)]
+            {
+                self.work += 1;
+            }
+            if let Some(dependency) = self.dependencies[index] {
+                self.readers[dependency] -= 1;
+                #[cfg(test)]
+                {
+                    self.work += 1;
+                }
+                if self.readers[dependency] == 0 && self.pending[dependency].is_some() {
+                    self.ready.push(dependency);
+                }
+            }
+            return Some(CopyStep::Transfer {
+                dest,
+                source,
+                saved: self.saved == Some(source),
+            });
+        }
+        // After leaves drain, remaining components are cycles. Drain each broken cycle
+        // completely before reusing the one existing scratch slot for another component.
+        while self.pending[self.cycle_cursor].is_none() {
+            self.cycle_cursor += 1;
+            #[cfg(test)]
+            {
+                self.work += 1;
+            }
+        }
+        let value = self.pending[self.cycle_cursor].unwrap().0;
+        #[cfg(test)]
+        {
+            self.work += 1;
+        }
+        self.saved = Some(value);
+        self.ready.push(self.cycle_cursor);
+        Some(CopyStep::Save(value))
+    }
+}
+
 fn emit_edge(
     func: &IrFunction,
     alloc: &RegAllocation,
@@ -1137,69 +1246,51 @@ fn emit_edge(
     succ: BlockId,
     out: &mut Vec<Instruction>,
 ) {
-    let mut pending: Vec<(ValueId, ValueId)> = func
-        .block(succ)
-        .phis
-        .iter()
-        .filter(|phi| alloc.homes.contains_key(&phi.dest))
-        .filter_map(|phi| {
-            phi.args
-                .iter()
-                .find(|(block, _)| *block == pred)
-                .map(|(_, source)| (phi.dest, *source))
-        })
-        .filter(|(dest, source)| dest != source)
-        .collect();
-    let mut saved = None;
-    while !pending.is_empty() {
-        if let Some(index) = pending
+    let mut copies = ParallelCopies::new(
+        func.block(succ)
+            .phis
             .iter()
-            .position(|(dest, _)| !pending.iter().any(|(_, source)| source == dest))
-        {
-            let (dest, source) = pending.remove(index);
-            let home = &alloc.homes[&dest];
-            let phys = if home.class == ValueClass::Xmm {
-                PhysReg::Xmm(XmmReg::Xmm0)
-            } else {
-                PhysReg::Gpr(Gpr::R10)
-            };
-            if saved == Some(source) {
-                load_home(
-                    out,
-                    &FrameHome {
-                        offset: alloc.frame.copy_scratch,
-                        ty: home.ty,
-                        class: home.class,
-                    },
-                    phys,
-                );
-            } else {
-                load_value(alloc, source, phys, out);
-            }
-            store_home(out, home, phys);
+            .filter(|phi| alloc.homes.contains_key(&phi.dest))
+            .filter_map(|phi| {
+                phi.args
+                    .iter()
+                    .find(|(block, _)| *block == pred)
+                    .map(|(_, source)| (phi.dest, *source))
+            }),
+    );
+    while let Some(step) = copies.next() {
+        let (dest, source, saved) = match step {
+            CopyStep::Save(value) => (value, value, false),
+            CopyStep::Transfer {
+                dest,
+                source,
+                saved,
+            } => (dest, source, saved),
+        };
+        let home = &alloc.homes[&dest];
+        let phys = if home.class == ValueClass::Xmm {
+            PhysReg::Xmm(XmmReg::Xmm0)
         } else {
-            let value = pending[0].0;
-            let home = &alloc.homes[&value];
-            let phys = if home.class == ValueClass::Xmm {
-                PhysReg::Xmm(XmmReg::Xmm0)
-            } else {
-                PhysReg::Gpr(Gpr::R10)
-            };
-            load_home(out, home, phys);
-            store_home(
-                out,
-                &FrameHome {
-                    offset: alloc.frame.copy_scratch,
-                    ty: home.ty,
-                    class: home.class,
-                },
-                phys,
-            );
-            saved = Some(value);
-            let index = pending.iter().position(|(dest, _)| *dest == value).unwrap();
-            let (dest, source) = pending.remove(index);
-            load_value(alloc, source, phys, out);
-            store_home(out, &alloc.homes[&dest], phys);
+            PhysReg::Gpr(Gpr::R10)
+        };
+        let cycle_home = FrameHome {
+            offset: alloc.frame.copy_scratch,
+            ty: home.ty,
+            class: home.class,
+        };
+        match step {
+            CopyStep::Save(_) => {
+                load_home(out, home, phys);
+                store_home(out, &cycle_home, phys);
+            }
+            CopyStep::Transfer { .. } => {
+                if saved {
+                    load_home(out, &cycle_home, phys);
+                } else {
+                    load_value(alloc, source, phys, out);
+                }
+                store_home(out, home, phys);
+            }
         }
     }
 }
@@ -1306,5 +1397,101 @@ pub(super) fn select(
     crate::references::SelectedInstructions {
         instructions: out,
         references,
+    }
+}
+
+#[cfg(test)]
+mod parallel_copy_tests {
+    use super::*;
+
+    fn execute(
+        copies: &[(u32, u32)],
+        initial: &HashMap<u32, u128>,
+    ) -> (HashMap<u32, u128>, usize, usize) {
+        let mut values = initial.clone();
+        let mut scratch = None;
+        let mut saves = 0;
+        let mut plan = ParallelCopies::new(
+            copies
+                .iter()
+                .map(|&(dest, source)| (ValueId(dest), ValueId(source))),
+        );
+        while let Some(step) = plan.next() {
+            match step {
+                CopyStep::Save(value) => {
+                    scratch = Some(values[&value.0]);
+                    saves += 1;
+                }
+                CopyStep::Transfer {
+                    dest,
+                    source,
+                    saved,
+                } => {
+                    let value = if saved {
+                        scratch.unwrap()
+                    } else {
+                        values[&source.0]
+                    };
+                    values.insert(dest.0, value);
+                }
+            }
+        }
+        for &(dest, source) in copies {
+            assert_eq!(values[&dest], initial[&source], "destination {dest}");
+        }
+        (values, plan.work, saves)
+    }
+
+    #[test]
+    fn simultaneous_copies_preserve_multiple_cycles_self_copies_and_external_sources() {
+        let initial: HashMap<_, _> = (0..20)
+            .map(|value| {
+                (
+                    value,
+                    (u128::from(value) + 1)
+                        .wrapping_mul(0x1020_3040_5060_7081_91a2_b3c4_d5e6_f701u128),
+                )
+            })
+            .collect();
+        // Independent two- and three-cycles, fanout, a self-copy, and rematerialized sources.
+        let copies = [
+            (0, 1),
+            (1, 0),
+            (2, 3),
+            (3, 4),
+            (4, 2),
+            (5, 0),
+            (6, 6),
+            (7, 18),
+            (8, 19),
+        ];
+        let (_, work, saves) = execute(&copies, &initial);
+        assert_eq!(saves, 2);
+        assert!(work <= copies.len() * 8);
+        let mut reverse = copies;
+        reverse.reverse();
+        execute(&reverse, &initial);
+    }
+
+    #[test]
+    fn wide_and_reverse_chain_planning_work_is_linear_and_results_are_simultaneous() {
+        for count in [64u32, 512, 4096, 16384] {
+            let initial: HashMap<_, _> = (0..=count)
+                .map(|value| (value, u128::from(value) * 257 + 11))
+                .collect();
+            let chain: Vec<_> = (0..count).map(|value| (value, value + 1)).collect();
+            let wide: Vec<_> = (0..count).map(|value| (value, count)).collect();
+            for (name, mut copies) in [("chain", chain), ("wide", wide)] {
+                for reverse in [false, true] {
+                    if reverse {
+                        copies.reverse();
+                    }
+                    let (_, work, saves) = execute(&copies, &initial);
+                    assert_eq!(saves, 0);
+                    assert!(work <= count as usize * 8, "{name} n={count} work={work}");
+                    eprintln!("phi-plan {name} reverse={reverse} transfers={count} work={work}");
+                }
+            }
+        }
     }
 }
