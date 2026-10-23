@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ScalarBounds {
     pub low: u64,
     pub high: u64,
@@ -338,112 +338,241 @@ pub(super) fn loops(
     Ok(result)
 }
 
-pub(super) fn scalar(
+#[derive(Clone, Copy)]
+enum ScalarState {
+    Active(usize),
+    Complete(Option<ScalarBounds>),
+}
+
+struct ScalarPending {
     value: ValueId,
-    facts: &HashMap<ValueId, Fact>,
-    definitions: &HashMap<ValueId, Definition<'_>>,
-    known: &HashMap<ValueId, ScalarBounds>,
-    depth: usize,
-) -> Option<ScalarBounds> {
-    if let Some(&bounds) = known.get(&value) {
-        return Some(bounds);
-    }
-    if let Some(Fact::Scalar(Some(value))) = facts.get(&value) {
-        return Some(ScalarBounds {
-            low: *value,
-            high: *value,
-        });
-    }
-    if depth == 0 {
-        return None;
-    }
-    let Definition::Inst(inst) = definitions.get(&value)? else {
-        return None;
-    };
-    if inst.ty.bits() > 64 {
-        return None;
-    }
-    let arg = |index: usize| scalar(*inst.args.get(index)?, facts, definitions, known, depth - 1);
-    let mask = if inst.ty.bits() == 64 {
-        u64::MAX
-    } else {
-        (1u64 << inst.ty.bits()) - 1
-    };
-    let normalize = |low: u128, high: u128| {
-        let bits = inst.ty.bits();
-        (low >> bits == high >> bits).then_some(ScalarBounds {
-            low: low as u64 & mask,
-            high: high as u64 & mask,
-        })
-    };
-    match inst.op {
-        IrOp::Copy | IrOp::Zext => arg(0),
-        IrOp::Trunc => {
-            let value = arg(0)?;
-            normalize(u128::from(value.low), u128::from(value.high))
+    next_argument: usize,
+    cycle_start: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ScalarWork {
+    evaluated_nodes: usize,
+    dependency_edges: usize,
+    peak_pending: usize,
+}
+
+/// A cache is valid only for these immutable facts, definitions and loop bounds.
+pub(super) struct ScalarAnalysis<'facts, 'ir> {
+    facts: &'facts HashMap<ValueId, Fact>,
+    definitions: &'facts HashMap<ValueId, Definition<'ir>>,
+    known: &'facts HashMap<ValueId, ScalarBounds>,
+    states: HashMap<ValueId, ScalarState>,
+    pending: Vec<ScalarPending>,
+    #[cfg(test)]
+    work: ScalarWork,
+}
+
+impl<'facts, 'ir> ScalarAnalysis<'facts, 'ir> {
+    pub(super) fn new(
+        facts: &'facts HashMap<ValueId, Fact>,
+        definitions: &'facts HashMap<ValueId, Definition<'ir>>,
+        known: &'facts HashMap<ValueId, ScalarBounds>,
+    ) -> Self {
+        Self {
+            facts,
+            definitions,
+            known,
+            states: HashMap::new(),
+            pending: Vec::new(),
+            #[cfg(test)]
+            work: ScalarWork::default(),
         }
-        IrOp::Add => {
-            let (left, right) = (arg(0)?, arg(1)?);
-            normalize(
-                u128::from(left.low) + u128::from(right.low),
-                u128::from(left.high) + u128::from(right.high),
-            )
+    }
+
+    fn arguments(&self, value: ValueId) -> &[ValueId] {
+        if self.known.contains_key(&value)
+            || matches!(self.facts.get(&value), Some(Fact::Scalar(Some(_))))
+        {
+            return &[];
         }
-        IrOp::Sub => {
-            let (left, right) = (arg(0)?, arg(1)?);
-            let modulus = 1u128 << inst.ty.bits();
-            normalize(
-                u128::from(left.low)
-                    .checked_add(modulus)?
-                    .checked_sub(u128::from(right.high))?,
-                u128::from(left.high)
-                    .checked_add(modulus)?
-                    .checked_sub(u128::from(right.low))?,
-            )
+        let Some(Definition::Inst(inst)) = self.definitions.get(&value) else {
+            return &[];
+        };
+        if inst.ty.bits() > 64 {
+            return &[];
         }
-        IrOp::Mul if inst.args.len() == 2 => {
-            let (left, right) = (arg(0)?, arg(1)?);
-            normalize(
-                u128::from(left.low) * u128::from(right.low),
-                u128::from(left.high) * u128::from(right.high),
-            )
+        let count = match inst.op {
+            IrOp::Copy | IrOp::Zext | IrOp::Trunc => 1,
+            IrOp::Add | IrOp::Sub | IrOp::Shl | IrOp::Shr | IrOp::And => 2,
+            IrOp::Mul if inst.args.len() == 2 => 2,
+            _ => 0,
+        };
+        &inst.args[..count.min(inst.args.len())]
+    }
+
+    fn begin(&mut self, value: ValueId, depth: usize) -> ScalarPending {
+        self.states.insert(value, ScalarState::Active(depth));
+        #[cfg(test)]
+        {
+            self.work.evaluated_nodes += 1;
+            self.work.peak_pending = self.work.peak_pending.max(depth + 1);
         }
-        IrOp::Shl | IrOp::Shr => {
-            let (value, count) = (arg(0)?, arg(1)?);
-            if count.low != count.high {
-                return None;
+        ScalarPending {
+            value,
+            next_argument: 0,
+            cycle_start: usize::MAX,
+        }
+    }
+
+    pub(super) fn get(&mut self, value: ValueId) -> Option<ScalarBounds> {
+        if let Some(ScalarState::Complete(result)) = self.states.get(&value) {
+            return *result;
+        }
+        let mut pending = std::mem::take(&mut self.pending);
+        pending.push(self.begin(value, 0));
+        while let Some(current) = pending.last_mut() {
+            if let Some(argument) = self
+                .arguments(current.value)
+                .get(current.next_argument)
+                .copied()
+            {
+                current.next_argument += 1;
+                #[cfg(test)]
+                {
+                    self.work.dependency_edges += 1;
+                }
+                match self.states.get(&argument).copied() {
+                    Some(ScalarState::Active(depth)) => {
+                        current.cycle_start = current.cycle_start.min(depth);
+                    }
+                    Some(ScalarState::Complete(_)) => {}
+                    None => {
+                        let next = self.begin(argument, pending.len());
+                        pending.push(next);
+                    }
+                }
+                continue;
             }
-            let count = (count.low & if inst.ty == IrType::I64 { 63 } else { 31 }) as u32;
-            if matches!(inst.op, IrOp::Shl) {
-                normalize(
-                    u128::from(value.low) << count,
-                    u128::from(value.high) << count,
-                )
+            let current = pending.pop().unwrap();
+            let result = if current.cycle_start <= pending.len() {
+                None
             } else {
-                Some(ScalarBounds {
-                    low: value.low >> count,
-                    high: value.high >> count,
-                })
+                self.evaluate(current.value)
+            };
+            self.states
+                .insert(current.value, ScalarState::Complete(result));
+            if let Some(parent) = pending.last_mut() {
+                parent.cycle_start = parent.cycle_start.min(current.cycle_start);
             }
         }
-        IrOp::And => {
-            let left = arg(0);
-            let right = arg(1);
-            match (left, right) {
-                (Some(left), Some(right)) => Some(ScalarBounds {
-                    low: 0,
-                    high: left.high.min(right.high),
-                }),
-                (Some(bound), None) | (None, Some(bound)) => Some(ScalarBounds {
-                    low: 0,
-                    high: bound.high,
-                }),
-                _ => None,
+        self.pending = pending;
+        match self.states[&value] {
+            ScalarState::Complete(result) => result,
+            ScalarState::Active(_) => unreachable!("scalar traversal left an active value"),
+        }
+    }
+
+    fn evaluate(&self, value: ValueId) -> Option<ScalarBounds> {
+        if let Some(&bounds) = self.known.get(&value) {
+            return Some(bounds);
+        }
+        if let Some(Fact::Scalar(Some(value))) = self.facts.get(&value) {
+            return Some(ScalarBounds {
+                low: *value,
+                high: *value,
+            });
+        }
+        let Definition::Inst(inst) = self.definitions.get(&value)? else {
+            return None;
+        };
+        if inst.ty.bits() > 64 {
+            return None;
+        }
+        let arg = |index: usize| match self.states.get(inst.args.get(index)?)? {
+            ScalarState::Complete(result) => *result,
+            ScalarState::Active(_) => None,
+        };
+        let mask = if inst.ty.bits() == 64 {
+            u64::MAX
+        } else {
+            (1u64 << inst.ty.bits()) - 1
+        };
+        let normalize = |low: u128, high: u128| {
+            let bits = inst.ty.bits();
+            (low >> bits == high >> bits).then_some(ScalarBounds {
+                low: low as u64 & mask,
+                high: high as u64 & mask,
+            })
+        };
+        match inst.op {
+            IrOp::Copy | IrOp::Zext => arg(0),
+            IrOp::Trunc => {
+                let value = arg(0)?;
+                normalize(u128::from(value.low), u128::from(value.high))
             }
+            IrOp::Add => {
+                let (left, right) = (arg(0)?, arg(1)?);
+                normalize(
+                    u128::from(left.low) + u128::from(right.low),
+                    u128::from(left.high) + u128::from(right.high),
+                )
+            }
+            IrOp::Sub => {
+                let (left, right) = (arg(0)?, arg(1)?);
+                let modulus = 1u128 << inst.ty.bits();
+                normalize(
+                    u128::from(left.low)
+                        .checked_add(modulus)?
+                        .checked_sub(u128::from(right.high))?,
+                    u128::from(left.high)
+                        .checked_add(modulus)?
+                        .checked_sub(u128::from(right.low))?,
+                )
+            }
+            IrOp::Mul if inst.args.len() == 2 => {
+                let (left, right) = (arg(0)?, arg(1)?);
+                normalize(
+                    u128::from(left.low) * u128::from(right.low),
+                    u128::from(left.high) * u128::from(right.high),
+                )
+            }
+            IrOp::Shl | IrOp::Shr => {
+                let (value, count) = (arg(0)?, arg(1)?);
+                if count.low != count.high {
+                    return None;
+                }
+                let count = (count.low & if inst.ty == IrType::I64 { 63 } else { 31 }) as u32;
+                if matches!(inst.op, IrOp::Shl) {
+                    normalize(
+                        u128::from(value.low) << count,
+                        u128::from(value.high) << count,
+                    )
+                } else {
+                    Some(ScalarBounds {
+                        low: value.low >> count,
+                        high: value.high >> count,
+                    })
+                }
+            }
+            IrOp::And => {
+                let left = arg(0);
+                let right = arg(1);
+                match (left, right) {
+                    (Some(left), Some(right)) => Some(ScalarBounds {
+                        low: 0,
+                        high: left.high.min(right.high),
+                    }),
+                    (Some(bound), None) | (None, Some(bound)) => Some(ScalarBounds {
+                        low: 0,
+                        high: bound.high,
+                    }),
+                    _ => None,
+                }
+            }
+            IrOp::Undef | IrOp::Load if inst.ty.bits() < 64 => {
+                Some(ScalarBounds { low: 0, high: mask })
+            }
+            _ => None,
         }
-        IrOp::Undef | IrOp::Load if inst.ty.bits() < 64 => {
-            Some(ScalarBounds { low: 0, high: mask })
-        }
-        _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests;

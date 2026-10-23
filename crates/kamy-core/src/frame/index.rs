@@ -153,7 +153,7 @@ pub(super) fn prove(
     facts: &HashMap<ValueId, Fact>,
     definitions: &HashMap<ValueId, Definition<'_>>,
     known: &HashMap<ValueId, FramePointerBounds>,
-    scalars: &HashMap<ValueId, bounds::ScalarBounds>,
+    scalars: &mut bounds::ScalarAnalysis<'_, '_>,
 ) -> Result<Option<PointerProof>, RejectionReason> {
     let Some(expression) = expression(value, facts, definitions, known, definitions.len()) else {
         return Ok(None);
@@ -171,7 +171,7 @@ pub(super) fn prove(
             relative: Some((expression.base, expression.displacement)),
         }));
     };
-    let Some(range) = bounds::scalar(index, facts, definitions, scalars, definitions.len()) else {
+    let Some(range) = scalars.get(index) else {
         return Ok(None);
     };
     if range.low <= i64::MAX as u64 && range.high > i64::MAX as u64 {

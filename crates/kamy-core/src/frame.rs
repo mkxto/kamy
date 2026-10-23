@@ -641,6 +641,7 @@ impl FrameAnalysis {
                 access_scratch.proven.insert(value, access_scratch.bounds);
             }
         }
+        let mut scalars = bounds::ScalarAnalysis::new(&facts, &defined, &loop_bounds.scalars);
         let mut pointer_work: VecDeque<_> = (0..definitions.len()).collect();
         queued.fill(true);
         while let Some(index) = pointer_work.pop_front() {
@@ -667,7 +668,7 @@ impl FrameAnalysis {
                     &facts,
                     &defined,
                     &analysis.pointer_bounds,
-                    &loop_bounds.scalars,
+                    &mut scalars,
                 )?,
             };
             let Some(index::PointerProof {
