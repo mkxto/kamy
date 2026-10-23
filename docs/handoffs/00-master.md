@@ -37,27 +37,30 @@ already exist. Update the register and the numbered handoff's notice together.
 | Handoff | Status | Accepted commits | Completion notice |
 |---|---|---|---|
 | 01 — Unified symbols and single rebuild | **Completed** | Policy `5ef9b46`; implementation `feaffd8` | [01 notice](01-unified-rebuild.md#completion-notice) |
-| 02 — Concrete frames and memory-backed lowering | **Incomplete / Reopened 2026-10-22; repairs evidenced 2026-10-23** | Policy `5ef9b46`; historical implementation `278f5ef81dd096e8325c06bd02ba7c88b84b0646` / publication `d1c70e1`, acceptance withdrawn; current source commits in notice | [02 notice](02-memory-backed-lowering.md#completion-notice) |
+| 02 — Concrete frames and memory-backed lowering | **Incomplete / Reopened 2026-10-22; six findings fixed, #38 open as of 2026-10-23** | Policy `5ef9b46`; historical implementation `278f5ef81dd096e8325c06bd02ba7c88b84b0646` / publication `d1c70e1`, acceptance withdrawn; current source fixes and #38 study in notice | [02 notice](02-memory-backed-lowering.md#completion-notice) |
 | 03 — Rust SDK, runtime and lifecycle | Pending | None recorded | [03 notice](03-rust-sdk-runtime.md#completion-notice) |
 | 04 — Whole-image virtual compaction | Pending | None recorded | [04 notice](04-whole-image-compaction.md#completion-notice) |
 | 05 — Instruction, flag and segment semantics | Pending | None recorded | [05 notice](05-instruction-semantics.md#completion-notice) |
 | 06 — Exception semantics | Pending | None recorded | [06 notice](06-exception-semantics.md#completion-notice) |
 | 07 — Control-flow residuals | Pending | None recorded | [07 notice](07-control-flow-residuals.md#completion-notice) |
 
-The next assignment is **reaccept H2 before H3**. The seven review findings
+The next assignment is **reaccept H2 before H3**. Six review findings are fixed
+and closed:
 [#37](https://github.com/mkxto/kamy/issues/37),
-[#38](https://github.com/mkxto/kamy/issues/38),
 [#39](https://github.com/mkxto/kamy/issues/39),
 [#40](https://github.com/mkxto/kamy/issues/40),
 [#41](https://github.com/mkxto/kamy/issues/41),
 [#42](https://github.com/mkxto/kamy/issues/42) and
-[#43](https://github.com/mkxto/kamy/issues/43) now have implementation repairs or
-a scoped supported-producer disproof; see the
+[#43](https://github.com/mkxto/kamy/issues/43).
+[#38](https://github.com/mkxto/kamy/issues/38) remains **open and investigated,
+not production-fixed**: the ordinary CCC/FastCC producer study is not proof for
+all admitted modules/attributes. See the
 [H2 notice](02-memory-backed-lowering.md#completion-notice) and
 [current repair evidence](../STATUS.md#current-h2-repair-evidence--2026-10-23).
-**Acceptance remains blocked by the unavailable original 23-member locked
-corpus.** Fresh workspace, full SDK and available-subset successes do not
-replace that gate or restore the withdrawn historical acceptance.
+**Acceptance remains incomplete for #38's actual accepted-call-contract
+obligation (items 10/12) and the unavailable original 23-member locked corpus
+(item 7).** Fresh workspace, full SDK and available-subset successes do not
+replace either obligation or restore the withdrawn historical acceptance.
 
 The user's explicit **Kamy-only** authorization applies to this repair campaign:
 manual exact source/SSA/homes, native bytes/PCs, ABI/calls/results, saves,

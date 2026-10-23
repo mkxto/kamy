@@ -13,17 +13,18 @@ remains withdrawn. Policy `5ef9b46` (D40) remains binding: one backend, concrete
 memory-backed frames, bounded scratch, explicit flags, one rebuild and actual-body
 unwind. Pressure rejection and transform-intensity retries MUST NOT return.
 
-All seven [review findings](../STATUS.md#post-acceptance-review--2026-10-22)
-now have a repair or scoped disproof:
+Six [review findings](../STATUS.md#post-acceptance-review--2026-10-22) are fixed
+and closed; #38 remains open:
 
 - **#37 fixed** (`d87d989`): finite conditional/phi/copy provenance and final
   logical-frame mapping, including delayed dominating constants and separated
   E−8/E+8 alternatives; real native identity/MBA and shared-DAG witnesses retained.
-- **#38 scoped disproof** (`19bffa6`): actual compiled, parsed and resolved ordinary
-  Rust 1.95 / LLVM 22.1.2 CCC/FastCC contracts, including a genuine 24-byte SRet,
-  disprove the current supported-producer concern. This is not fabricated
-  RBX/XMM6 metadata or proof for arbitrary LLVM/custom ABIs; preservation-override
-  attributes remain outside the evidence.
+- **#38 open / investigated, not production-fixed** (`19bffa6`): finite producer
+  study and ordinary-WIN tests using compiled, parsed and resolved Rust 1.95 /
+  LLVM 22.1.2 CCC/FastCC contracts, including a genuine 24-byte SRet. Compatibility
+  of these samples is not production resolved-effects handling or proof for all
+  admitted modules/attributes; broader external-IR/kmod and preservation-attribute
+  paths remain unclosed. No nonstandard-result native failure was observed.
 - **#39 fixed** (`b6f94b2`): per-analysis scalar success/failure/cycle caching.
 - **#40 fixed** (`c0bfb28`): candidate-free skip and compact petgraph dominators;
   linear storage, not a linear-time claim (worst-case time remains O(V²)).
@@ -32,12 +33,17 @@ now have a repair or scoped disproof:
   registered native Windows unwind checks preserve full 128-bit XMM state.
 - **#43 fixed** (`57eb3b1`): one global pins map and private four-value local allocation.
 
-**Formal H2 acceptance is still blocked:** the original 23-member population at
-locked corpus revision `d9bc70d9970d3e1988203acd3415b103bcb62197` is unavailable.
-The available subset is not a replacement. The original `dll_strutil` remains
-quarantined/user-skipped, not restored, rebuilt, reblessed or counted PASS.
-No original/golden/security policy was changed. H3 MUST wait; this notice and
-the [master register](00-master.md#completion-register) track handoff acceptance,
+**Formal H2 acceptance remains incomplete in two areas:** #38's actual
+accepted-call-contract obligation (acceptance items 10/12), and the original
+23-member population at locked corpus revision
+`d9bc70d9970d3e1988203acd3415b103bcb62197`, which is unavailable (item 7).
+Next #38 work must establish genuine accepted-producer/consumer closure or
+reproducibly disprove the concern for the admitted surface, not fabricate ABI
+metadata or use blanket rejection. The available corpus subset is not a
+replacement. The original `dll_strutil` remains quarantined/user-skipped, not
+restored, rebuilt, reblessed or counted PASS. No original/golden/security policy
+was changed. H3 MUST wait; this notice and the
+[master register](00-master.md#completion-register) track handoff acceptance,
 not remote or umbrella issue closure.
 
 | Issue scope | Delivered scope and disposition | Residual owner |
@@ -45,14 +51,14 @@ not remote or umbrella issue closure.
 | #15 | Concrete homes/coordinates and bounded resources; finite provenance repaired | H2 corpus reacceptance; truly unproved/dynamic frames remain explicit |
 | #6 | D40 memory-home cutover plus bounded DAG/CFG/phi work and one global pins map | H2 reacceptance; no return to zero-spill scheduling |
 | #5 applicability | Requested supported MBA intensity retained in fresh witnesses | No pressure-driven reduction; stronger/nonlinear protection stays separate |
-| #9 | After-definition captures/homes preserved; actual-write saves and supported call contracts evidenced | Arbitrary custom ABI/preservation overrides are not established |
+| #9 | After-definition captures/homes preserved; actual-write saves and ordinary CCC/FastCC call samples evidenced | H2 #38 accepted-call-contract closure; broader admitted paths are not established |
 | #10 | Historical caller-frame/recursion recovery retained; finite selected-frame addressing repaired | Truly unproved frame forms remain explicit |
 | #13 | Partial: metadata/CRT/import-thunk/inference retained; actual authored ABI and conservative unknown calls preserved | Broader signature precision is not declared complete |
 | #16 | Partial: successor-aware per-bit dead-flag dependencies removed only when proved dead | H5 owns unmodeled flags and variable-count carry semantics |
 | #23 | Historical 23-member success retained as history; available population reverified, original full gate unavailable | H2 original corpus gate; H5/H6 retain native termination/EH residuals, including the two historical INT29 losses |
 | #8 | Physical native pins/effects and bit-string widths/offsets preserved | H5 owns FS/GS and unknown native classes |
 | #17 | Bounded prerequisite: one-plan frame/probe/helper and typed metadata references retained | H4 global compaction and later reference residuals remain |
-| #20 | Actual-body saves/probes/unwind retained; registered Windows read/partial/write-state proof refreshed | H6 retains handler/scope/personality reconstruction |
+| #20 | Actual-body saves/probes/unwind retained; registered Windows synthetic read/partial/write-state checks refreshed | H6 retains handler/scope/personality reconstruction |
 | #30 | Bounded prerequisite: validated BaseReloc scalar ownership preserves records and field rebasing/rebuild | HIGHLOW/opaque-reference limits remain conservative; H4 owns global layout |
 | #32 | Intact combined Rust callback executes identity and full MBA through the shared backend | H3 owns compiled startup, ordinary imports, std/runtime/TLS and lifecycle |
 
@@ -63,12 +69,15 @@ records current commands, versions, source/output identities, exact PC/ABI
 annotations, native oracles, work/allocation scaling and stable-population
 transitions separately from historical results. Fresh workspace gates, full
 SDK rebuild/runtime, the explicitly ignored genuine producer test and all
-available corpus members passed; numerical detail belongs there. Identity
+executed available corpus members passed; numerical detail belongs there. Identity
 lowering is not actual MBA: the exact normalized select ledger has no eligible
 arithmetic, while nearby witnesses and the standalone frame SDK genuinely
 transform at requested intensity. The intact combined callback, depth-64
-recursion, large guard frame and independent Windows native unwind proofs
-remain load-bearing, not substitutes for the missing full corpus.
+recursion, large guard frame and registered Windows unwind checks remain
+load-bearing within their tested scope, not substitutes for either outstanding
+acceptance area. The Rtl APIs were genuinely exercised with synthetic
+stack/CONTEXT and decoded PC states, not live exceptions at every PC; shared
+WIN/decoder assumptions limit their independence.
 
 Manual in-tree CLI/IR/protection/rejection work and exact native byte/PC, frame,
 ABI/call/result, save, phi/flag and unwind inspection were exercised under the

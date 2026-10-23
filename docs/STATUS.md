@@ -773,16 +773,17 @@ Observed verification:
 **H2 remains Incomplete / Reopened; H3 waits.** Acceptance of implementation
 `278f5ef81dd096e8325c06bd02ba7c88b84b0646` (`Lower SSA through concrete
 memory-backed frames`), published at `d1c70e1`, was withdrawn on 2026-10-22.
-All seven review findings now have a fix or scoped producer disproof in the
-authoritative ledger below. The sole remaining formal H2 gate is the unavailable
-original 23-member locked corpus; the available four-member run is not a substitute.
+Six findings are fixed; #38 remains **OPEN**: the ordinary-producer fixture passes,
+but generic accepted-call-effect unwind repair and universal unreachability are
+unproved. H2 still requires that production/evidence obligation and the unavailable
+original 23-member corpus; the available four-member run is not a substitute.
 D40 policy `5ef9b46` remains binding: concrete frames, memory-backed
 intermediates/flags, bounded scratch, one shared backend and one rebuild.
 The [H2 completion notice](handoffs/02-memory-backed-lowering.md#completion-notice)
 and [master register](handoffs/00-master.md#completion-register) track the same
 state. **Repair and reaccept H2 before H3.** H1 acceptance remains unchanged.
 The earlier tests, corpus and full SDK/runtime/unwind successes below remain
-historical observations, not current acceptance or remote issue closure.
+historical observations, not current acceptance; current issue status is below.
 
 The following implementation-era receipts, through the pre-repair NOW evidence,
 are **historical snapshots**, not the current repair result. The fresh pre-H2
@@ -983,7 +984,7 @@ These are semantic/ownership repairs, not pressure-masking bandaids.
 | #15 frame/pressure recovery | Historical concrete-frame/home cutover; finite select repair #37 and bounded analysis/copy repairs #39–41 below | Original-population H2 gate remains open; no umbrella closure |
 | #6 serial scheduling / zero-spill policy | Bounded scratch/memory homes retained; bounded DAG/CFG/phi work and one global pin map repaired | No return to zero-spill; no umbrella closure |
 | #5 applicability | Requested existing MBA intensity retained in genuine transforming native/SDK cases below | Stronger/nonlinear MBA remains separate; raw normalized select ledger has no eligible MBA |
-| #9 volatile-pinned live-across-call | After-definition capture/home delivery retained; supported-producer #38 disproof and actual-write saves #42 below | Arbitrary custom ABI and unsupported effects are not covered |
+| #9 volatile-pinned live-across-call | After-definition capture/home delivery retained; ordinary-producer #38 study and actual-write saves #42 below | #38 accepted-call-effect unwind obligation remains open beyond that fixture |
 | #10 recursion/caller-frame access | Historical 486 caller-frame and 3 recursion recoveries; recursion 64/96 exercised; finite frame provenance repaired | Truly dynamic/unproved frame forms remain explicit; no umbrella closure |
 | #13 signature precision | Existing metadata/CRT/import-thunk/inference path retained; exact authored contracts remain precise; unknown host calls consume all four GPR and XMM argument possibilities and retain RAX/XMM0 returns | No invented narrow signature or guessed unknown stack-argument count; broader signature work is not declared closed |
 | #16 dead dependencies | Successor-aware per-bit analysis admits native flag writers only when their outputs are proved dead; partial writes, native reads, calls and memory effects retain their dependencies | Unmodeled native flag effects and variable-count carry semantics remain H5 work |
@@ -1000,8 +1001,8 @@ not declared repaired merely because the suite passes. FS/GS, variable-count
 carry semantics, broader ISA/native classes and EH remain later work. H3 Rust
 std/import/startup/lifecycle and H4 global compaction are not implemented here.
 The intentional H1 generated loader remains; this is not a claim to have compiled
-that loader or completed H3. **No remote issue is claimed closed.** The narrow
-read-only-pin-save and duplicate-pin-map findings below are disposed within H2;
+that loader or completed H3. **No remote issue was claimed closed at that snapshot.**
+The narrow read-only-pin-save and duplicate-pin-map findings below are now fixed;
 this does not pull all #36 output optimization or stronger MBA into H2.
 
 ### Post-acceptance review — 2026-10-22
@@ -1017,7 +1018,7 @@ does not expand H2 into all #36, H3–H7 or language-handler reconstruction.
 | Issue | Current evidence / status | Implemented result | Regression / oracle | Evidence limit |
 |---|---|---|---|---|
 | [#37](https://github.com/mkxto/kamy/issues/37) — finite select provenance | **Fixed**, `d87d989`; original wrong-result witness now passes both conditions | Finite Select/Phi/Copy provenance and final logical-coordinate mapping; delayed constants and separated final zones included | [Core frame regressions](../crates/kamy-core/src/frame.rs): `delayed_select_condition_is_independent_of_block_order`, `split_select_accesses_expand_only_actual_offset_alternatives`; [full-link native regressions](../crates/kamy-link/tests/memory_frames.rs): `exact_six_argument_select_ledger_witness_lowers_in_both_profiles`, finite phi/select/index/flags/call compositions; [actual values](../target/h2-repair/final-dll-values.log) | Exact normalized ledger has **0 eligible MBA**; adjacent and SDK witnesses genuinely transform at requested intensity **1.0**; truly unproved choices still reject specifically |
-| [#38](https://github.com/mkxto/kamy/issues/38) — accepted call-contract unwind | **Scoped disproof**, `19bffa6`, for current supported ordinary Rust 1.95 / LLVM 22.1.2 CCC/FastCC producer | Actual compiled module, parsed definitions, resolved real CALL targets and reachable integer/Float64/mixed/aggregate/**24-byte SRet** contracts preserve Win64 nonvolatiles | [Ignored genuine-producer regression](../tests/sdk-rebuild/src/main.rs): `real_rust_llvm_call_contracts_preserve_win64_nonvolatiles`, explicitly rerun **PASS** after committed source; [final producer receipt](../target/h2-repair/real-producer-contract-final.log), SDK native-PC oracle | Not fabricated RBX/XMM6 metadata; not arbitrary LLVM/custom ABI or preservation-override attribute proof |
+| [#38](https://github.com/mkxto/kamy/issues/38) — accepted call-contract unwind | **Investigated / OPEN**, `19bffa6`; ordinary Rust 1.95 / LLVM 22.1.2 CCC/FastCC fixture **PASS**, not a production repair | Actual compiled module, parsed definitions, resolved CALL targets and integer/Float64/mixed/aggregate/**24-byte SRet** fixture contracts preserve Win64 nonvolatiles; generic resolved-effect unwind handling is not implemented | [Ignored genuine-producer regression](../tests/sdk-rebuild/src/main.rs): `real_rust_llvm_call_contracts_preserve_win64_nonvolatiles`, explicitly rerun **PASS** after committed source; [final producer receipt](../target/h2-repair/real-producer-contract-final.log), ordinary-WIN SDK PC checks | Fixed WIN call mask remains; external IR/existing kmod and unexcluded `NoCalleeSaved` attributes exceed this fixture. Reachability is not universally ruled out; no nonstandard-result native failure observed |
 | [#39](https://github.com/mkxto/kamy/issues/39) — scalar-DAG work | **Fixed**, `b6f94b2` | Immutable-analysis cache memoizes success, failure and cycles; changed transform facts get fresh analysis | [Bounds regressions](../crates/kamy-core/src/frame/bounds/tests.rs): `scalar_shared_success_and_failure_dags_evaluate_once`, cycle/width/overflow/resource/fact-refresh cases; native indexed-frame consumers | Evaluated nodes **20,003/20,003 success**, **20,001/20,001 failure**; **40,002/40,000 edges**; no wallclock guarantee |
 | [#40](https://github.com/mkxto/kamy/issues/40) — dominator storage | **Fixed**, `c0bfb28` | Candidate-free skip; petgraph immediate dominators plus Euler intervals, **linear storage**, **O(V²) worst-case time** | [Bounds regressions](../crates/kamy-core/src/frame/bounds/tests.rs): candidate-free 20,000-block CFG, loop scaling and **625** small-graph oracle choices; [allocation before](../target/h2-repair/frame-before.csv) / [after](../target/h2-repair/frame-after.csv) | No linear-time claim, threshold rejection or discarded CFG blocks; irreducible unproved frame bounds remain `FrameDynamic` |
 | [#41](https://github.com/mkxto/kamy/issues/41) — phi-copy planning | **Fixed**, `32aaeb4` | Dependency/ready worklist and existing single cycle slot preserve simultaneous transfers | [Parallel-copy tests](../crates/kamy-codegen/src/isel/memory.rs), [native mixed-home phi-cycle consumer](../crates/kamy-link/tests/memory_frames.rs); [work receipt](../target/h2-repair/phi-planning-work.log): **16,384** chain/wide transfers use **98,303 / 81,920** work units | Constants, frame addresses, self copies, multiple cycles, GPR/XMM/flags covered; no incidental-register or elapsed-time oracle |
@@ -1072,7 +1073,7 @@ not change frame proof, lifting, code generation or unwind. At this snapshot all
 seven findings remained unfixed. It re-caught #37 **through `kamy corpus verify`**,
 not only a standalone harness or exit-code check. The intentionally failing
 external case was not a deliberately red workspace test. These receipts do not
-imply then-unmeasured #39–41 work or the later #38 producer disproof; current
+imply then-unmeasured #39–41 work or the later #38 producer study; current
 dispositions and passing native evidence are recorded separately below.
 
 Corpus source identity is distinct from the historical lock. The available
@@ -1336,8 +1337,8 @@ findings would stay blocked; none was found in the exercised evidence.
 
 The current section records source/build/input/output identities, commands,
 symbol/RVA and native-PC/address annotations, exact output-value oracles,
-accepted producer/call-result contracts and independent Windows
-`RtlLookupFunctionEntry` / `RtlVirtualUnwind` checks under forced ASLR. Manual
+accepted producer/call-result contracts and real Windows
+`RtlLookupFunctionEntry` / `RtlVirtualUnwind` model checks under forced ASLR. Manual
 triage/bisect, lift/SSA/optimize/regalloc/native dumps, identity/requested-MBA
 protection and explain-reject evidence remain required as applicable. Actual
 DAG/CFG/phi work/allocation is evidence, not flaky wallclock assertions. Portable
@@ -1371,11 +1372,11 @@ scoped to their recorded fixtures, not universal acceptance.
 
 ### Current H2 repair evidence — 2026-10-23
 
-**All seven findings are disposed as recorded in the ledger above; formal H2
-remains incomplete solely for the original-population corpus gate. H3 waits.**
+**Six findings are fixed; #38 remains OPEN with a production/evidence obligation.
+The original-population corpus gate is also unsatisfied. H2 is incomplete; H3 waits.**
 This is the user-authorized Kamy-only campaign: **no IDA/x64dbg was run**. Exact
-machine bytes/PCs, ABI/address math, native outputs and independent Windows unwind
-proof were exercised; debugger-specific proof was not silently declared green.
+machine bytes/PCs, ABI/address math, native outputs and Windows unwind model checks
+were exercised; debugger-specific proof was not silently declared green.
 D16/D22/D24/D40, the source schemas, originals/goldens and security policy are unchanged.
 
 **Fresh integration gates:** format check, `clippy --all-targets -- -D warnings`,
@@ -1391,8 +1392,11 @@ Rust **1.95.0** (`59807616e1fa2540724bfbac14d7976d7e4a3860`), LLVM
 metadata and resolved reachable calls, not arbitrary ABI labels. The genuine
 24-byte SRet helper is in [callback.rs](../tests/sdk-rebuild/plugins/callback.rs);
 the [producer test](../tests/sdk-rebuild/src/main.rs) checks integer, scalar
-Float64/XMM0, mixed RAX/XMM0, aggregate and hidden-return contracts. The scoped
-#38 conclusion excludes preservation-override attributes and arbitrary custom ABI.
+Float64/XMM0, mixed RAX/XMM0, aggregate and hidden-return contracts. This finite
+#38 study does not close accepted-call-effect unwind handling: production still
+uses a fixed WIN mask, while external IR/existing kmod and unexcluded
+`NoCalleeSaved` attributes are broader than the fixture. No nonstandard-result
+native failure was observed, but universal unreachability was not established.
 
 **Native #37 result and profile:** [final values](../target/h2-repair/final-dll-values.log)
 show original, identity and requested ordered probability-100 sub/add outputs all
@@ -1450,22 +1454,28 @@ with explicit compiler/linker/library paths into `target/h2-repair/sdk-final`:
 identity/MBA executes **trace 12 / bounds 24**, frames **176/320 B**, without split,
 skip or intensity reduction. Standalone identity/MBA each lower **8 exports**,
 transforming **0/8** respectively, and execute depth **64**, original object
-**4,096 B**, actual guard-page object **24,576 B**, forced ASLR. Independent `RtlLookupFunctionEntry` /
+**4,096 B**, actual guard-page object **24,576 B**, forced ASLR. Real `RtlLookupFunctionEntry` /
 `RtlVirtualUnwind` probes cover **1,155/1,920 PCs**, **87/87 epilogue PCs**,
-max frames **25,208/25,640 B**, saved **3 GPR / 1 XMM**. The ordinary dynamic
-negative fails specifically `FrameDynamic`, with no output. These are real SDK
-and registered native oracle results, not execution of every corpus body or EH parity.
+max frames **25,208/25,640 B**, saved **3 GPR / 1 XMM**, using independently
+modeled synthetic stacks/CONTEXTs and a decoder sharing WIN/iced assumptions,
+not live exceptions at those PCs. Normal-return CPU executions above are separate.
+The ordinary dynamic negative fails specifically `FrameDynamic`, with no output.
+These are scoped SDK/model results, not execution of every corpus body or EH parity.
 
 **Available corpus:** measured source revision **`0664dda`**, **4/4 PASS** (now README-only HEAD `fdede7e`; binaries/goldens unchanged): three historical members
 plus `dll_frame_select`; **935 historical lowered + 1 new witness**, identity
 **0 transformed**. [Final stable-cohort receipt](../target/h2-repair/final-stable-cohorts.json)
 compares exactly **3,532 historical identities**: **0 added / removed /
 classification changes / rejection-reason migrations**; final per-member baselines
-are `target/h2-repair/final-<member>.yml`. This is not a recovered 23-member run.
-The lock's original revision **`d9bc70d9970d3e1988203acd3415b103bcb62197`** is absent
-locally (`cat-file` exit 128; prior fetch `not our ref`); the original population or
-published revision is required. Original `dll_strutil` stays **quarantined/user-skipped**,
-never restored, rebuilt or re-blessed. No original, golden or security baseline changed.
+are `target/h2-repair/final-<member>.yml`. Passing file oracles do not prove every
+lowered identity executed. This is not a recovered 23-member run: four historical
+manifests plus the local witness make five; **19** historical members are missing,
+not attributed to antivirus. The lock's original revision
+**`d9bc70d9970d3e1988203acd3415b103bcb62197`** is absent locally (`cat-file` exit 128;
+prior fetch `not our ref`); the original population or published revision is required.
+The lock/catalog is not automatically enforced. Original `dll_strutil` stays
+**quarantined/user-skipped**, never restored, rebuilt or re-blessed.
+No original, golden or security baseline changed.
 
 **Manual tooling:** actual `dump` lift/SSA/optimize/regalloc and exact
 `dump --stage native --size` inspected selected/indexed/phi/call consumers;
