@@ -98,7 +98,7 @@ enum Command {
         /// Input PE.
         input: PathBuf,
         /// Exit code a passing run must return.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         expect_exit: i32,
         /// Feed this file to the target's stdin.
         #[arg(long)]
@@ -110,6 +110,9 @@ enum Command {
         /// Per-run wall-clock limit in seconds.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
+        /// Retain the exact minimal failing protected binary.
+        #[arg(long)]
+        keep: bool,
     },
     /// Explain why functions were rejected by the SSA-identity protect.
     ExplainReject {
@@ -234,12 +237,14 @@ fn main() -> anyhow::Result<()> {
             stdin_file,
             expect_stdout,
             timeout,
+            keep,
         } => commands::bisect::run(
             &input,
             expect_exit,
             stdin_file.as_deref(),
             expect_stdout.as_deref(),
             timeout,
+            keep,
         ),
         Command::ExplainReject { input, rva } => {
             commands::explain_reject::run(&input, rva.as_deref())
@@ -251,5 +256,30 @@ fn main() -> anyhow::Result<()> {
         } => commands::verify::run(&original, &protected, vectors),
         Command::Corpus { cmd } => commands::corpus::dispatch(cmd),
         Command::Plugin { cmd } => commands::plugin::dispatch(cmd),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn bisect_accepts_a_separate_negative_exit_contract() {
+        let cli = Cli::try_parse_from([
+            "kamy",
+            "bisect",
+            "input.exe",
+            "--expect-exit",
+            "-1073741819",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Bisect {
+                expect_exit: -1073741819,
+                ..
+            }
+        ));
     }
 }

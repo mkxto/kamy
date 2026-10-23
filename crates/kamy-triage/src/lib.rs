@@ -278,12 +278,45 @@ pub struct BisectOutcome {
     pub candidates: usize,
     /// Count of protect+test iterations performed.
     pub steps: usize,
-    /// Fault captured by a traced run of the minimal-subset protect, if any.
-    pub fault: Option<kamy_run::Fault>,
+    /// Final traced execution, using the same launch context as the probes.
+    /// Callers must apply their probe oracle to this outcome too.
+    pub replay: kamy_run::RunOutcome,
+    /// Exact minimal-subset binary in its own retained directory, only when requested.
+    pub artifact: Option<PathBuf>,
 }
 
-fn temp_path(n: u64) -> PathBuf {
-    std::env::temp_dir().join(format!("kamy-triage-{}-{n}.bin", std::process::id()))
+struct ArtifactDir {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl ArtifactDir {
+    fn new() -> anyhow::Result<Self> {
+        Self::new_in(&std::env::temp_dir())
+    }
+
+    fn new_in(root: &Path) -> anyhow::Result<Self> {
+        let mut id = 0u64;
+        loop {
+            let path = root.join(format!("kamy-triage-{}-{id}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path, keep: false }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => id += 1,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("creating triage directory {}", path.display()));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ArtifactDir {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 /// Protect `input` restricted to `subset`, run `is_pass`, and report whether the
@@ -291,24 +324,27 @@ fn temp_path(n: u64) -> PathBuf {
 /// artifact is removed afterward.
 fn still_fails(
     input: &Path,
+    dir: &Path,
     subset: &[Rva],
     is_pass: &dyn Fn(&Path) -> anyhow::Result<bool>,
     counter: &mut u64,
     steps: &mut usize,
 ) -> anyhow::Result<bool> {
     *counter += 1;
-    let out = temp_path(*counter);
+    let out = dir.join(format!("probe-{counter}.exe"));
     let sel = FunctionSelector::only(subset.iter().copied());
     protect_identity(input, &out, Some(&sel))?;
     *steps += 1;
     let res = is_pass(&out);
-    let _ = std::fs::remove_file(&out);
+    std::fs::remove_file(&out)
+        .with_context(|| format!("removing triage probe {}", out.display()))?;
     Ok(!res?)
 }
 
 /// Delta-debug (ddmin) `candidates` to a 1-minimal subset that still fails.
 fn ddmin(
     input: &Path,
+    dir: &Path,
     candidates: Vec<Rva>,
     is_pass: &dyn Fn(&Path) -> anyhow::Result<bool>,
     counter: &mut u64,
@@ -328,7 +364,7 @@ fn ddmin(
 
         // Reduce to a single failing chunk.
         for ch in &chunks {
-            if !ch.is_empty() && still_fails(input, ch, is_pass, counter, steps)? {
+            if !ch.is_empty() && still_fails(input, dir, ch, is_pass, counter, steps)? {
                 c = ch.to_vec();
                 n = 2;
                 continue 'outer;
@@ -338,7 +374,9 @@ fn ddmin(
         // Reduce to a failing complement (drop one chunk).
         for ch in &chunks {
             let complement: Vec<Rva> = c.iter().copied().filter(|r| !ch.contains(r)).collect();
-            if !complement.is_empty() && still_fails(input, &complement, is_pass, counter, steps)? {
+            if !complement.is_empty()
+                && still_fails(input, dir, &complement, is_pass, counter, steps)?
+            {
                 c = complement;
                 n = (n - 1).max(2);
                 continue 'outer;
@@ -353,35 +391,42 @@ fn ddmin(
     Ok(c)
 }
 
-/// Localize an SSA-lowering regression. Confirms the verbatim baseline passes
-/// and the all-lowered build fails, delta-debugs the lowered-function set to a
-/// minimal failing subset, then traces that subset to capture the fault.
+/// Localize an SSA-lowering regression. Confirms the empty-selection resident
+/// baseline passes and the all-lowered build fails, then delta-debugs the
+/// lowered-function set to a minimal failing subset. The final traced replay
+/// changes only `run_options.exe`; callers must check `replay` with the same
+/// oracle as `is_pass`. `keep` retains only that final protected binary.
 pub fn bisect(
     input: &Path,
+    run_options: &kamy_run::RunOptions,
     is_pass: &dyn Fn(&Path) -> anyhow::Result<bool>,
+    keep: bool,
 ) -> anyhow::Result<BisectOutcome> {
+    let mut dir = ArtifactDir::new()?;
     let mut steps = 0usize;
     let mut counter = 0u64;
 
-    // (a) Verbatim baseline: lower nothing. Must pass.
+    // (a) Empty-selection resident baseline: lower nothing. Must pass.
     counter += 1;
-    let out_a = temp_path(counter);
+    let out_a = dir.path.join(format!("probe-{counter}.exe"));
     let empty = FunctionSelector::only(std::iter::empty());
     protect_identity(input, &out_a, Some(&empty))?;
     steps += 1;
     let res_a = is_pass(&out_a);
-    let _ = std::fs::remove_file(&out_a);
+    std::fs::remove_file(&out_a)
+        .with_context(|| format!("removing triage probe {}", out_a.display()))?;
     if !res_a? {
-        bail!("verbatim baseline already fails, bug is not in SSA lowering");
+        bail!("empty-selection resident baseline already fails, bug is not in SSA lowering");
     }
 
     // (b) All-lowered build: selector None. Must fail; its report gives C.
     counter += 1;
-    let out_b = temp_path(counter);
+    let out_b = dir.path.join(format!("probe-{counter}.exe"));
     let report = protect_identity(input, &out_b, None)?;
     steps += 1;
     let res_b = is_pass(&out_b);
-    let _ = std::fs::remove_file(&out_b);
+    std::fs::remove_file(&out_b)
+        .with_context(|| format!("removing triage probe {}", out_b.display()))?;
     let candidates: Vec<_> = report
         .ssa_lowered_symbols
         .iter()
@@ -395,26 +440,217 @@ pub fn bisect(
     }
 
     // (c) Delta-debug to a minimal failing subset.
-    let culprit = ddmin(input, candidates.clone(), is_pass, &mut counter, &mut steps)?;
+    let culprit = ddmin(
+        input,
+        &dir.path,
+        candidates.clone(),
+        is_pass,
+        &mut counter,
+        &mut steps,
+    )?;
 
     // (d) Trace the minimal subset to capture the faulting address.
-    counter += 1;
-    let out_c = temp_path(counter);
+    let out_c = dir.path.join("replay.exe");
     let sel = FunctionSelector::only(culprit.iter().copied());
     protect_identity(input, &out_c, Some(&sel))?;
     steps += 1;
-    let opts = kamy_run::RunOptions {
-        exe: out_c.clone(),
-        ..Default::default()
+    let replay = replay(&out_c, run_options)?;
+    let artifact = if keep {
+        dir.keep = true;
+        Some(out_c)
+    } else {
+        None
     };
-    let outcome = kamy_run::run_traced(&opts);
-    let _ = std::fs::remove_file(&out_c);
-    let fault = outcome?.fault;
 
     Ok(BisectOutcome {
         culprit,
         candidates: candidates.len(),
         steps,
-        fault,
+        replay,
+        artifact,
     })
+}
+
+/// Preserve the full invocation when tracing a protected replacement.
+fn replay(exe: &Path, run_options: &kamy_run::RunOptions) -> anyhow::Result<kamy_run::RunOutcome> {
+    let mut options = run_options.clone();
+    options.exe = exe.to_path_buf();
+    kamy_run::run_traced(&options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArtifactDir, replay};
+    use kamy_run::RunOptions;
+    use std::io::{Read as _, Write as _};
+    use std::time::Duration;
+
+    #[test]
+    fn final_replay_preserves_stdin_args_environment_and_working_directory() {
+        if std::env::var("KAMY_REPLAY_CHILD").as_deref() == Ok("context") {
+            let args: Vec<_> = std::env::args().collect();
+            // The harness accepts arbitrary --skip values, so this also carries child data.
+            let offset_file = args
+                .windows(2)
+                .find(|pair| pair[0] == "--skip")
+                .map(|pair| &pair[1])
+                .expect("offset filename argument");
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input).unwrap();
+            let value: i32 = input.trim().parse().unwrap();
+            let offset: i32 = std::fs::read_to_string(offset_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let environment: i32 = std::env::var("KAMY_REPLAY_OFFSET")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let result = value + offset + environment;
+            println!("\nKAMY_REPLAY_RESULT={result}");
+            std::io::stdout().flush().unwrap();
+            std::process::exit(result);
+        }
+
+        let dir = ArtifactDir::new().unwrap();
+        std::fs::write(dir.path.join("offset.txt"), "5").unwrap();
+        let executable = dir.path.join("probe-1.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let options = RunOptions {
+            // Only this field may be replaced by replay().
+            exe: dir.path.join("does-not-exist.exe"),
+            args: vec![
+                "--exact".into(),
+                "tests::final_replay_preserves_stdin_args_environment_and_working_directory".into(),
+                "--nocapture".into(),
+                "--quiet".into(),
+                "--skip".into(),
+                "offset.txt".into(),
+            ],
+            stdin: b"30\n".to_vec(),
+            env: vec![
+                ("KAMY_REPLAY_CHILD".into(), "context".into()),
+                ("KAMY_REPLAY_OFFSET".into(), "7".into()),
+            ],
+            cwd: Some(dir.path.clone()),
+            timeout: Duration::from_secs(10),
+        };
+        let result = replay(&executable, &options).unwrap();
+        std::fs::remove_file(&executable)
+            .expect("a completed traced process must release its executable immediately");
+        assert!(!result.timed_out, "{result:?}");
+        assert!(result.fault.is_none(), "{result:?}");
+        assert_eq!(result.exit_code, Some(42), "{result:?}");
+        assert!(
+            result
+                .stdout
+                .split(|byte| *byte == b'\n')
+                .any(|line| { line.trim_ascii_end() == b"KAMY_REPLAY_RESULT=42" }),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn final_replay_enforces_the_probe_timeout() {
+        if std::env::var("KAMY_REPLAY_CHILD").as_deref() == Ok("timeout") {
+            std::fs::write("ready", b"started").unwrap();
+            std::thread::sleep(Duration::from_secs(60));
+            std::process::exit(0);
+        }
+
+        let dir = ArtifactDir::new().unwrap();
+        let executable = dir.path.join("probe-1.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let options = RunOptions {
+            exe: dir.path.join("does-not-exist.exe"),
+            args: vec![
+                "--exact".into(),
+                "tests::final_replay_enforces_the_probe_timeout".into(),
+                "--nocapture".into(),
+                "--quiet".into(),
+            ],
+            stdin: b"nonempty input\n".to_vec(),
+            env: vec![("KAMY_REPLAY_CHILD".into(), "timeout".into())],
+            cwd: Some(dir.path.clone()),
+            timeout: Duration::from_secs(5),
+        };
+        let result = replay(&executable, &options).unwrap();
+        std::fs::remove_file(&executable)
+            .expect("a timed-out traced process must release its executable immediately");
+        assert_eq!(
+            std::fs::read(dir.path.join("ready")).unwrap(),
+            b"started",
+            "child must reach its blocking operation before the timeout"
+        );
+        assert!(result.timed_out, "{result:?}");
+        assert!(result.fault.is_none(), "{result:?}");
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn faulted_replay_releases_its_executable_and_preserves_the_exception() {
+        if std::env::var("KAMY_REPLAY_CHILD").as_deref() == Ok("fault") {
+            std::fs::write("ready", b"started").unwrap();
+            // SAFETY: this child deliberately executes UD2 to raise an actual
+            // unhandled native illegal-instruction exception, not a Rust panic.
+            unsafe { std::arch::asm!("ud2", options(noreturn, nostack)) };
+        }
+
+        let dir = ArtifactDir::new().unwrap();
+        let executable = dir.path.join("probe-1.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let options = RunOptions {
+            exe: dir.path.join("does-not-exist.exe"),
+            args: vec![
+                "--exact".into(),
+                "tests::faulted_replay_releases_its_executable_and_preserves_the_exception".into(),
+                "--nocapture".into(),
+                "--quiet".into(),
+            ],
+            env: vec![("KAMY_REPLAY_CHILD".into(), "fault".into())],
+            cwd: Some(dir.path.clone()),
+            // Fault cleanup must remain bounded even with no execution timeout.
+            timeout: Duration::ZERO,
+            ..Default::default()
+        };
+        let result = replay(&executable, &options).unwrap();
+        std::fs::remove_file(&executable)
+            .expect("a faulted traced process must release its executable immediately");
+        assert_eq!(std::fs::read(dir.path.join("ready")).unwrap(), b"started");
+        assert!(!result.timed_out, "{result:?}");
+        let fault = result.fault.expect("the native fault must be observed");
+        assert_eq!(fault.code, 0xc000_001d, "{result:?}");
+        assert_eq!(result.exit_code, Some(fault.code as i32), "{result:?}");
+        assert_ne!(fault.image_base, 0, "{result:?}");
+        assert!(fault.address >= fault.image_base, "{result:?}");
+        assert_eq!(fault.rva, fault.address - fault.image_base, "{result:?}");
+    }
+
+    #[test]
+    fn new_invocation_preserves_preexisting_retained_evidence() {
+        let root = ArtifactDir::new().unwrap();
+        // Reproduce a retained directory from an earlier process with the same PID.
+        let retained = root
+            .path
+            .join(format!("kamy-triage-{}-0", std::process::id()));
+        std::fs::create_dir(&retained).unwrap();
+        let evidence = retained.join("replay.exe");
+        std::fs::write(&evidence, b"retained evidence").unwrap();
+
+        let probe_dir;
+        {
+            let invocation = ArtifactDir::new_in(&root.path).unwrap();
+            probe_dir = invocation.path.clone();
+            std::fs::write(invocation.path.join("probe-1.exe"), b"partial probe").unwrap();
+            std::fs::write(invocation.path.join("replay.exe"), b"new replay").unwrap();
+        }
+
+        assert!(
+            !probe_dir.exists(),
+            "unretained invocation must clean its files"
+        );
+        assert_eq!(std::fs::read(evidence).unwrap(), b"retained evidence");
+        assert!(retained.is_dir());
+    }
 }
