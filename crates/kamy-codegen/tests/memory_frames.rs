@@ -6,6 +6,10 @@ use kamy_core::ir::{
 };
 use kamy_core::{LinkField, Reference, ReferenceOrigin, SymbolId, SymbolicExpression};
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[path = "../../../tests/sdk-rebuild/src/native_probe.rs"]
+mod native_probe;
+
 const SOURCE_VA: u64 = 0x1_4000_1000;
 const HELPER_OFFSET: usize = 0xf_f000;
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -671,10 +675,250 @@ fn concrete_frame_resource_and_signed_offset_overflow_are_specific() {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum NonvolatileBoundary {
+    ReadOnly,
+    NativeRead,
+    PartialWrite,
+}
+
+fn nonvolatile_boundary_witness(boundary: NonvolatileBoundary) -> Witness {
+    let mut witness = Witness::new(1);
+    let output = witness.input(Gpr::Rcx);
+    let scalar = witness.input(Gpr::Rbx);
+    let vector = witness.value(0, IrOp::Undef, &[], IrType::I128);
+    witness.pins.insert(vector, PhysReg::Xmm(XmmReg::Xmm6));
+    let (scalar, vector) = match boundary {
+        NonvolatileBoundary::ReadOnly => (scalar, vector),
+        NonvolatileBoundary::NativeRead => {
+            let seven = witness.value(0, IrOp::Const(7), &[], IrType::I64);
+            let sum = witness.value(0, IrOp::Add, &[scalar, seven], IrType::I64);
+            let sum = witness.pinned_copy(0, sum, PhysReg::Gpr(Gpr::Rbx), IrType::I64);
+            witness.effect(
+                0,
+                IrOp::NativeInline(NativeInst {
+                    bytes: vec![0x48, 0x89, 0xd8], // mov rax,rbx only reads RBX
+                    references: vec![],
+                    reads: vec![PhysReg::Gpr(Gpr::Rbx)],
+                    writes: vec![PhysReg::Gpr(Gpr::Rax)],
+                }),
+                &[sum],
+                IrType::I64,
+            );
+            let result = witness.value(0, IrOp::Undef, &[], IrType::I64);
+            witness.pins.insert(result, PhysReg::Gpr(Gpr::Rax));
+            let zero = witness.value(0, IrOp::Const(0), &[], IrType::I128);
+            let zero = witness.pinned_copy(0, zero, PhysReg::Xmm(XmmReg::Xmm6), IrType::I128);
+            witness.effect(
+                0,
+                IrOp::NativeInline(NativeInst {
+                    bytes: vec![0x0f, 0x50, 0xc6], // movmskps eax,xmm6 only reads XMM6
+                    references: vec![],
+                    reads: vec![PhysReg::Xmm(XmmReg::Xmm6)],
+                    writes: vec![PhysReg::Gpr(Gpr::Rax)],
+                }),
+                &[zero],
+                IrType::I32,
+            );
+            (result, zero)
+        }
+        NonvolatileBoundary::PartialWrite => {
+            witness.effect(
+                0,
+                IrOp::NativeInline(NativeInst {
+                    bytes: vec![0xb3, 0x5a], // mov bl,0x5a preserves the upper 56 bits
+                    references: vec![],
+                    reads: vec![PhysReg::Gpr(Gpr::Rbx)],
+                    writes: vec![PhysReg::Gpr(Gpr::Rbx)],
+                }),
+                &[scalar],
+                IrType::I8,
+            );
+            let result = witness.value(0, IrOp::Undef, &[], IrType::I64);
+            witness.pins.insert(result, PhysReg::Gpr(Gpr::Rbx));
+            let zero = witness.value(0, IrOp::Const(0), &[], IrType::I32);
+            witness.pins.insert(zero, PhysReg::Xmm(XmmReg::Xmm0));
+            witness.effect(
+                0,
+                IrOp::NativeInline(NativeInst {
+                    bytes: vec![0xf3, 0x0f, 0x10, 0xf0], // movss xmm6,xmm0 preserves upper 96 bits
+                    references: vec![],
+                    reads: vec![PhysReg::Xmm(XmmReg::Xmm6), PhysReg::Xmm(XmmReg::Xmm0)],
+                    writes: vec![PhysReg::Xmm(XmmReg::Xmm6)],
+                }),
+                &[vector, zero],
+                IrType::I32,
+            );
+            let result_vector = witness.value(0, IrOp::Undef, &[], IrType::I128);
+            witness
+                .pins
+                .insert(result_vector, PhysReg::Xmm(XmmReg::Xmm6));
+            (result, result_vector)
+        }
+    };
+    witness.effect(0, IrOp::Store, &[output, scalar], IrType::I64);
+    let offset = witness.value(0, IrOp::Const(16), &[], IrType::I64);
+    let address = witness.value(0, IrOp::Add, &[output, offset], IrType::I64);
+    witness.effect(0, IrOp::Store, &[address, vector], IrType::I128);
+    witness.return_value(0, scalar);
+    witness
+}
+
+#[test]
+fn nonvolatile_read_only_and_real_writes_preserve_results_and_caller_state() {
+    let mut save_cases = Vec::new();
+    for boundary in [
+        NonvolatileBoundary::ReadOnly,
+        NonvolatileBoundary::NativeRead,
+        NonvolatileBoundary::PartialWrite,
+    ] {
+        let witness = nonvolatile_boundary_witness(boundary);
+        let allocation =
+            kamy_codegen::allocate_registers(&witness.func, &HashSet::new(), &witness.pins)
+                .unwrap();
+        let saved: Vec<_> = allocation
+            .frame
+            .saves
+            .iter()
+            .map(|save| save.register)
+            .collect();
+        let expected_saves = match boundary {
+            NonvolatileBoundary::ReadOnly => vec![],
+            _ => vec![PhysReg::Gpr(Gpr::Rbx), PhysReg::Xmm(XmmReg::Xmm6)],
+        };
+        let selected = kamy_codegen::select_instructions(&witness.func, &allocation);
+        let prologue_end = selected
+            .instructions
+            .iter()
+            .position(|inst| inst.ip() != 0)
+            .unwrap();
+        // This single-return fixture's epilogue restores its modeled saves,
+        // reloads the nonconstant RAX output, releases its frame and returns.
+        let epilogue_start = selected.instructions.len() - allocation.frame.saves.len() - 3;
+        let code = kamy_codegen::relocate(&selected.instructions, SOURCE_VA).unwrap();
+        let code_bytes = code.len();
+        let unwind = kamy_seh::unwind_ranges(&code, SOURCE_VA)
+            .expect("the exact nonvolatile fixture MUST have reconstructible native metadata");
+        assert_eq!(unwind.first().unwrap().begin, 0, "{boundary:?}");
+        assert_eq!(
+            unwind.last().unwrap().end as usize,
+            code_bytes,
+            "{boundary:?}"
+        );
+        let prologue_bytes =
+            kamy_codegen::relocate(&selected.instructions[..prologue_end], SOURCE_VA)
+                .unwrap()
+                .len();
+        let epilogue_bytes =
+            kamy_codegen::relocate(&selected.instructions[epilogue_start..], SOURCE_VA)
+                .unwrap()
+                .len();
+        let save_bytes: u32 = allocation
+            .frame
+            .saves
+            .iter()
+            .map(|save| {
+                if matches!(save.register, PhysReg::Xmm(_)) {
+                    16
+                } else {
+                    8
+                }
+            })
+            .sum();
+        eprintln!(
+            "nonvolatile {boundary:?}: frame={} saves={} save_bytes={} prologue={prologue_bytes} body={} epilogue={epilogue_bytes} code={code_bytes}",
+            allocation.frame.stack_size,
+            saved.len(),
+            save_bytes,
+            code_bytes - prologue_bytes - epilogue_bytes
+        );
+        save_cases.push((boundary, saved, expected_saves));
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            let executable = native::Executable::with_nonvolatile_caller(&witness);
+            let report = executable.check_unwind();
+            assert!(report.body_pcs > 1, "interior body probes: {boundary:?}");
+            assert!(report.epilogues >= 2, "epilogue probes: {boundary:?}");
+            eprintln!(
+                "nonvolatile {boundary:?}: native_unwind_pcs={} body_pcs={} epilogue_pcs={} anchor={} calls={} max_frame={} saved_gpr={} saved_xmm={}",
+                report.pcs,
+                report.body_pcs,
+                report.epilogues,
+                report.anchor,
+                report.calls,
+                report.max_frame,
+                report.saved_gpr.count_ones(),
+                report.saved_xmm.count_ones()
+            );
+            let function: unsafe extern "system" fn(
+                *const [u128; 2],
+                *mut [u128; 2],
+                *mut [u128; 2],
+            ) -> u64 = unsafe { core::mem::transmute(executable.caller_address()) };
+            for (scalar, vector) in [
+                (
+                    0x1234_5678_9abc_def0u64,
+                    0xfedc_ba98_7654_3210_0123_4567_89ab_cdefu128,
+                ),
+                (u64::MAX, 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff),
+            ] {
+                let initial = [u128::from(scalar), vector];
+                let mut output = [0; 2];
+                let mut caller = [0; 2];
+                let returned = unsafe { function(&initial, &mut output, &mut caller) };
+                let expected = match boundary {
+                    NonvolatileBoundary::ReadOnly => (scalar, vector),
+                    NonvolatileBoundary::NativeRead => (scalar.wrapping_add(7), 0),
+                    NonvolatileBoundary::PartialWrite => {
+                        ((scalar & !0xff) | 0x5a, vector & !u128::from(u32::MAX))
+                    }
+                };
+                assert_eq!(returned, expected.0, "{boundary:?}");
+                assert_eq!(output, [u128::from(expected.0), expected.1], "{boundary:?}");
+                assert_eq!(caller, initial, "full RBX/XMM6 caller state: {boundary:?}");
+            }
+        }
+    }
+    for (boundary, saved, expected) in save_cases {
+        assert_eq!(saved, expected, "{boundary:?}");
+    }
+}
+
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod native {
     use super::{ALLOCATION_SIZE, CLOBBERING_HELPER, HELPER_OFFSET, Witness};
     use core::ffi::c_void;
+    use iced_x86::{Code, Instruction, MemoryOperand, Register};
+    use windows::Win32::System::Diagnostics::Debug::{
+        IMAGE_RUNTIME_FUNCTION_ENTRY, IMAGE_RUNTIME_FUNCTION_ENTRY_0, RtlAddFunctionTable,
+        RtlDeleteFunctionTable,
+    };
+
+    const CALLER_OFFSET: usize = HELPER_OFFSET - 4096;
+
+    fn nonvolatile_caller(entry: u64) -> Vec<u8> {
+        use Register::*;
+        let stack = |offset| MemoryOperand::with_base_displ(RSP, offset);
+        let at = |base, offset| MemoryOperand::with_base_displ(base, offset);
+        let instructions = vec![
+            Instruction::with1(Code::Push_r64, RBX).unwrap(),
+            Instruction::with2(Code::Sub_rm64_imm8, RSP, 64i32).unwrap(),
+            Instruction::with2(Code::Movups_xmmm128_xmm, stack(48), XMM6).unwrap(),
+            Instruction::with2(Code::Mov_rm64_r64, stack(32), R8).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, RBX, at(RCX, 0)).unwrap(),
+            Instruction::with2(Code::Movups_xmm_xmmm128, XMM6, at(RCX, 16)).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, RCX, RDX).unwrap(),
+            Instruction::with_branch(Code::Call_rel32_64, entry).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, R10, stack(32)).unwrap(),
+            Instruction::with2(Code::Mov_rm64_r64, at(R10, 0), RBX).unwrap(),
+            Instruction::with2(Code::Movups_xmmm128_xmm, at(R10, 16), XMM6).unwrap(),
+            Instruction::with2(Code::Movups_xmm_xmmm128, XMM6, stack(48)).unwrap(),
+            Instruction::with2(Code::Add_rm64_imm8, RSP, 64i32).unwrap(),
+            Instruction::with1(Code::Pop_r64, RBX).unwrap(),
+            Instruction::with(Code::Retnq),
+        ];
+        kamy_codegen::relocate(&instructions, entry + CALLER_OFFSET as u64).unwrap()
+    }
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -691,15 +935,33 @@ mod native {
         fn GetCurrentProcess() -> *mut c_void;
     }
 
-    pub(super) struct Executable(*mut c_void);
+    pub(super) struct Executable {
+        allocation: *mut c_void,
+        code_len: u32,
+        runtime_functions: Option<Box<[IMAGE_RUNTIME_FUNCTION_ENTRY]>>,
+    }
 
     impl Executable {
         pub(super) fn new(witness: &Witness) -> Self {
+            Self::build(witness, false)
+        }
+
+        pub(super) fn with_nonvolatile_caller(witness: &Witness) -> Self {
+            Self::build(witness, true)
+        }
+
+        fn build(witness: &Witness, include_caller: bool) -> Self {
             let allocation =
                 unsafe { VirtualAlloc(core::ptr::null_mut(), ALLOCATION_SIZE, 0x3000, 4) };
-            assert!(!allocation.is_null());
-            let executable = Self(allocation);
+            assert!(!allocation.is_null(), "VirtualAlloc failed");
+            let mut executable = Self {
+                allocation,
+                code_len: 0,
+                runtime_functions: None,
+            };
             let code = witness.lower(allocation as u64);
+            executable.code_len = u32::try_from(code.len()).unwrap();
+            let mut runtime_functions = Vec::new();
             unsafe {
                 let bytes = allocation.cast::<u8>();
                 core::ptr::copy_nonoverlapping(code.as_ptr(), bytes, code.len());
@@ -708,27 +970,110 @@ mod native {
                     bytes.add(HELPER_OFFSET),
                     CLOBBERING_HELPER.len(),
                 );
+                if include_caller {
+                    let ranges = kamy_seh::unwind_ranges(&code, allocation as u64)
+                        .expect("exact generated bytes MUST have native unwind metadata");
+                    let mut metadata_offset = (code.len() + 3) & !3;
+                    let mut covered = 0;
+                    for range in ranges {
+                        assert_eq!(
+                            range.begin, covered,
+                            "runtime records MUST cover every fixture byte"
+                        );
+                        assert!(range.begin < range.end && range.end <= executable.code_len);
+                        covered = range.end;
+                        assert_eq!(metadata_offset % 4, 0);
+                        let metadata_end = metadata_offset.checked_add(range.info.len()).unwrap();
+                        assert!(
+                            metadata_end <= CALLER_OFFSET,
+                            "metadata overlaps the caller trampoline"
+                        );
+                        core::ptr::copy_nonoverlapping(
+                            range.info.as_ptr(),
+                            bytes.add(metadata_offset),
+                            range.info.len(),
+                        );
+                        runtime_functions.push(IMAGE_RUNTIME_FUNCTION_ENTRY {
+                            BeginAddress: range.begin,
+                            EndAddress: range.end,
+                            Anonymous: IMAGE_RUNTIME_FUNCTION_ENTRY_0 {
+                                UnwindInfoAddress: u32::try_from(metadata_offset).unwrap(),
+                            },
+                        });
+                        metadata_offset = (metadata_end + 3) & !3;
+                    }
+                    assert_eq!(covered, executable.code_len);
+                    assert!(!runtime_functions.is_empty());
+                    let caller = nonvolatile_caller(allocation as u64);
+                    assert!(caller.len() <= HELPER_OFFSET - CALLER_OFFSET);
+                    core::ptr::copy_nonoverlapping(
+                        caller.as_ptr(),
+                        bytes.add(CALLER_OFFSET),
+                        caller.len(),
+                    );
+                }
                 let mut old = 0;
                 assert_ne!(
                     VirtualProtect(allocation, ALLOCATION_SIZE, 0x20, &mut old),
-                    0
+                    0,
+                    "VirtualProtect failed"
                 );
                 assert_ne!(
                     FlushInstructionCache(GetCurrentProcess(), allocation, ALLOCATION_SIZE),
-                    0
+                    0,
+                    "FlushInstructionCache failed"
                 );
+                if include_caller {
+                    // The boxed table keeps the registered pointer stable until Drop,
+                    // while all UNWIND_INFO RVAs refer to this exact executable allocation.
+                    let table = runtime_functions.into_boxed_slice();
+                    assert!(
+                        RtlAddFunctionTable(&table, allocation as u64).as_bool(),
+                        "RtlAddFunctionTable failed"
+                    );
+                    executable.runtime_functions = Some(table);
+                }
             }
             executable
         }
 
         pub(super) fn address(&self) -> *mut c_void {
-            self.0
+            self.allocation
+        }
+
+        pub(super) fn caller_address(&self) -> *mut c_void {
+            unsafe { self.allocation.cast::<u8>().add(CALLER_OFFSET).cast() }
+        }
+
+        pub(super) fn check_unwind(&self) -> super::native_probe::windows_oracle::Report {
+            assert!(
+                self.runtime_functions.is_some(),
+                "native unwind requires registered metadata"
+            );
+            unsafe {
+                super::native_probe::windows_oracle::check_function(
+                    self.allocation.cast(),
+                    0,
+                    self.code_len,
+                )
+            }
+            .expect("registered exact nonvolatile fixture MUST unwind every reachable native PC")
         }
     }
 
     impl Drop for Executable {
         fn drop(&mut self) {
-            assert_ne!(unsafe { VirtualFree(self.0, 0, 0x8000) }, 0);
+            if let Some(table) = &self.runtime_functions {
+                assert!(
+                    unsafe { RtlDeleteFunctionTable(table.as_ptr()) }.as_bool(),
+                    "RtlDeleteFunctionTable failed"
+                );
+            }
+            assert_ne!(
+                unsafe { VirtualFree(self.allocation, 0, 0x8000) },
+                0,
+                "VirtualFree failed"
+            );
         }
     }
 }

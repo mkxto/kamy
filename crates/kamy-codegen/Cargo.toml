@@ -14,3 +14,9 @@ kamy-core.workspace = true
 iced-x86.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+kamy-seh.workspace = true
+
+[target.'cfg(all(windows, target_arch = "x86_64"))'.dev-dependencies]
+windows = { workspace = true, features = ["Win32_System_Kernel"] }

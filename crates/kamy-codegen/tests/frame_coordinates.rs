@@ -877,6 +877,37 @@ fn wrapping_induction_does_not_prove_bounded_frame_accesses() {
     );
 }
 
+#[test]
+fn rematerialized_frame_coordinate_pins_do_not_require_nonvolatile_saves() {
+    let mut witness = Witness::new(1);
+    witness.store_word(-64, 0x1234_5678_9abc_def0);
+    let local = witness.value(0, IrOp::FrameAddress(-64), &[], IrType::I64);
+    let incoming = witness.value(0, IrOp::FrameAddress(40), &[], IrType::I64);
+    witness.pins.insert(local, PhysReg::Gpr(Gpr::Rbp));
+    witness.pins.insert(incoming, PhysReg::Gpr(Gpr::Rbx));
+    let local = witness.value(0, IrOp::Load, &[local], IrType::I64);
+    let incoming = witness.value(0, IrOp::Load, &[incoming], IrType::I64);
+    let result = witness.value(0, IrOp::Add, &[local, incoming], IrType::I64);
+    witness.return_value(0, result);
+    let allocation =
+        kamy_codegen::allocate_registers(&witness.func, &HashSet::new(), &witness.pins).unwrap();
+    assert!(allocation.frame.saves.is_empty());
+    assert!(allocation.frame.original_size >= 64);
+    witness.lower(SOURCE).unwrap();
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        let executable = native::Executable::new(&witness);
+        let function: unsafe extern "system" fn(u64, u64, u64, u64, u64) -> u64 =
+            unsafe { core::mem::transmute(executable.address()) };
+        for incoming in [0u64, 17, u64::MAX] {
+            assert_eq!(
+                unsafe { function(1, 2, 3, 4, incoming) },
+                0x1234_5678_9abc_def0u64.wrapping_add(incoming)
+            );
+        }
+    }
+}
+
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod native {
     use super::Witness;

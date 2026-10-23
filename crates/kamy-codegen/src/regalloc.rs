@@ -838,15 +838,49 @@ pub fn allocate_registers(
         );
     }
     let copy_scratch = reserve_slot(&mut cursor, 16, 16)?;
-    let mut written: HashSet<_> = pins.values().copied().collect();
+    // Pins constrain boundaries; capturing an entry Undef only reads its register.
+    // Boundary reloads, native/call effects and final output loads do write.
+    let mut written = [false; CALLEE_SAVED_GPRS.len() + CALLEE_SAVED_XMMS.len()];
+    let mut mark_written = |register| {
+        if let Some(index) = CALLEE_SAVED_GPRS
+            .into_iter()
+            .chain(CALLEE_SAVED_XMMS.map(PhysReg::Xmm))
+            .position(|candidate| candidate == register)
+        {
+            written[index] = true;
+        }
+    };
     for block in &func.blocks {
         for inst in &block.insts {
             match &inst.op {
                 IrOp::NativeInline(native) => {
-                    written.extend(native.reads.iter().chain(&native.writes).copied());
+                    for &register in native.reads.iter().chain(&native.writes) {
+                        mark_written(register);
+                    }
                 }
                 IrOp::Call { clobbers, .. } | IrOp::CallIndirect { clobbers } => {
-                    written.extend(clobbers.iter().copied());
+                    for &register in clobbers {
+                        mark_written(register);
+                    }
+                    for (position, arg) in inst.args.iter().enumerate() {
+                        if matches!(inst.op, IrOp::CallIndirect { .. }) && position == 0 {
+                            // The target is loaded into volatile R11, not its pin.
+                            continue;
+                        }
+                        if let Some(&register) = pins.get(arg) {
+                            mark_written(register);
+                        }
+                    }
+                }
+                IrOp::CallResult { register } => mark_written(*register),
+                IrOp::Use
+                    if matches!(block.term, IrTerminator::Ret | IrTerminator::Tail { .. }) =>
+                {
+                    for arg in &inst.args {
+                        if let Some(&register) = pins.get(arg) {
+                            mark_written(register);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -856,7 +890,8 @@ pub fn allocate_registers(
     for register in CALLEE_SAVED_GPRS
         .into_iter()
         .chain(CALLEE_SAVED_XMMS.map(PhysReg::Xmm))
-        .filter(|register| written.contains(register))
+        .enumerate()
+        .filter_map(|(index, register)| written[index].then_some(register))
     {
         let width = if matches!(register, PhysReg::Xmm(_)) {
             16
@@ -1264,6 +1299,134 @@ mod tests {
             end = save.offset + width;
         }
         assert!(allocation.frame.stack_size >= end);
+    }
+
+    #[test]
+    fn read_only_nonvolatile_captures_do_not_allocate_saves() {
+        for ty in [IrType::I8, IrType::I16, IrType::I32, IrType::I64] {
+            let xmm_ty = if matches!(ty, IrType::I8 | IrType::I16) {
+                IrType::I32
+            } else {
+                ty
+            };
+            let func = function(vec![
+                inst(0, IrOp::Undef, &[], ty),
+                inst(1, IrOp::Undef, &[], xmm_ty),
+                inst(2, IrOp::Copy, &[0], ty),
+                inst(3, IrOp::Copy, &[1], xmm_ty),
+                used(&[2, 3]),
+            ]);
+            let allocation = allocate(
+                &func,
+                &HashMap::from([
+                    (ValueId(0), PhysReg::Gpr(Gpr::Rbx)),
+                    (ValueId(1), PhysReg::Xmm(XmmReg::Xmm6)),
+                ]),
+            );
+            assert!(allocation.frame.saves.is_empty(), "read-only {ty:?}");
+            assert_eq!(allocation.homes[&ValueId(0)].ty, ty);
+            assert_eq!(allocation.homes[&ValueId(1)].ty, xmm_ty);
+        }
+        let func = function(vec![
+            inst(0, IrOp::Undef, &[], IrType::I128),
+            inst(1, IrOp::Copy, &[0], IrType::I128),
+            used(&[1]),
+        ]);
+        let allocation = allocate(
+            &func,
+            &HashMap::from([(ValueId(0), PhysReg::Xmm(XmmReg::Xmm6))]),
+        );
+        assert!(allocation.frame.saves.is_empty());
+        assert_eq!(allocation.homes[&ValueId(0)].ty, IrType::I128);
+    }
+
+    #[test]
+    fn nonvolatile_saves_cover_boundary_reloads_results_clobbers_and_outputs() {
+        #[derive(Clone, Copy, Debug)]
+        enum Boundary {
+            NativeRead,
+            NativeWrite,
+            CallArgument,
+            IndirectCallArgument,
+            CallClobber,
+            CallResult,
+            Output,
+        }
+        let rbx = PhysReg::Gpr(Gpr::Rbx);
+        let xmm6 = PhysReg::Xmm(XmmReg::Xmm6);
+        for boundary in [
+            Boundary::NativeRead,
+            Boundary::NativeWrite,
+            Boundary::CallArgument,
+            Boundary::IndirectCallArgument,
+            Boundary::CallClobber,
+            Boundary::CallResult,
+            Boundary::Output,
+        ] {
+            let mut insts = vec![
+                inst(0, IrOp::Undef, &[], IrType::I64),
+                inst(1, IrOp::Undef, &[], IrType::I128),
+            ];
+            match boundary {
+                Boundary::NativeRead => insts.push(native(vec![rbx, xmm6], vec![], &[0, 1])),
+                Boundary::NativeWrite => insts.push(native(vec![], vec![rbx, xmm6], &[])),
+                Boundary::CallArgument => {
+                    let mut boundary = call();
+                    boundary.args = vec![ValueId(0), ValueId(1)];
+                    insts.push(boundary);
+                }
+                Boundary::IndirectCallArgument => {
+                    insts.push(inst(4, IrOp::Const(0x140002000), &[], IrType::I64));
+                    insts.push(Inst {
+                        dest: None,
+                        op: IrOp::CallIndirect {
+                            clobbers: kamy_core::ir::win64_volatiles(),
+                        },
+                        args: vec![ValueId(4), ValueId(0), ValueId(1)],
+                        ty: IrType::I64,
+                    });
+                }
+                Boundary::CallClobber => {
+                    let mut boundary = call();
+                    if let IrOp::Call { clobbers, .. } = &mut boundary.op {
+                        clobbers.extend([rbx, xmm6]);
+                    }
+                    insts.push(boundary);
+                }
+                Boundary::CallResult => {
+                    insts.push(call());
+                    // Even unused result projections describe physical writes.
+                    insts.push(inst(4, IrOp::CallResult { register: rbx }, &[], IrType::I8));
+                    insts.push(inst(
+                        5,
+                        IrOp::CallResult { register: xmm6 },
+                        &[],
+                        IrType::I32,
+                    ));
+                }
+                Boundary::Output => insts.push(used(&[0, 1])),
+            }
+            insts.extend([
+                inst(2, IrOp::Copy, &[0], IrType::I64),
+                inst(3, IrOp::Copy, &[1], IrType::I128),
+                used(&[2, 3]),
+            ]);
+            let allocation = allocate(
+                &function(insts),
+                &HashMap::from([(ValueId(0), rbx), (ValueId(1), xmm6)]),
+            );
+            let saved: Vec<_> = allocation
+                .frame
+                .saves
+                .iter()
+                .map(|save| save.register)
+                .collect();
+            assert_eq!(saved, [rbx, xmm6], "{boundary:?}");
+            assert_eq!(allocation.frame.saves[0].offset % 8, 0);
+            assert_eq!(allocation.frame.saves[1].offset % 16, 0);
+            assert!(allocation.frame.saves[1].offset >= allocation.frame.saves[0].offset + 8);
+            assert!(allocation.frame.stack_size >= allocation.frame.saves[1].offset + 16);
+        }
     }
 
     #[test]

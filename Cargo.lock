@@ -283,7 +283,9 @@ dependencies = [
  "anyhow",
  "iced-x86",
  "kamy-core",
+ "kamy-seh",
  "tracing",
+ "windows",
 ]
 
 [[package]]
