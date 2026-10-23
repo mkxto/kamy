@@ -439,6 +439,542 @@ fn full_link_mba_preserves_phi_pointer_differences_and_comparisons() {
     }
 }
 
+fn selected_coordinates(
+    condition: Option<u64>,
+    branch: bool,
+    nested: bool,
+    incoming_first: bool,
+    arithmetic_first: bool,
+    overlap_store: bool,
+) -> Vec<u8> {
+    use Register::*;
+    let mut code = vec![Instruction::with2(Code::Sub_rm64_imm8, RSP, 24i32).unwrap()];
+    if let Some(condition) = condition {
+        code.push(Instruction::with2(Code::Mov_r64_imm64, RCX, condition).unwrap());
+    }
+    // Initialize both LOW objects from the real incoming arguments, independently of selection.
+    for (source, destination) in [(64, 8), (72, 16)] {
+        code.push(Instruction::with2(Code::Mov_r64_rm64, R10, slot(source)).unwrap());
+        code.push(Instruction::with2(Code::Mov_rm64_r64, slot(destination), R10).unwrap());
+    }
+    let start = if incoming_first { 64 } else { 8 };
+    code.push(Instruction::with2(Code::Lea_r64_m, RAX, slot(start)).unwrap());
+    code.push(Instruction::with2(Code::Lea_r64_m, RDX, slot(start + 8)).unwrap());
+    let shift = if incoming_first { -56 } else { 56 };
+    if arithmetic_first {
+        for register in [RAX, RDX] {
+            code.push(Instruction::with2(Code::Add_rm64_imm8, register, shift).unwrap());
+        }
+    }
+    code.push(Instruction::with2(Code::Test_rm64_r64, RCX, RCX).unwrap());
+    if branch {
+        let landing = code.len() + 2;
+        code.push(Instruction::with_branch(Code::Je_rel32_64, instruction_label(landing)).unwrap());
+        code.push(Instruction::with2(Code::Mov_r64_rm64, RAX, RDX).unwrap());
+    } else {
+        code.push(Instruction::with2(Code::Cmovne_r64_rm64, RAX, RDX).unwrap());
+    }
+    if nested {
+        code.push(Instruction::with2(Code::Mov_r64_rm64, R11, RAX).unwrap());
+        let first = start
+            + if arithmetic_first {
+                i64::from(shift)
+            } else {
+                0
+            };
+        code.push(Instruction::with2(Code::Lea_r64_m, R10, slot(first)).unwrap());
+        code.push(Instruction::with2(Code::Test_rm64_r64, RCX, RCX).unwrap());
+        code.push(Instruction::with2(Code::Cmove_r64_rm64, R11, R10).unwrap());
+        code.push(Instruction::with2(Code::Mov_r64_rm64, RAX, R11).unwrap());
+    }
+    if !arithmetic_first {
+        code.push(Instruction::with2(Code::Add_rm64_imm8, RAX, shift).unwrap());
+    }
+    if overlap_store {
+        code.push(
+            Instruction::with2(Code::Mov_r64_rm64, R10, MemoryOperand::with_base(RAX)).unwrap(),
+        );
+        code.push(
+            Instruction::with2(Code::Mov_rm64_r64, MemoryOperand::with_base(RAX), R10).unwrap(),
+        );
+        code.push(
+            Instruction::with2(
+                Code::Mov_rm32_imm32,
+                MemoryOperand::with_base_displ(RAX, 4),
+                0xaabb_ccddu32,
+            )
+            .unwrap(),
+        );
+    }
+    code.extend([
+        Instruction::with2(Code::Mov_r64_rm64, RAX, MemoryOperand::with_base(RAX)).unwrap(),
+        // A scalar payload forces genuine requested MBA, rather than only pointer rematerialization.
+        Instruction::with2(Code::Add_rm64_imm8, RAX, 7i32).unwrap(),
+        Instruction::with2(Code::Add_rm64_imm8, RSP, 24i32).unwrap(),
+        Instruction::with(Code::Retnq),
+    ]);
+    encode(ENTRY, code)
+}
+
+fn mixed_zone_selected_coordinates() -> Vec<u8> {
+    use Register::*;
+    encode(
+        ENTRY,
+        vec![
+            Instruction::with2(Code::Sub_rm64_imm8, RSP, 24i32).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, R10, slot(64)).unwrap(),
+            Instruction::with2(Code::Mov_rm64_r64, slot(0), R10).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, R10, slot(72)).unwrap(),
+            Instruction::with2(Code::Mov_rm64_r64, slot(64), R10).unwrap(),
+            Instruction::with2(Code::Lea_r64_m, RAX, slot(8)).unwrap(),
+            Instruction::with2(Code::Lea_r64_m, RDX, slot(72)).unwrap(),
+            Instruction::with2(Code::Test_rm64_r64, RCX, RCX).unwrap(),
+            Instruction::with2(Code::Cmovne_r64_rm64, RAX, RDX).unwrap(),
+            Instruction::with2(Code::Sub_rm64_imm8, RAX, 8i32).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, RAX, MemoryOperand::with_base(RAX)).unwrap(),
+            Instruction::with2(Code::Add_rm64_imm8, RAX, 7i32).unwrap(),
+            Instruction::with2(Code::Add_rm64_imm8, RSP, 24i32).unwrap(),
+            Instruction::with(Code::Retnq),
+        ],
+    )
+}
+
+#[test]
+fn finite_select_phi_coordinates_execute_in_identity_and_requested_mba() {
+    let cases = [
+        ("select", None, false, false, false, false, false),
+        ("select-zero", Some(0), false, false, false, false, false),
+        ("select-one", Some(1), false, false, false, false, false),
+        ("phi", None, true, false, false, false, false),
+        ("nested-copy", None, false, true, false, false, false),
+        ("arithmetic-before", None, false, false, false, true, false),
+        ("incoming-to-low", None, false, false, true, false, false),
+        ("phi-incoming-to-low", None, true, true, true, false, false),
+        (
+            "incoming-overlap-store",
+            None,
+            false,
+            true,
+            false,
+            false,
+            true,
+        ),
+        ("low-overlap-store", None, true, false, true, false, true),
+    ];
+    let cases = cases
+        .into_iter()
+        .map(
+            |(name, constant, branch, nested, incoming, arithmetic_first, overlap)| {
+                (
+                    name,
+                    selected_coordinates(
+                        constant,
+                        branch,
+                        nested,
+                        incoming,
+                        arithmetic_first,
+                        overlap,
+                    ),
+                    constant,
+                    overlap,
+                )
+            },
+        )
+        .chain(std::iter::once((
+            "mixed-zones",
+            mixed_zone_selected_coordinates(),
+            None,
+            false,
+        )));
+    for (name, code, constant, overlap) in cases {
+        let original = fixture(&[(ENTRY, code)]);
+        for mba in [false, true] {
+            let (lowered, report) = protect(&original, &[ENTRY], mba, true);
+            retain(
+                &format!("select-{name}-{}", if mba { "mba" } else { "identity" }),
+                &original,
+                &lowered,
+            );
+            assert!(report.rejected.is_empty(), "{name}: {:?}", report.rejected);
+            let symbol = SymbolId::Host {
+                rva: Rva::new(ENTRY),
+            };
+            assert!(report.ssa_lowered_symbols.contains(&symbol), "{name}");
+            let function = report
+                .functions
+                .iter()
+                .find(|function| function.symbol == symbol)
+                .unwrap();
+            assert_eq!(function.transformed, mba, "{name}");
+            assert_eq!(function.intensity, if mba { 1.0 } else { 0.0 }, "{name}");
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            {
+                let input = native::MappedImage::new(&original);
+                let output = native::MappedImage::new(&lowered);
+                let before: unsafe extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                    unsafe { core::mem::transmute(input.at(Rva::new(ENTRY))) };
+                let after: unsafe extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                    unsafe { core::mem::transmute(output.at(report.address_map[&symbol])) };
+                for condition in [0, 1, 7] {
+                    let e = 0x1122_3344_5566_7788u64;
+                    let f = 0x8877_6655_4433_2211u64;
+                    let selected = if constant.unwrap_or(condition) == 0 {
+                        e
+                    } else {
+                        f
+                    };
+                    let expected = if overlap {
+                        (selected & 0xffff_ffff) | 0xaabb_ccdd_0000_0000
+                    } else {
+                        selected
+                    }
+                    .wrapping_add(7);
+                    assert_eq!(
+                        unsafe { before(condition, 0, 0, 0, e, f) },
+                        expected,
+                        "original {name}"
+                    );
+                    assert_eq!(
+                        unsafe { after(condition, 0, 0, 0, e, f) },
+                        expected,
+                        "{name} mba={mba}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_frame_index_proof_survives_requested_mba_and_final_zone_crossing() {
+    use Register::*;
+    for constant_first in [false, true] {
+        let mut code = vec![
+            Instruction::with2(Code::Sub_rm64_imm8, RSP, 24i32).unwrap(),
+            Instruction::with2(Code::Lea_r64_m, RAX, slot(8)).unwrap(),
+            Instruction::with2(Code::Lea_r64_m, RDX, slot(16)).unwrap(),
+            Instruction::with2(Code::Test_rm64_r64, RCX, RCX).unwrap(),
+            Instruction::with2(Code::Cmovne_r64_rm64, RAX, RDX).unwrap(),
+            Instruction::with2(Code::And_rm64_imm8, R8, 7i32).unwrap(),
+        ];
+        let constant = Instruction::with2(Code::Add_rm64_imm8, RAX, 56i32).unwrap();
+        let index = Instruction::with2(Code::Add_rm64_r64, RAX, R8).unwrap();
+        code.extend(if constant_first {
+            [constant, index]
+        } else {
+            [index, constant]
+        });
+        code.extend([
+            Instruction::with2(Code::Movzx_r32_rm8, EAX, MemoryOperand::with_base(RAX)).unwrap(),
+            Instruction::with2(Code::Add_rm64_imm8, RAX, 7i32).unwrap(),
+            Instruction::with2(Code::Add_rm64_imm8, RSP, 24i32).unwrap(),
+            Instruction::with(Code::Retnq),
+        ]);
+        let original = fixture(&[(ENTRY, encode(ENTRY, code))]);
+        for mba in [false, true] {
+            let (lowered, report) = protect(&original, &[ENTRY], mba, true);
+            retain(
+                &format!("select-index-constant-first-{constant_first}-mba-{mba}"),
+                &original,
+                &lowered,
+            );
+            assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+            let symbol = SymbolId::Host {
+                rva: Rva::new(ENTRY),
+            };
+            assert!(report.ssa_lowered_symbols.contains(&symbol));
+            let function = report
+                .functions
+                .iter()
+                .find(|function| function.symbol == symbol)
+                .unwrap();
+            assert_eq!(function.transformed, mba);
+            assert_eq!(function.intensity, if mba { 1.0 } else { 0.0 });
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            {
+                let input = native::MappedImage::new(&original);
+                let output = native::MappedImage::new(&lowered);
+                let before: unsafe extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                    unsafe { core::mem::transmute(input.at(Rva::new(ENTRY))) };
+                let after: unsafe extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                    unsafe { core::mem::transmute(output.at(report.address_map[&symbol])) };
+                for condition in [0, 1] {
+                    for index in 0..8 {
+                        let e = 0x1122_3344_5566_7788u64;
+                        let f = 0x8877_6655_4433_2211u64;
+                        let selected = if condition == 0 { e } else { f };
+                        let expected = u64::from(selected.to_le_bytes()[index as usize]) + 7;
+                        assert_eq!(unsafe { before(condition, 0, index, 0, e, f) }, expected);
+                        assert_eq!(unsafe { after(condition, 0, index, 0, e, f) }, expected);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_frame_alternatives_split_final_zones_without_invented_crossing() {
+    use Register::*;
+    let original = fixture(&[(
+        ENTRY,
+        encode(
+            ENTRY,
+            vec![
+                Instruction::with2(Code::Sub_rm64_imm8, RSP, 40i32).unwrap(),
+                // Initialize E-8 and E+8 from independent fifth and sixth Win64 arguments.
+                Instruction::with2(Code::Mov_r64_rm64, R10, slot(80)).unwrap(),
+                Instruction::with2(Code::Mov_rm64_r64, slot(32), R10).unwrap(),
+                Instruction::with2(Code::Mov_r64_rm64, R10, slot(88)).unwrap(),
+                Instruction::with2(Code::Mov_rm64_r64, slot(48), R10).unwrap(),
+                // Select E-32 or E-16 before shifting: the only final addresses are E-8/E+8.
+                // Each eight-byte access is valid; no access starts between these alternatives.
+                Instruction::with2(Code::Lea_r64_m, RAX, slot(8)).unwrap(),
+                Instruction::with2(Code::Lea_r64_m, RDX, slot(24)).unwrap(),
+                Instruction::with2(Code::Test_rm64_r64, RCX, RCX).unwrap(),
+                Instruction::with2(Code::Cmovne_r64_rm64, RAX, RDX).unwrap(),
+                Instruction::with2(Code::Add_rm64_imm8, RAX, 24i32).unwrap(),
+                Instruction::with2(Code::Mov_r64_rm64, RAX, MemoryOperand::with_base(RAX)).unwrap(),
+                // Keep genuine scalar MBA work without changing the exact ledger witness below.
+                Instruction::with2(Code::Add_rm64_imm8, RAX, 7i32).unwrap(),
+                Instruction::with2(Code::Add_rm64_imm8, RSP, 40i32).unwrap(),
+                Instruction::with(Code::Retnq),
+            ],
+        ),
+    )]);
+    for mba in [false, true] {
+        let (lowered, report) = protect(&original, &[ENTRY], mba, true);
+        retain(
+            if mba {
+                "select-split-final-zones-mba"
+            } else {
+                "select-split-final-zones-identity"
+            },
+            &original,
+            &lowered,
+        );
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        let symbol = SymbolId::Host {
+            rva: Rva::new(ENTRY),
+        };
+        assert!(report.ssa_lowered_symbols.contains(&symbol));
+        let function = report
+            .functions
+            .iter()
+            .find(|function| function.symbol == symbol)
+            .unwrap();
+        assert!(function.selected && function.eligible && function.lowered);
+        assert_eq!(function.transformed, mba);
+        assert_eq!(function.intensity, if mba { 1.0 } else { 0.0 });
+        assert_eq!(
+            report
+                .functions
+                .iter()
+                .filter(|function| function.transformed)
+                .count(),
+            usize::from(mba),
+            "requested MBA must transform the selected body, not silently fall back"
+        );
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            let input = native::MappedImage::new(&original);
+            let output = native::MappedImage::new(&lowered);
+            let before: unsafe extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                unsafe { core::mem::transmute(input.at(Rva::new(ENTRY))) };
+            let after: unsafe extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                unsafe { core::mem::transmute(output.at(report.address_map[&symbol])) };
+            for (fifth, sixth) in [
+                (0x1122_3344_5566_7788u64, 0x8877_6655_4433_2211u64),
+                (u64::MAX - 3, 0x1020_3040_5060_7080),
+            ] {
+                for condition in [0, 1, 7] {
+                    let selected = if condition == 0 { fifth } else { sixth };
+                    let expected = selected.wrapping_add(7);
+                    assert_eq!(
+                        unsafe { before(condition, 0, 0, 0, fifth, sixth) },
+                        expected,
+                        "original condition={condition}"
+                    );
+                    assert_eq!(
+                        unsafe { after(condition, 0, 0, 0, fifth, sixth) },
+                        expected,
+                        "protected condition={condition} mba={mba}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn exact_six_argument_select_ledger_witness_lowers_in_both_profiles() {
+    use Register::*;
+    let original = fixture(&[(
+        ENTRY,
+        encode(
+            ENTRY,
+            vec![
+                Instruction::with2(Code::Sub_rm64_imm8, RSP, 24i32).unwrap(),
+                Instruction::with2(Code::Lea_r64_m, RAX, slot(8)).unwrap(),
+                Instruction::with2(Code::Lea_r64_m, RDX, slot(16)).unwrap(),
+                Instruction::with2(Code::Test_rm64_r64, RCX, RCX).unwrap(),
+                Instruction::with2(Code::Cmovne_r64_rm64, RAX, RDX).unwrap(),
+                Instruction::with2(Code::Add_rm64_imm8, RAX, 56i32).unwrap(),
+                Instruction::with2(Code::Mov_r64_rm64, RAX, MemoryOperand::with_base(RAX)).unwrap(),
+                Instruction::with2(Code::Add_rm64_imm8, RSP, 24i32).unwrap(),
+                Instruction::with(Code::Retnq),
+            ],
+        ),
+    )]);
+    for mba in [false, true] {
+        let (lowered, report) = protect(&original, &[ENTRY], mba, true);
+        retain(
+            if mba {
+                "select-ledger-mba"
+            } else {
+                "select-ledger-identity"
+            },
+            &original,
+            &lowered,
+        );
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        let symbol = SymbolId::Host {
+            rva: Rva::new(ENTRY),
+        };
+        assert!(report.ssa_lowered_symbols.contains(&symbol));
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            let input = native::MappedImage::new(&original);
+            let output = native::MappedImage::new(&lowered);
+            let before: unsafe extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                unsafe { core::mem::transmute(input.at(Rva::new(ENTRY))) };
+            let after: unsafe extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                unsafe { core::mem::transmute(output.at(report.address_map[&symbol])) };
+            for (condition, expected) in [(0, 0x1122_3344_5566_7788), (1, 0x8877_6655_4433_2211)] {
+                assert_eq!(
+                    unsafe {
+                        before(
+                            condition,
+                            0,
+                            0,
+                            0,
+                            0x1122_3344_5566_7788,
+                            0x8877_6655_4433_2211,
+                        )
+                    },
+                    expected
+                );
+                assert_eq!(
+                    unsafe {
+                        after(
+                            condition,
+                            0,
+                            0,
+                            0,
+                            0x1122_3344_5566_7788,
+                            0x8877_6655_4433_2211,
+                        )
+                    },
+                    expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_frame_flags_and_successive_call_results_compose() {
+    use Register::*;
+    let caller = encode(
+        ENTRY,
+        vec![
+            Instruction::with2(Code::Sub_rm64_imm8, RSP, 72i32).unwrap(),
+            Instruction::with_branch(Code::Call_rel32_64, BASE + u64::from(TOUCH)).unwrap(),
+            Instruction::with2(Code::Sub_rm64_imm8, RAX, 7i32).unwrap(),
+            Instruction::with2(Code::Test_rm64_r64, RAX, RAX).unwrap(),
+            Instruction::with2(Code::Lea_r64_m, RAX, slot(40)).unwrap(),
+            Instruction::with2(Code::Lea_r64_m, RDX, slot(48)).unwrap(),
+            Instruction::with2(Code::Cmovne_r64_rm64, RAX, RDX).unwrap(),
+            Instruction::with2(Code::Add_rm64_imm8, RAX, 72i32).unwrap(),
+            Instruction::with2(Code::Mov_r64_rm64, R10, MemoryOperand::with_base(RAX)).unwrap(),
+            Instruction::with2(Code::Mov_rm64_r64, slot(48), R10).unwrap(),
+            Instruction::with2(Code::Mov_r64_imm64, RCX, 0u64).unwrap(),
+            Instruction::with_branch(Code::Call_rel32_64, BASE + u64::from(TOUCH)).unwrap(),
+            Instruction::with2(Code::Add_r64_rm64, RAX, slot(48)).unwrap(),
+            Instruction::with2(Code::Add_rm64_imm8, RSP, 72i32).unwrap(),
+            Instruction::with(Code::Retnq),
+        ],
+    );
+    let callee = encode(
+        TOUCH,
+        vec![
+            Instruction::with2(Code::Mov_r64_rm64, RAX, RCX).unwrap(),
+            Instruction::with2(Code::Add_rm64_imm8, RAX, 7i32).unwrap(),
+            Instruction::with(Code::Retnq),
+        ],
+    );
+    let original = fixture(&[(ENTRY, caller), (TOUCH, callee)]);
+    for mba in [false, true] {
+        let (lowered, report) = protect(&original, &[ENTRY, TOUCH], mba, true);
+        retain(
+            if mba {
+                "select-calls-mba"
+            } else {
+                "select-calls-identity"
+            },
+            &original,
+            &lowered,
+        );
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        for entry in [ENTRY, TOUCH] {
+            assert!(report.ssa_lowered_symbols.contains(&SymbolId::Host {
+                rva: Rva::new(entry)
+            }));
+        }
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            let input = native::MappedImage::new(&original);
+            let output = native::MappedImage::new(&lowered);
+            let before: unsafe extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                unsafe { core::mem::transmute(input.at(Rva::new(ENTRY))) };
+            let after: unsafe extern "system" fn(u64, u64, u64, u64, u64, u64) -> u64 = unsafe {
+                core::mem::transmute(output.at(report.address_map[&SymbolId::Host {
+                    rva: Rva::new(ENTRY),
+                }]))
+            };
+            for (condition, expected) in [(0, 0x1122_3344_5566_778fu64), (1, 0x8877_6655_4433_2218)]
+            {
+                assert_eq!(
+                    unsafe {
+                        before(
+                            condition,
+                            0,
+                            0,
+                            0,
+                            0x1122_3344_5566_7788,
+                            0x8877_6655_4433_2211,
+                        )
+                    },
+                    expected
+                );
+                assert_eq!(
+                    unsafe {
+                        after(
+                            condition,
+                            0,
+                            0,
+                            0,
+                            0x1122_3344_5566_7788,
+                            0x8877_6655_4433_2211,
+                        )
+                    },
+                    expected
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn full_link_self_recursion_preserves_live_original_locals() {
     let original = fixture(&[(ENTRY, vec![0xc3]), (RECURSIVE, recursive())]);

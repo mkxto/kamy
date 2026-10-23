@@ -30,6 +30,8 @@ pub struct FrameSave {
     pub offset: u32,
 }
 
+/// Conservative entry-RSP intervals, not an enumeration of feasible starts.
+/// Select/Phi definitions retain alternatives when gaps matter to access safety.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FramePointerBounds {
     pub negative: Option<(i64, i64)>,
@@ -209,6 +211,21 @@ impl Definition<'_> {
                         Fact::Scalar(Some(*offset as u64)),
                         false,
                     ),
+                    IrOp::Select if inst.args.len() == 3 => {
+                        let fact = match get(&inst.args[0]) {
+                            // An unevaluated condition is bottom, not a runtime choice.
+                            Fact::Unknown => Fact::Unknown,
+                            Fact::Scalar(Some(0)) => get(&inst.args[2]),
+                            Fact::Scalar(Some(_)) => get(&inst.args[1]),
+                            _ => get(&inst.args[1]).merge(get(&inst.args[2])),
+                        };
+                        match fact {
+                            Fact::Offset(_) | Fact::Conflict if inst.ty != IrType::I64 => {
+                                Fact::Variable
+                            }
+                            fact => fact,
+                        }
+                    }
                     IrOp::Copy | IrOp::Zext | IrOp::Trunc | IrOp::Sext if inst.args.len() == 1 => {
                         match get(&inst.args[0]) {
                             Fact::Scalar(Some(value)) => {
@@ -346,9 +363,13 @@ fn relative_frame_offset(
 struct AccessScratch {
     pending: Vec<(ValueId, i64, bool)>,
     active: HashMap<ValueId, i64>,
+    // Query-local completed traversals, not proofs reusable across roots or extents.
+    completed: HashSet<(ValueId, i64)>,
     unknown: bool,
     bounds: FramePointerBounds,
     proven: HashMap<ValueId, FramePointerBounds>,
+    #[cfg(test)]
+    visits: usize,
 }
 
 fn check_access(
@@ -362,39 +383,48 @@ fn check_access(
 ) -> Result<(), RejectionReason> {
     scratch.pending.clear();
     scratch.active.clear();
+    scratch.completed.clear();
+    #[cfg(test)]
+    {
+        scratch.visits = 0;
+    }
     scratch.unknown = false;
     scratch.bounds = FramePointerBounds::default();
     scratch.pending.push((value, 0, false));
     while let Some((value, adjustment, exiting)) = scratch.pending.pop() {
+        #[cfg(test)]
+        {
+            scratch.visits += 1;
+        }
         if exiting {
             scratch.active.remove(&value);
+            scratch.completed.insert((value, adjustment));
+            continue;
+        }
+        if let Some(previous) = scratch.active.get(&value) {
+            if *previous == adjustment {
+                continue;
+            }
+            return Err(RejectionReason::FrameDynamic);
+        }
+        if scratch.completed.contains(&(value, adjustment)) {
             continue;
         }
         let fact = facts.get(&value).copied().unwrap_or(Fact::Unknown);
+        let mut interval_conflict = false;
         if let Some(bounds) = scratch.proven.get(&value).copied() {
-            for (low, high) in [bounds.negative, bounds.incoming].into_iter().flatten() {
-                let start = low
-                    .checked_add(adjustment)
-                    .ok_or(RejectionReason::FrameOverflow)?;
-                let last = high
-                    .checked_add(adjustment)
-                    .ok_or(RejectionReason::FrameOverflow)?;
-                let end = last
-                    .checked_add(extent)
-                    .ok_or(RejectionReason::FrameOverflow)?;
-                i32::try_from(start).map_err(|_| RejectionReason::FrameOverflow)?;
-                i32::try_from(end).map_err(|_| RejectionReason::FrameOverflow)?;
-                if (low < 0) != (start < 0) || (high < 0) != (last < 0) {
-                    return Err(RejectionReason::FrameDynamic);
+            if let Some(bounds) = index::access_bounds(bounds, adjustment, extent)? {
+                for (low, high) in [bounds.negative, bounds.incoming].into_iter().flatten() {
+                    *minimum = (*minimum).min(low);
+                    scratch.bounds.observe(low);
+                    scratch.bounds.observe(high);
                 }
-                if start < 0 && end >= 0 {
-                    return Err(RejectionReason::FrameConflict);
-                }
-                *minimum = (*minimum).min(start);
-                scratch.bounds.observe(start);
-                scratch.bounds.observe(last);
+                scratch.completed.insert((value, adjustment));
+                continue;
             }
-            continue;
+            // No scratch state was committed by the failed certificate. The
+            // original alternatives, not invented interval points, decide.
+            interval_conflict = true;
         }
         if let Fact::Offset(delta) = fact {
             let start = delta
@@ -405,35 +435,33 @@ fn check_access(
                 .ok_or(RejectionReason::FrameOverflow)?;
             i32::try_from(start).map_err(|_| RejectionReason::FrameOverflow)?;
             i32::try_from(end).map_err(|_| RejectionReason::FrameOverflow)?;
-            if (delta < 0) != (start < 0) {
-                return Err(RejectionReason::FrameDynamic);
-            }
             if start < 0 && end >= 0 {
                 return Err(RejectionReason::FrameConflict);
             }
             *minimum = (*minimum).min(start);
             scratch.bounds.observe(start);
+            scratch.completed.insert((value, adjustment));
             continue;
         }
         match fact {
-            Fact::Variable => return Err(RejectionReason::FrameDynamic),
+            Fact::Variable if !interval_conflict => return Err(RejectionReason::FrameDynamic),
             Fact::Overflow => return Err(RejectionReason::FrameOverflow),
-            Fact::Conflict => {}
+            Fact::Conflict | Fact::Variable => {}
             _ => {
                 scratch.unknown = true;
+                scratch.completed.insert((value, adjustment));
                 continue;
             }
         }
-        if let Some(previous) = scratch.active.get(&value) {
-            if *previous == adjustment {
-                continue;
-            }
-            return Err(RejectionReason::FrameDynamic);
-        }
+        let unsupported = if interval_conflict {
+            RejectionReason::FrameConflict
+        } else {
+            RejectionReason::FrameDynamic
+        };
         scratch.active.insert(value, adjustment);
         scratch.pending.push((value, adjustment, true));
         match definitions.get(&value).copied() {
-            Some(Definition::Phi(phi)) => {
+            Some(Definition::Phi(phi)) if phi.ty == IrType::I64 => {
                 scratch.pending.extend(
                     phi.args
                         .iter()
@@ -441,18 +469,42 @@ fn check_access(
                         .map(|(_, arg)| (*arg, adjustment, false)),
                 );
             }
-            Some(Definition::Inst(inst)) if matches!(inst.op, IrOp::Copy) => {
-                scratch.pending.push((inst.args[0], adjustment, false));
+            Some(Definition::Inst(inst))
+                if inst.ty == IrType::I64 && matches!(inst.op, IrOp::Copy) =>
+            {
+                let [source] = inst.args.as_slice() else {
+                    return Err(RejectionReason::FrameDynamic);
+                };
+                scratch.pending.push((*source, adjustment, false));
             }
-            Some(Definition::Inst(inst)) => {
-                let (input, offset) =
-                    relative_frame_offset(inst, facts)?.ok_or(RejectionReason::FrameDynamic)?;
+            Some(Definition::Inst(inst))
+                if inst.ty == IrType::I64 && matches!(inst.op, IrOp::Select) =>
+            {
+                let [condition, yes, no] = inst.args.as_slice() else {
+                    return Err(RejectionReason::FrameDynamic);
+                };
+                match facts.get(condition) {
+                    None | Some(Fact::Unknown) => scratch.unknown = true,
+                    Some(Fact::Scalar(Some(0))) => {
+                        scratch.pending.push((*no, adjustment, false));
+                    }
+                    Some(Fact::Scalar(Some(_))) => {
+                        scratch.pending.push((*yes, adjustment, false));
+                    }
+                    _ => {
+                        scratch.pending.push((*yes, adjustment, false));
+                        scratch.pending.push((*no, adjustment, false));
+                    }
+                }
+            }
+            Some(Definition::Inst(inst)) if inst.ty == IrType::I64 => {
+                let (input, offset) = relative_frame_offset(inst, facts)?.ok_or(unsupported)?;
                 let adjustment = adjustment
                     .checked_add(offset)
                     .ok_or(RejectionReason::FrameOverflow)?;
                 scratch.pending.push((input, adjustment, false));
             }
-            _ => return Err(RejectionReason::FrameDynamic),
+            _ => return Err(unsupported),
         }
     }
     Ok(())
@@ -656,6 +708,15 @@ impl FrameAnalysis {
             let proof = match definition {
                 Definition::Phi(phi) => {
                     index::phi(phi, &facts, &analysis.pointer_bounds, &reachable).map(|bounds| {
+                        index::PointerProof {
+                            bounds,
+                            indexed: None,
+                            relative: None,
+                        }
+                    })
+                }
+                Definition::Inst(inst) if matches!(inst.op, IrOp::Select) => {
+                    index::select(inst, &facts, &analysis.pointer_bounds).map(|bounds| {
                         index::PointerProof {
                             bounds,
                             indexed: None,
@@ -966,6 +1027,21 @@ mod tests {
             &rsp.iter().map(|value| ValueId(*value)).collect(),
             &HashMap::new(),
         )
+    }
+
+    fn access_definitions(func: &IrFunction) -> HashMap<ValueId, Definition<'_>> {
+        let mut definitions = HashMap::new();
+        for block in &func.blocks {
+            for phi in &block.phis {
+                definitions.insert(phi.dest, Definition::Phi(phi));
+            }
+            for inst in &block.insts {
+                if let Some(dest) = inst.dest {
+                    definitions.insert(dest, Definition::Inst(inst));
+                }
+            }
+        }
+        definitions
     }
 
     #[test]
@@ -1402,6 +1478,804 @@ mod tests {
                     }
                 }
             );
+        }
+    }
+
+    #[test]
+    fn select_copy_and_phi_arithmetic_preserve_final_frame_coordinates() {
+        for displacement in [0, 56, -32] {
+            let mut func = pointer_phi(displacement);
+            func.blocks[3]
+                .insts
+                .insert(0, inst(8, IrOp::Select, &[2, 3, 1]));
+            func.blocks[3].insts[1].args = vec![ValueId(8)];
+            let analysis = analyze(&func, &[]).unwrap();
+            let expected = index::from_interval(-16 + displacement, -8 + displacement).unwrap();
+            assert_eq!(analysis.pointer_bounds[&ValueId(6)], expected);
+            assert_eq!(
+                analysis.pointer_bounds[&ValueId(8)].negative,
+                Some((-16, -8))
+            );
+            assert_eq!(
+                analysis.derived_offsets[&ValueId(6)],
+                (ValueId(4), displacement)
+            );
+        }
+    }
+
+    #[test]
+    fn nested_selects_shift_across_both_frame_zones() {
+        let func = function(vec![
+            inst(0, IrOp::FrameAddress(-16), &[]),
+            inst(1, IrOp::FrameAddress(-8), &[]),
+            inst(2, IrOp::Undef, &[]),
+            inst(3, IrOp::Select, &[2, 1, 0]),
+            inst(4, IrOp::Copy, &[3]),
+            inst(5, IrOp::FrameOffset(56), &[4]),
+            inst(6, IrOp::Select, &[2, 5, 4]),
+            inst(7, IrOp::FrameOffset(-32), &[6]),
+            inst(8, IrOp::Load, &[7]),
+        ]);
+        let analysis = analyze(&func, &[]).unwrap();
+        assert_eq!(
+            analysis.pointer_bounds[&ValueId(5)].incoming,
+            Some((40, 48))
+        );
+        assert_eq!(
+            analysis.pointer_bounds[&ValueId(7)],
+            FramePointerBounds {
+                negative: Some((-48, -40)),
+                incoming: Some((8, 16)),
+            }
+        );
+        assert_eq!(analysis.derived_offsets[&ValueId(7)], (ValueId(6), -32));
+    }
+
+    #[test]
+    fn shared_select_dag_feeding_phi_has_linear_access_work() {
+        const LAYERS: u32 = 64;
+        let mut func = function(vec![
+            inst(0, IrOp::FrameAddress(-8), &[]),
+            inst(1, IrOp::FrameAddress(-16), &[]),
+            inst(2, IrOp::Undef, &[]),
+            inst(3, IrOp::Undef, &[]),
+        ]);
+        let mut facts = HashMap::from([
+            (ValueId(0), Fact::Offset(-8)),
+            (ValueId(1), Fact::Offset(-16)),
+            (ValueId(2), Fact::Scalar(None)),
+            (ValueId(3), Fact::Scalar(None)),
+        ]);
+        let mut previous = [0, 1];
+        let mut next = 4;
+        for _ in 0..LAYERS {
+            let current = [next, next + 1];
+            for (condition, dest) in [2, 3].into_iter().zip(current) {
+                func.blocks[0].insts.push(inst(
+                    dest,
+                    IrOp::Select,
+                    &[condition, previous[0], previous[1]],
+                ));
+                facts.insert(ValueId(dest), Fact::Conflict);
+            }
+            previous = current;
+            next += 2;
+        }
+        let phi = ValueId(next);
+        facts.insert(phi, Fact::Conflict);
+        func.next_value = next + 2;
+        func.blocks[0].term = IrTerminator::Branch {
+            cond: ValueId(2),
+            taken: BlockId(1),
+            not_taken: BlockId(2),
+        };
+        for id in [1, 2] {
+            func.blocks.push(IrBlock {
+                id: BlockId(id),
+                phis: vec![],
+                insts: vec![],
+                term: IrTerminator::Jump(BlockId(3)),
+            });
+        }
+        func.blocks.push(IrBlock {
+            id: BlockId(3),
+            phis: vec![Phi {
+                dest: phi,
+                ty: IrType::I64,
+                args: vec![
+                    (BlockId(1), ValueId(previous[0])),
+                    (BlockId(2), ValueId(previous[1])),
+                ],
+            }],
+            insts: vec![inst(next + 1, IrOp::Load, &[next])],
+            term: IrTerminator::Ret,
+        });
+        let definitions = access_definitions(&func);
+        let reachable = func.blocks.iter().map(|block| block.id).collect();
+        let mut scratch = AccessScratch::default();
+        let mut minimum = 0;
+        check_access(
+            phi,
+            7,
+            &facts,
+            &definitions,
+            &reachable,
+            &mut scratch,
+            &mut minimum,
+        )
+        .unwrap();
+        let expected = FramePointerBounds {
+            negative: Some((-16, -8)),
+            incoming: None,
+        };
+        assert_eq!(scratch.bounds, expected);
+        assert_eq!(minimum, -16);
+        assert!(!scratch.unknown);
+        // Count every popped work item, including cache hits and exit markers.
+        // Each layer contributes four input edges and two completion markers.
+        assert_eq!(scratch.visits, 6 * LAYERS as usize + 4);
+
+        let analysis = analyze(&func, &[]).unwrap();
+        assert_eq!(analysis.pointer_bounds[&phi], expected);
+        assert!(!analysis.offsets.contains_key(&phi));
+        assert_eq!(analysis.original_size, 24);
+
+        // The same shared DAG must remain linear when coarse bounds cannot
+        // certify the shifted load, and therefore cannot short-circuit it.
+        func.blocks[0].insts[0].op = IrOp::FrameAddress(-16);
+        func.blocks[0].insts[1].op = IrOp::FrameAddress(-32);
+        facts.insert(ValueId(0), Fact::Offset(-16));
+        facts.insert(ValueId(1), Fact::Offset(-32));
+        let shifted = ValueId(next + 2);
+        func.blocks[3]
+            .insts
+            .insert(0, inst(next + 2, IrOp::FrameOffset(24), &[next]));
+        func.blocks[3].insts[1].args = vec![shifted];
+        func.next_value = next + 3;
+        facts.insert(shifted, Fact::Conflict);
+        let coarse = index::from_interval(-32, -16).unwrap();
+        let shifted_coarse = index::from_interval(-8, 8).unwrap();
+        scratch.proven = facts
+            .iter()
+            .filter_map(|(&value, &fact)| {
+                (fact == Fact::Conflict).then_some((
+                    value,
+                    if value == shifted {
+                        shifted_coarse
+                    } else {
+                        coarse
+                    },
+                ))
+            })
+            .collect();
+        let definitions = access_definitions(&func);
+        minimum = 0;
+        check_access(
+            shifted,
+            7,
+            &facts,
+            &definitions,
+            &reachable,
+            &mut scratch,
+            &mut minimum,
+        )
+        .unwrap();
+        assert_eq!(
+            scratch.bounds,
+            FramePointerBounds {
+                negative: Some((-8, -8)),
+                incoming: Some((8, 8)),
+            }
+        );
+        assert_eq!(minimum, -8);
+        assert!(!scratch.unknown);
+        assert_eq!(scratch.visits, 6 * LAYERS as usize + 6);
+        let analysis = analyze(&func, &[]).unwrap();
+        assert_eq!(analysis.pointer_bounds[&shifted], shifted_coarse);
+        assert_eq!(analysis.original_size, 40);
+    }
+
+    #[test]
+    fn completed_access_states_keep_adjustments_extents_and_unknowns_distinct() {
+        let func = function(vec![
+            inst(0, IrOp::FrameAddress(-16), &[]),
+            inst(1, IrOp::FrameAddress(-8), &[]),
+            inst(2, IrOp::Undef, &[]),
+            inst(3, IrOp::Select, &[2, 0, 1]),
+            inst(4, IrOp::FrameOffset(56), &[3]),
+            inst(5, IrOp::Select, &[2, 4, 3]),
+            inst(6, IrOp::FrameOffset(i64::MAX), &[5]),
+            inst(7, IrOp::FrameOffset(1), &[6]),
+        ]);
+        let mut facts = HashMap::from([
+            (ValueId(0), Fact::Offset(-16)),
+            (ValueId(1), Fact::Offset(-8)),
+            (ValueId(2), Fact::Scalar(None)),
+        ]);
+        facts.extend((3..=7).map(|value| (ValueId(value), Fact::Conflict)));
+        let definitions = access_definitions(&func);
+        let reachable = HashSet::from([BlockId(0)]);
+        let mut scratch = AccessScratch::default();
+        let mut minimum = 0;
+        let expected = FramePointerBounds {
+            negative: Some((-16, -8)),
+            incoming: Some((40, 48)),
+        };
+        check_access(
+            ValueId(5),
+            7,
+            &facts,
+            &definitions,
+            &reachable,
+            &mut scratch,
+            &mut minimum,
+        )
+        .unwrap();
+        assert_eq!(scratch.bounds, expected);
+        assert_eq!(minimum, -16);
+        assert!(!scratch.unknown);
+        assert_eq!(scratch.visits, 12);
+
+        // A completed query cannot suppress a wider access or signed overflow.
+        for (value, extent, reason) in [
+            (5, 8, RejectionReason::FrameConflict),
+            (7, 7, RejectionReason::FrameOverflow),
+        ] {
+            assert_eq!(
+                check_access(
+                    ValueId(value),
+                    extent,
+                    &facts,
+                    &definitions,
+                    &reachable,
+                    &mut scratch,
+                    &mut minimum,
+                ),
+                Err(reason),
+            );
+        }
+
+        facts.remove(&ValueId(1));
+        check_access(
+            ValueId(5),
+            7,
+            &facts,
+            &definitions,
+            &reachable,
+            &mut scratch,
+            &mut minimum,
+        )
+        .unwrap();
+        assert!(scratch.unknown);
+        assert_eq!(
+            scratch.bounds,
+            FramePointerBounds {
+                negative: Some((-16, -16)),
+                incoming: Some((40, 40)),
+            }
+        );
+
+        // Neither a failed nor an unknown query leaves reusable partial proofs.
+        facts.insert(ValueId(1), Fact::Offset(-8));
+        check_access(
+            ValueId(5),
+            7,
+            &facts,
+            &definitions,
+            &reachable,
+            &mut scratch,
+            &mut minimum,
+        )
+        .unwrap();
+        assert!(!scratch.unknown);
+        assert_eq!(scratch.bounds, expected);
+        assert_eq!(scratch.visits, 12);
+    }
+
+    #[test]
+    fn completed_access_states_preserve_active_cycle_checks() {
+        for step in [0, 8] {
+            let mut func = function(vec![
+                inst(0, IrOp::FrameAddress(-8), &[]),
+                inst(1, IrOp::FrameAddress(-16), &[]),
+                inst(2, IrOp::Undef, &[]),
+            ]);
+            func.blocks[0].term = IrTerminator::Jump(BlockId(1));
+            func.blocks.push(IrBlock {
+                id: BlockId(1),
+                phis: vec![Phi {
+                    dest: ValueId(3),
+                    ty: IrType::I64,
+                    args: vec![(BlockId(0), ValueId(0)), (BlockId(1), ValueId(5))],
+                }],
+                insts: vec![
+                    inst(4, IrOp::Select, &[2, 3, 1]),
+                    inst(5, IrOp::FrameOffset(step), &[4]),
+                    inst(6, IrOp::Load, &[3]),
+                ],
+                term: IrTerminator::Jump(BlockId(1)),
+            });
+            let facts = HashMap::from([
+                (ValueId(0), Fact::Offset(-8)),
+                (ValueId(1), Fact::Offset(-16)),
+                (ValueId(2), Fact::Scalar(None)),
+                (ValueId(3), Fact::Conflict),
+                (ValueId(4), Fact::Conflict),
+                (ValueId(5), Fact::Conflict),
+            ]);
+            let definitions = access_definitions(&func);
+            let reachable = HashSet::from([BlockId(0), BlockId(1)]);
+            let mut scratch = AccessScratch::default();
+            let mut minimum = 0;
+            let result = check_access(
+                ValueId(3),
+                7,
+                &facts,
+                &definitions,
+                &reachable,
+                &mut scratch,
+                &mut minimum,
+            );
+            if step != 0 {
+                assert_eq!(result, Err(RejectionReason::FrameDynamic));
+                continue;
+            }
+            result.unwrap();
+            let expected = FramePointerBounds {
+                negative: Some((-16, -8)),
+                incoming: None,
+            };
+            assert_eq!(scratch.bounds, expected);
+            assert!(!scratch.unknown);
+            assert_eq!(minimum, -16);
+            assert_eq!(scratch.visits, 9);
+
+            // The select completed before its active phi; its own next query
+            // must still traverse the phi and recover both concrete seeds.
+            check_access(
+                ValueId(4),
+                7,
+                &facts,
+                &definitions,
+                &reachable,
+                &mut scratch,
+                &mut minimum,
+            )
+            .unwrap();
+            assert_eq!(scratch.bounds, expected);
+            assert!(!scratch.unknown);
+            assert_eq!(scratch.visits, 9);
+        }
+    }
+
+    #[test]
+    fn ambiguous_access_bounds_preserve_zero_and_nonzero_cycle_distinctions() {
+        for step in [0, 8] {
+            let mut func = function(vec![
+                inst(0, IrOp::FrameAddress(-32), &[]),
+                inst(1, IrOp::FrameAddress(-16), &[]),
+                inst(2, IrOp::Undef, &[]),
+            ]);
+            func.blocks[0].term = IrTerminator::Jump(BlockId(1));
+            func.blocks.push(IrBlock {
+                id: BlockId(1),
+                phis: vec![Phi {
+                    dest: ValueId(3),
+                    ty: IrType::I64,
+                    args: vec![(BlockId(0), ValueId(0)), (BlockId(1), ValueId(5))],
+                }],
+                insts: vec![
+                    inst(4, IrOp::Select, &[2, 3, 1]),
+                    inst(5, IrOp::FrameOffset(step), &[4]),
+                    inst(6, IrOp::FrameOffset(24), &[3]),
+                    inst(7, IrOp::Load, &[6]),
+                ],
+                term: IrTerminator::Jump(BlockId(1)),
+            });
+            let facts = HashMap::from([
+                (ValueId(0), Fact::Offset(-32)),
+                (ValueId(1), Fact::Offset(-16)),
+                (ValueId(2), Fact::Scalar(None)),
+                (ValueId(3), Fact::Conflict),
+                (ValueId(4), Fact::Conflict),
+                (ValueId(5), Fact::Conflict),
+                (ValueId(6), Fact::Conflict),
+            ]);
+            let definitions = access_definitions(&func);
+            let mut scratch = AccessScratch {
+                proven: HashMap::from([(ValueId(6), index::from_interval(-8, 8).unwrap())]),
+                ..AccessScratch::default()
+            };
+            let mut minimum = 0;
+            let result = check_access(
+                ValueId(6),
+                7,
+                &facts,
+                &definitions,
+                &HashSet::from([BlockId(0), BlockId(1)]),
+                &mut scratch,
+                &mut minimum,
+            );
+            if step == 0 {
+                result.unwrap();
+                assert_eq!(
+                    scratch.bounds,
+                    FramePointerBounds {
+                        negative: Some((-8, -8)),
+                        incoming: Some((8, 8)),
+                    }
+                );
+                assert_eq!(minimum, -8);
+                assert!(!scratch.unknown);
+                assert_eq!(scratch.visits, 11);
+            } else {
+                assert_eq!(result, Err(RejectionReason::FrameDynamic));
+                assert!(scratch.visits <= 11);
+            }
+        }
+    }
+
+    #[test]
+    fn unproved_select_frame_alternative_remains_dynamic() {
+        let func = function(vec![
+            inst(0, IrOp::FrameAddress(-16), &[]),
+            inst(1, IrOp::Undef, &[]),
+            inst(2, IrOp::Undef, &[]),
+            inst(3, IrOp::Select, &[2, 0, 1]),
+            inst(4, IrOp::Load, &[3]),
+        ]);
+        assert_eq!(
+            analyze(&func, &[]).unwrap_err(),
+            RejectionReason::FrameDynamic
+        );
+    }
+
+    #[test]
+    fn constant_select_condition_retains_only_the_selected_coordinate() {
+        for (condition, expected) in [(0, 40), (1, -16)] {
+            let func = function(vec![
+                inst(0, IrOp::FrameAddress(-16), &[]),
+                inst(1, IrOp::FrameAddress(40), &[]),
+                inst(2, IrOp::Const(condition), &[]),
+                inst(3, IrOp::Select, &[2, 0, 1]),
+                inst(4, IrOp::Load, &[3]),
+            ]);
+            assert_eq!(analyze(&func, &[]).unwrap().offsets[&ValueId(3)], expected);
+        }
+    }
+
+    #[test]
+    fn delayed_select_condition_is_independent_of_block_order() {
+        for condition in [0, 1] {
+            for condition_id in [1, 2] {
+                for consumer_first in [false, true] {
+                    let consumer_id = 3 - condition_id;
+                    let mut func = function(vec![
+                        inst(0, IrOp::FrameAddress(-16), &[]),
+                        inst(1, IrOp::Const(56), &[]),
+                        inst(2, IrOp::Const(0), &[]),
+                    ]);
+                    func.blocks[0].term = IrTerminator::Jump(BlockId(condition_id));
+                    let definition = IrBlock {
+                        id: BlockId(condition_id),
+                        phis: vec![],
+                        insts: vec![inst(3, IrOp::Const(condition), &[])],
+                        term: IrTerminator::Jump(BlockId(consumer_id)),
+                    };
+                    let consumer = IrBlock {
+                        id: BlockId(consumer_id),
+                        phis: vec![],
+                        insts: vec![
+                            inst(4, IrOp::Select, &[3, 1, 2]),
+                            inst(5, IrOp::Add, &[0, 4]),
+                            inst(6, IrOp::Load, &[5]),
+                        ],
+                        term: IrTerminator::Ret,
+                    };
+                    if consumer_first {
+                        func.blocks.extend([consumer, definition]);
+                    } else {
+                        func.blocks.extend([definition, consumer]);
+                    }
+                    let analysis = analyze(&func, &[]).unwrap();
+                    let scalar = if condition == 0 { 0 } else { 56 };
+                    assert_eq!(analysis.constants[&ValueId(4)], scalar);
+                    assert_eq!(analysis.offsets[&ValueId(5)], -16 + scalar as i64);
+                    assert!(!analysis.pointer_bounds.contains_key(&ValueId(5)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unresolved_select_conditions_defer_scalar_and_pointer_proofs() {
+        let select = inst(3, IrOp::Select, &[2, 0, 1]);
+        let definitions = HashMap::from([(ValueId(3), Definition::Inst(&select))]);
+        let reachable = HashSet::from([BlockId(0)]);
+        for (yes, no) in [
+            (Fact::Scalar(Some(56)), Fact::Scalar(Some(0))),
+            (Fact::Offset(-32), Fact::Offset(-16)),
+        ] {
+            let mut facts = HashMap::from([(ValueId(0), yes), (ValueId(1), no)]);
+            assert_eq!(
+                Definition::Inst(&select).evaluate(&facts, &definitions, &reachable),
+                Fact::Unknown,
+            );
+            assert!(index::select(&select, &facts, &HashMap::new()).is_none());
+            facts.insert(ValueId(2), Fact::Scalar(None));
+            assert_eq!(
+                Definition::Inst(&select).evaluate(&facts, &definitions, &reachable),
+                yes.merge(no),
+            );
+            for (condition, expected) in [(0, no), (1, yes)] {
+                facts.insert(ValueId(2), Fact::Scalar(Some(condition)));
+                assert_eq!(
+                    Definition::Inst(&select).evaluate(&facts, &definitions, &reachable),
+                    expected,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_select_cycles_still_widen_runtime_choices() {
+        for ty in [IrType::I8, IrType::I32, IrType::I64] {
+            for loop_first in [false, true] {
+                let mut func = function(vec![
+                    Inst {
+                        ty,
+                        ..inst(0, IrOp::Const(0x100), &[])
+                    },
+                    Inst {
+                        ty,
+                        ..inst(1, IrOp::Const(0x101), &[])
+                    },
+                ]);
+                func.blocks[0].term = IrTerminator::Jump(BlockId(1));
+                let loop_block = IrBlock {
+                    id: BlockId(1),
+                    phis: vec![Phi {
+                        dest: ValueId(2),
+                        ty,
+                        args: vec![(BlockId(0), ValueId(1)), (BlockId(1), ValueId(3))],
+                    }],
+                    insts: vec![Inst {
+                        ty,
+                        ..inst(3, IrOp::Select, &[2, 0, 1])
+                    }],
+                    term: IrTerminator::Jump(BlockId(1)),
+                };
+                if loop_first {
+                    func.blocks.insert(0, loop_block);
+                } else {
+                    func.blocks.push(loop_block);
+                }
+                let analysis = analyze(&func, &[]).unwrap();
+                let mask = if ty == IrType::I8 { 0xff } else { u64::MAX };
+                assert_eq!(analysis.constants[&ValueId(0)], 0x100 & mask);
+                assert_eq!(analysis.constants[&ValueId(1)], 0x101 & mask);
+                assert!(!analysis.constants.contains_key(&ValueId(2)));
+                assert!(!analysis.constants.contains_key(&ValueId(3)));
+            }
+        }
+    }
+
+    #[test]
+    fn split_select_accesses_expand_only_actual_offset_alternatives() {
+        for reverse in [false, true] {
+            for operation in [IrOp::FrameOffset(24), IrOp::Add, IrOp::Sub] {
+                let subtract = matches!(operation, IrOp::Sub);
+                let offset = if subtract { -24i64 } else { 24 };
+                let args = if matches!(operation, IrOp::FrameOffset(_)) {
+                    vec![4]
+                } else {
+                    vec![4, 5]
+                };
+                let arms = if reverse { [2, 1, 0] } else { [2, 0, 1] };
+                let func = function(vec![
+                    inst(0, IrOp::FrameAddress(-32), &[]),
+                    inst(1, IrOp::FrameAddress(-16), &[]),
+                    inst(2, IrOp::Undef, &[]),
+                    inst(3, IrOp::Select, &arms),
+                    inst(4, IrOp::Copy, &[3]),
+                    inst(5, IrOp::Const(offset as u64), &[]),
+                    inst(6, operation, &args),
+                    inst(7, IrOp::Load, &[6]),
+                ]);
+                let analysis = analyze(&func, &[]).unwrap();
+                assert_eq!(
+                    analysis.pointer_bounds[&ValueId(6)],
+                    index::from_interval(-8, 8).unwrap(),
+                );
+                assert_eq!(analysis.derived_offsets[&ValueId(6)], (ValueId(4), 24));
+                let facts = HashMap::from([
+                    (ValueId(0), Fact::Offset(-32)),
+                    (ValueId(1), Fact::Offset(-16)),
+                    (ValueId(2), Fact::Scalar(None)),
+                    (ValueId(3), Fact::Conflict),
+                    (ValueId(4), Fact::Conflict),
+                    (ValueId(5), Fact::Scalar(Some(offset as u64))),
+                    (ValueId(6), Fact::Conflict),
+                ]);
+                let definitions = access_definitions(&func);
+                let mut scratch = AccessScratch {
+                    proven: analysis.pointer_bounds.clone(),
+                    ..AccessScratch::default()
+                };
+                let mut minimum = 0;
+                check_access(
+                    ValueId(6),
+                    7,
+                    &facts,
+                    &definitions,
+                    &HashSet::from([BlockId(0)]),
+                    &mut scratch,
+                    &mut minimum,
+                )
+                .unwrap();
+                assert_eq!(
+                    scratch.bounds,
+                    FramePointerBounds {
+                        negative: Some((-8, -8)),
+                        incoming: Some((8, 8)),
+                    }
+                );
+                assert_eq!(minimum, -8);
+                assert!(!scratch.unknown);
+            }
+        }
+    }
+
+    #[test]
+    fn split_select_accesses_reject_only_selected_true_crossings() {
+        for reverse in [false, true] {
+            for condition in [None, Some(0), Some(1)] {
+                for (negative, ty) in [(-32, IrType::I64), (-31, IrType::I64), (-32, IrType::I128)]
+                {
+                    let arms = if reverse { [2, 1, 0] } else { [2, 0, 1] };
+                    let func = function(vec![
+                        inst(0, IrOp::FrameAddress(negative), &[]),
+                        inst(1, IrOp::FrameAddress(-16), &[]),
+                        inst(2, condition.map_or(IrOp::Undef, IrOp::Const), &[]),
+                        inst(3, IrOp::Select, &arms),
+                        inst(4, IrOp::FrameOffset(24), &[3]),
+                        Inst {
+                            ty,
+                            ..inst(5, IrOp::Load, &[4])
+                        },
+                    ]);
+                    let selects_negative =
+                        condition.is_none_or(|condition| (condition != 0) != reverse);
+                    let crosses = negative + 24 + i64::from(ty.bytes() - 1) >= 0;
+                    let result = analyze(&func, &[]);
+                    if selects_negative && crosses {
+                        assert_eq!(result.unwrap_err(), RejectionReason::FrameConflict);
+                    } else {
+                        let analysis = result.unwrap();
+                        if let Some(condition) = condition {
+                            let expected = if (condition != 0) != reverse {
+                                negative + 24
+                            } else {
+                                8
+                            };
+                            assert_eq!(analysis.offsets[&ValueId(4)], expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_select_failure_reasons_remain_specific() {
+        for (negative, other, displacement, expected) in [
+            (
+                -32,
+                IrOp::FrameAddress(-16),
+                i64::MAX,
+                RejectionReason::FrameOverflow,
+            ),
+            (
+                -i64::from(MAX_FRAME_SIZE) - 8,
+                IrOp::FrameAddress(-16),
+                24,
+                RejectionReason::FrameResourceLimit,
+            ),
+            (-32, IrOp::Undef, 24, RejectionReason::FrameDynamic),
+        ] {
+            let func = function(vec![
+                inst(0, IrOp::FrameAddress(negative), &[]),
+                inst(1, other, &[]),
+                inst(2, IrOp::Undef, &[]),
+                inst(3, IrOp::Select, &[2, 0, 1]),
+                inst(4, IrOp::FrameOffset(displacement), &[3]),
+                inst(5, IrOp::Load, &[4]),
+            ]);
+            assert_eq!(analyze(&func, &[]).unwrap_err(), expected);
+        }
+    }
+
+    #[test]
+    fn failed_coarse_access_certification_commits_no_partial_bounds() {
+        let func = function(vec![
+            inst(0, IrOp::FrameAddress(-32), &[]),
+            inst(1, IrOp::FrameAddress(24), &[]),
+            inst(2, IrOp::Undef, &[]),
+            inst(3, IrOp::Select, &[2, 0, 1]),
+            inst(4, IrOp::FrameOffset(-16), &[3]),
+        ]);
+        let mut facts = HashMap::from([
+            (ValueId(0), Fact::Offset(-32)),
+            (ValueId(1), Fact::Offset(24)),
+            (ValueId(2), Fact::Scalar(None)),
+            (ValueId(3), Fact::Conflict),
+            (ValueId(4), Fact::Conflict),
+        ]);
+        let definitions = access_definitions(&func);
+        let mut scratch = AccessScratch {
+            proven: HashMap::from([(
+                ValueId(3),
+                FramePointerBounds {
+                    negative: Some((-32, -16)),
+                    incoming: Some((8, 24)),
+                },
+            )]),
+            ..AccessScratch::default()
+        };
+        for unknown in [false, true, false] {
+            if unknown {
+                facts.remove(&ValueId(1));
+            } else {
+                facts.insert(ValueId(1), Fact::Offset(24));
+            }
+            let mut minimum = 0;
+            check_access(
+                ValueId(4),
+                7,
+                &facts,
+                &definitions,
+                &HashSet::from([BlockId(0)]),
+                &mut scratch,
+                &mut minimum,
+            )
+            .unwrap();
+            assert_eq!(
+                scratch.bounds,
+                FramePointerBounds {
+                    negative: Some((-48, -48)),
+                    incoming: (!unknown).then_some((8, 8)),
+                }
+            );
+            assert_eq!(minimum, -48);
+            assert_eq!(scratch.unknown, unknown);
+        }
+    }
+
+    #[test]
+    fn opaque_frame_index_intervals_still_reject_possible_crossings() {
+        for (negative, expected) in [
+            ((-8, -8), None),
+            ((-8, -1), Some(RejectionReason::FrameConflict)),
+            ((-7, -7), Some(RejectionReason::FrameConflict)),
+        ] {
+            let func = function(vec![
+                inst(0, IrOp::FrameAddress(-8), &[]),
+                inst(1, IrOp::Const(0), &[]),
+                inst(
+                    2,
+                    IrOp::FrameIndex {
+                        displacement: 0,
+                        subtract: false,
+                        bounds: FramePointerBounds {
+                            negative: Some(negative),
+                            incoming: Some((8, 8)),
+                        },
+                    },
+                    &[0, 1],
+                ),
+                inst(3, IrOp::Load, &[2]),
+            ]);
+            assert_eq!(analyze(&func, &[]).err(), expected);
         }
     }
 

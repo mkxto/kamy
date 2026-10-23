@@ -41,6 +41,36 @@ pub(super) fn validate(bounds: FramePointerBounds) -> Result<(), RejectionReason
     Ok(())
 }
 
+// Coarse intervals certify an access only when every represented start stays
+// within one frame zone. Failure to certify is not proof that an actual
+// Select/Phi alternative straddles the split; callers may expand its DAG.
+pub(super) fn access_bounds(
+    bounds: FramePointerBounds,
+    adjustment: i64,
+    extent: i64,
+) -> Result<Option<FramePointerBounds>, RejectionReason> {
+    let mut result = FramePointerBounds::default();
+    for (low, high) in [bounds.negative, bounds.incoming].into_iter().flatten() {
+        let start = low
+            .checked_add(adjustment)
+            .ok_or(RejectionReason::FrameOverflow)?;
+        let last = high
+            .checked_add(adjustment)
+            .ok_or(RejectionReason::FrameOverflow)?;
+        let end = last
+            .checked_add(extent)
+            .ok_or(RejectionReason::FrameOverflow)?;
+        i32::try_from(start).map_err(|_| RejectionReason::FrameOverflow)?;
+        i32::try_from(end).map_err(|_| RejectionReason::FrameOverflow)?;
+        if start < 0 && end >= 0 {
+            return Ok(None);
+        }
+        result.observe(start);
+        result.observe(last);
+    }
+    Ok(Some(result))
+}
+
 fn merge(target: &mut FramePointerBounds, bounds: FramePointerBounds) {
     for (low, high) in [bounds.negative, bounds.incoming].into_iter().flatten() {
         target.observe(low);
@@ -220,4 +250,27 @@ pub(super) fn phi(
         merge(&mut result, pointer_bounds(*value, facts, known)?);
     }
     (!result.is_empty()).then_some(result)
+}
+
+pub(super) fn select(
+    inst: &Inst,
+    facts: &HashMap<ValueId, Fact>,
+    known: &HashMap<ValueId, FramePointerBounds>,
+) -> Option<FramePointerBounds> {
+    if inst.ty != IrType::I64 {
+        return None;
+    }
+    let [condition, yes, no] = inst.args.as_slice() else {
+        return None;
+    };
+    match facts.get(condition) {
+        None | Some(Fact::Unknown) => None,
+        Some(Fact::Scalar(Some(0))) => pointer_bounds(*no, facts, known),
+        Some(Fact::Scalar(Some(_))) => pointer_bounds(*yes, facts, known),
+        _ => {
+            let mut bounds = pointer_bounds(*yes, facts, known)?;
+            merge(&mut bounds, pointer_bounds(*no, facts, known)?);
+            Some(bounds)
+        }
+    }
 }
