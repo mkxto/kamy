@@ -82,16 +82,19 @@ enum Command {
         #[arg(long)]
         reject_rva: Option<String>,
     },
-    /// Dump a single function's IR at a chosen pipeline stage.
+    /// Dump function IR or an exact file-backed native instruction range.
     Dump {
         /// Input PE.
         input: PathBuf,
-        /// Entry RVA of the function to dump (hex).
+        /// Source-local function entry RVA, or exact native range start (hex).
         #[arg(long)]
         rva: String,
-        /// Pipeline stage to run up to.
+        /// Pipeline stage, or native to decode bytes without running the pipeline.
         #[arg(long, value_enum, default_value_t = StageArg::Optimize)]
         stage: StageArg,
+        /// Exact native byte count (decimal); required only with --stage native.
+        #[arg(long)]
+        size: Option<u32>,
     },
     /// Delta-debug an SSA-lowering regression down to a minimal culprit set.
     Bisect {
@@ -230,7 +233,12 @@ fn main() -> anyhow::Result<()> {
             only_rva,
             reject_rva,
         }),
-        Command::Dump { input, rva, stage } => commands::dump::run(&input, &rva, stage),
+        Command::Dump {
+            input,
+            rva,
+            stage,
+            size,
+        } => commands::dump::run(&input, &rva, stage, size),
         Command::Bisect {
             input,
             expect_exit,

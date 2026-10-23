@@ -1,11 +1,13 @@
 //! Agent triage tooling for the kamy protector pipeline.
 //!
-//! Three tools:
+//! Triage tools:
 //! - [`protect_identity`]: canonical SSA-identity protect of a PE, returning
 //!   the raw linker [`kamy_link::Report`]; an optional [`FunctionSelector`]
 //!   restricts which functions are SSA-lowered.
 //! - [`dump_function`]: human-readable dump of a single function's IR at a
 //!   chosen pipeline [`Stage`] (lift / SSA / optimize / regalloc).
+//! - [`dump_native`]: exact file-backed PE range with RVA, preferred VA, bytes
+//!   and decoded Intel-syntax operands, without discovery or lowering.
 //! - [`bisect`]: delta-debug the set of SSA-lowered functions down to a minimal
 //!   failing subset, then capture the faulting address via a traced run.
 
@@ -13,6 +15,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter};
 use kamy_core::ir::{IrBlock, IrFunction};
 use kamy_core::{FunctionSelector, Rva, SymbolId};
 use kamy_disasm::discover_functions;
@@ -67,6 +70,93 @@ pub enum Stage {
     Ssa,
     Optimize,
     Regalloc,
+}
+
+/// Decode exactly `size` file-backed bytes at `rva` in the supplied PE.
+/// Coordinates must come from that exact original/protected image's map/report;
+/// this does not infer function extents or interpret authored module identities.
+/// VAs use the preferred PE image base, not a live process's ASLR load address.
+pub fn dump_native(input: &Path, rva: Rva, size: u32) -> anyhow::Result<String> {
+    let bytes = std::fs::read(input).with_context(|| format!("reading {}", input.display()))?;
+    let pe = PeFile::parse(&bytes).with_context(|| format!("parsing {}", input.display()))?;
+    dump_native_range(&pe, rva, size).with_context(|| {
+        format!(
+            "native dump of {} at RVA {rva}, size {size}",
+            input.display()
+        )
+    })
+}
+
+fn dump_native_range(pe: &PeFile, rva: Rva, size: u32) -> anyhow::Result<String> {
+    anyhow::ensure!(size != 0, "native byte count must be nonzero");
+    let start = rva.get();
+    let end = start
+        .checked_add(size)
+        .context("native RVA range overflow")?;
+    let (index, section) = pe
+        .section_headers()
+        .iter()
+        .enumerate()
+        .find(|(_, section)| {
+            start >= section.rva
+                && u64::from(start) < u64::from(section.rva) + u64::from(section.raw_size)
+        })
+        .with_context(|| format!("RVA {rva} is not file-backed section storage"))?;
+    let offset = start - section.rva;
+    anyhow::ensure!(
+        u64::from(offset) + u64::from(size) <= u64::from(section.raw_size),
+        "native range {rva}..{end:#x} exceeds file-backed section {:?}",
+        section.name
+    );
+    let data = pe
+        .section_data(index)
+        .with_context(|| format!("file-backed section {:?} is truncated", section.name))?;
+    let data = data
+        .get(offset as usize..(u64::from(offset) + u64::from(size)) as usize)
+        .context("requested native bytes are truncated")?;
+    let base = pe.image_base();
+    let va = base
+        .checked_add(u64::from(start))
+        .context("native VA overflow")?;
+    base.checked_add(u64::from(end))
+        .context("native VA range overflow")?;
+
+    let mut out = String::new();
+    writeln!(out, "native RVA {start:#010x}..{end:#010x}, size {size}")?;
+    writeln!(
+        out,
+        "preferred_image_base: {base:#018x} (not a runtime ASLR address)"
+    )?;
+    writeln!(
+        out,
+        "RVA         VA                  bytes                                         instruction"
+    )?;
+    let mut decoder = Decoder::with_ip(64, data, va, DecoderOptions::NONE);
+    let mut formatter = IntelFormatter::new();
+    formatter.options_mut().set_rip_relative_addresses(true);
+    let mut operands = String::new();
+    while decoder.can_decode() {
+        let offset = decoder.position();
+        let instruction = decoder.decode();
+        let pc = start + offset as u32;
+        anyhow::ensure!(
+            !instruction.is_invalid(),
+            "invalid or truncated x86-64 instruction at RVA {pc:#010x}, VA {:#018x} ({:?})",
+            instruction.ip(),
+            decoder.last_error()
+        );
+        operands.clear();
+        formatter.format(&instruction, &mut operands);
+        write!(out, "{pc:#010x}  {:#018x}  ", instruction.ip())?;
+        for byte in &data[offset..decoder.position()] {
+            write!(out, "{byte:02x} ")?;
+        }
+        for _ in instruction.len()..15 {
+            out.push_str("   ");
+        }
+        writeln!(out, " {operands}")?;
+    }
+    Ok(out)
 }
 
 /// Run the per-function pipeline up to `stage` at an exact source-local entry.
@@ -480,10 +570,111 @@ fn replay(exe: &Path, run_options: &kamy_run::RunOptions) -> anyhow::Result<kamy
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactDir, replay};
+    use super::{ArtifactDir, dump_native_range, replay};
     use kamy_run::RunOptions;
     use std::io::{Read as _, Write as _};
     use std::time::Duration;
+
+    fn native_image(code: &[u8]) -> Vec<u8> {
+        // One PE32+ section, with a virtual-only tail to distinguish BSS from bytes.
+        let mut bytes = vec![0; 0x200 + code.len()];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        bytes[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+        bytes[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        bytes[0x94..0x96].copy_from_slice(&0xf0u16.to_le_bytes());
+        bytes[0x98..0x9a].copy_from_slice(&0x20bu16.to_le_bytes());
+        bytes[0xb0..0xb8].copy_from_slice(&0x140000000u64.to_le_bytes());
+        bytes[0x188..0x18d].copy_from_slice(b".text");
+        bytes[0x190..0x194].copy_from_slice(&(code.len() as u32 + 0x100).to_le_bytes());
+        bytes[0x194..0x198].copy_from_slice(&0x1000u32.to_le_bytes());
+        bytes[0x198..0x19c].copy_from_slice(&(code.len() as u32).to_le_bytes());
+        bytes[0x19c..0x1a0].copy_from_slice(&0x200u32.to_le_bytes());
+        bytes[0x200..].copy_from_slice(code);
+        bytes
+    }
+
+    #[test]
+    fn native_dump_decodes_only_requested_bytes_with_exact_coordinates_and_operands() {
+        let bytes = native_image(&[0x48, 0x8b, 0x44, 0x24, 0x28, 0xc3, 0x0f]);
+        let pe = kamy_pe::PeFile::parse(&bytes).unwrap();
+        let dump = dump_native_range(&pe, kamy_core::Rva::new(0x1000), 6).unwrap();
+        let instructions: Vec<_> = dump.lines().filter(|line| line.starts_with("0x")).collect();
+        assert_eq!(instructions.len(), 2, "{dump}");
+        assert!(
+            instructions[0].starts_with("0x00001000  0x0000000140001000"),
+            "{dump}"
+        );
+        assert!(instructions[0].contains("48 8b 44 24 28"), "{dump}");
+        assert!(instructions[0].contains("mov rax,[rsp+28h]"), "{dump}");
+        assert!(
+            instructions[1].starts_with("0x00001005  0x0000000140001005"),
+            "{dump}"
+        );
+        assert!(instructions[1].contains("c3"), "{dump}");
+        assert!(instructions[1].ends_with("ret"), "{dump}");
+        assert!(dump.contains("not a runtime ASLR address"), "{dump}");
+        // A non-entry subrange is allowed; no function discovery or boundary guessing.
+        let tail = dump_native_range(&pe, kamy_core::Rva::new(0x1005), 1).unwrap();
+        assert_eq!(
+            tail.lines().filter(|line| line.starts_with("0x")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn native_dump_rejects_zero_unmapped_virtual_and_cross_section_ranges() {
+        let pe = kamy_pe::PeFile::parse(&native_image(&[0x90, 0xc3])).unwrap();
+        for (rva, size, expected) in [
+            (0x1000, 0, "nonzero"),
+            (u32::MAX, 1, "RVA range overflow"),
+            (0, 1, "not file-backed"),
+            (0x2000, 1, "not file-backed"),
+            (0x1002, 1, "not file-backed"),
+            (0x1001, 2, "exceeds file-backed section"),
+        ] {
+            let error = dump_native_range(&pe, kamy_core::Rva::new(rva), size).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "{rva:#x}+{size}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_dump_rejects_truncated_file_and_invalid_or_partial_instructions() {
+        let mut bytes = native_image(&[0x90, 0xc3]);
+        bytes.pop();
+        let pe = kamy_pe::PeFile::parse(&bytes).unwrap();
+        let error = dump_native_range(&pe, kamy_core::Rva::new(0x1000), 2).unwrap_err();
+        assert!(error.to_string().contains("truncated"), "{error:#}");
+        for code in [&[0x48, 0x8b][..], &[0x06][..]] {
+            let pe = kamy_pe::PeFile::parse(&native_image(code)).unwrap();
+            let error =
+                dump_native_range(&pe, kamy_core::Rva::new(0x1000), code.len() as u32).unwrap_err();
+            assert!(
+                error.to_string().contains("invalid or truncated"),
+                "{error:#}"
+            );
+            assert!(error.to_string().contains("RVA 0x00001000"), "{error:#}");
+            assert!(
+                error.to_string().contains("VA 0x0000000140001000"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_dump_rejects_preferred_va_overflow() {
+        let mut bytes = native_image(&[0x90, 0xc3]);
+        bytes[0xb0..0xb8].copy_from_slice(&(u64::MAX - 0x1000).to_le_bytes());
+        let pe = kamy_pe::PeFile::parse(&bytes).unwrap();
+        let error = dump_native_range(&pe, kamy_core::Rva::new(0x1000), 1).unwrap_err();
+        assert!(error.to_string().contains("VA range overflow"), "{error:#}");
+        let error = dump_native_range(&pe, kamy_core::Rva::new(0x1001), 1).unwrap_err();
+        assert!(error.to_string().contains("VA overflow"), "{error:#}");
+    }
 
     #[test]
     fn final_replay_preserves_stdin_args_environment_and_working_directory() {

@@ -1,162 +1,99 @@
 ---
 name: kamy-triage
 description: >
-  Localize and inspect kamy SSA-backend miscompiles with the headless in-tree
-  tools instead of ad-hoc debugging. Use when a protected binary crashes or
-  diverges from the original, a `kamy corpus verify` member FAILs, SSA coverage
-  drops or reject counts move, or you need to find which function miscompiled,
-  read its lifted/optimized IR, concrete frame, memory homes and boundary pins,
-  or learn why a function was rejected. Triggers: "miscompile", "corpus FAIL", "which function broke",
-  "bisect", "dump IR / regalloc / reg assignments", "reject reason", "faulting
-  RVA", "coverage regression", "protected binary crashes".
+  Localize Kamy miscompiles, corpus FAILs, coverage/rejection regressions and
+  protected crashes/wrong output with headless corpus, bisect, dump and
+  explain-reject commands; inspect SSA, frames, memory homes and boundary pins.
 ---
 
-Hunt kamy miscompiles with the headless tools, in this order. Each step is a
-real `kamy` subcommand; do not hand-roll debuggers or drive x64dbg for pass/fail.
+# Kamy triage
 
-## Workflow (do not skip steps)
+## Operational checklist
 
-```
-corpus verify  ─▶  bisect  ─▶  dump --stage regalloc  ─▶  x64dbg (deep-dive only)
-  detect FAIL      isolate        inspect the one             step the single
-                   the culprit    culprit's IR/alloc          isolated culprit
-```
+1. **Validate original:** `kamy corpus doctor --corpus <dir> --member <name>`.
+   Check independent golden/health; never re-bless protected failures or existing
+   members. Preserve originals/goldens. Disclose unavailable/skipped members.
+2. **Detect:** `kamy corpus verify --corpus <dir> --member <name> --keep`.
+   Keep the exact executed binary plus appended `.debug-map.csv` and
+   `.link-report.json`; use `--baseline <file>` for coverage transitions.
+3. **Isolate EXE:** `kamy bisect <exe> --expect-exit <code> --expect-stdout <file>
+   --stdin-file <input> --timeout <seconds> --keep`. Supply relevant options;
+   wrong-output defects need stdout comparison, not exit alone. Every probe AND
+   final replay must use the same stdin/timeout/output predicate. Keep the actual
+   failing replay artifact in its exclusively reserved directory. All-lowered
+   success leaves nothing to bisect. DLL export-call oracles stay with corpus.
+4. **Inspect:** `kamy dump <input> --rva <hex> --stage <stage>` separately for
+   `lift`, `ssa`, `optimize`, `regalloc` (default `optimize`). Capture stdout,
+   stderr/nonzero diagnostics. Inspect source/SSA, transforms, frame coordinates,
+   typed homes, saves, bounded scratch and `boundary_pins`, not global registers.
+   Frame proof may fail before later stages; use earlier dumps. Authored KAMYMOD
+   v2 DLLs auto-detect `.kmod`: RVA means local compiler function entry, NOT host
+   source/final RVA. Inspect `source_range`, `native_abi`, `operand_references`;
+   `HostImageBase` remains symbolic without a host. Never invent module host RVAs.
+5. **Rebuild/prove:** `kamy protect <input> -o <out> --ssa-identity --debug-map
+   <csv> --link-report <json>`; also protect with the requested `--profile <yaml>`
+   without identity. Inspect exact emitted outputs and compare native values,
+   caller state and forced-ASLR body/epilogue unwind. Use `kamy explain-reject
+   <input> [--rva <hex>]` for negatives. Preserve witnesses/requested intensity.
+   Decode exact original/output bytes: `kamy dump <exact-PE> --stage native
+   --rva <hex> --size <decimal-byte-count>`. Use actual output placement RVA/size
+   or original module-local range, never source RVA in the output. Nonzero size
+   is native-only; decoding requires one file-backed section and whole valid
+   instructions. Rows show RVA, preferred VA (NOT runtime ASLR), bytes/Intel
+   operands; invalid ranges fail atomically. See tooling reference for details.
+6. **Record:** exact commands, tool/build/input/output identities, maps, PC/ABI/
+   frame observations, native/scaling evidence and unresolved items in
+   `docs/STATUS.md`. Tests/static analysis are not native proof or reacceptance.
 
-1. **Detect** — `kamy corpus verify --corpus <checkout> --member <name> --keep`
-   reproduces the FAIL and retains the exact protected binary, schema-2 debug
-   map and version-1 link report. Inspect per-function lowering as well as exit,
-   output and coverage. Add `--baseline <file>` for coverage/reject transitions.
-   Run `corpus doctor` first to validate the original oracle; never re-bless a
-   protected failure or use equal crashes/empty loader output as success.
-2. **Isolate** — `kamy bisect <exe> --expect-exit <code> --expect-stdout <file>
-   --stdin-file <input> --timeout <seconds> --keep` ddmin-narrows the lowering
-   set with the same stdin/timeout/output predicate for probes and final replay.
-   Retain the actual replayed failing artifact. A DLL export-call oracle belongs
-   to the corpus loader, not a bare-DLL EXE replay.
-3. **Inspect** — `kamy dump <input> --rva <culprit> --stage regalloc` shows IR,
-   the concrete frame, typed memory homes, bounded scratch and `boundary_pins`.
-   These pins are ABI/native constraints, not a global resident-register
-   assignment. Use separate `--stage lift|ssa|optimize` dumps to locate a bad
-   frame proof or optimization; capture stderr and nonzero diagnostic exits.
-   For an injection failure already naming an authored function, dump the
-   original schema-2 module DLL at its local compiler entry instead. `.kmod`
-   selects the same provenance/ABI adapter as linking; no host discovery seed
-   is needed. Inspect `source_range`, `native_abi` and `operand_references` before
-   IR/pins. Authored regalloc failures print the dump in the error and retain
-   nonzero status. `HostImageBase` stays symbolic without a host. Neither the
-   authored final map RVA nor a fabricated host RVA is a host bisect selector.
-4. **Deep-dive (last resort)** — only now open the single isolated culprit in
-   x64dbg to step instructions. x64dbg is **never** the batch pass/fail loop.
+IDA/x64dbg are unavailable this campaign: Kamy commands/native Windows execution
+must stand alone. Elsewhere, an available debugger is optional single-culprit
+inspection only, NEVER the batch pass/fail loop. Do not fabricate missing evidence.
 
-## Tool quick reference
+## Safety and interpretation
 
-| Command | Use |
-|---|---|
-| `kamy corpus verify [--corpus D] [--member N] [--keep] [--baseline F] [--write-baseline F]` | differential corpus; keep exact protected artifact, debug map and link report |
-| `kamy corpus doctor [--corpus D] [--member N]` | selected *unprotected* original must reproduce its golden; disclose unavailable/skipped members; catch ABI/call-shim and health failures |
-| `kamy corpus bless [--corpus D] --member N` | bless only the independently checked new original; never existing members or protected output |
-| `kamy bisect <exe> --expect-exit <n> [--expect-stdout F] [--stdin-file F] [--timeout S] [--keep]` | same replay oracle/options for every probe and final execution; retain the exact final failing output |
-| `kamy dump <in> --rva <hex> [--stage lift\|ssa\|optimize\|regalloc]` | one function's IR, frame, memory homes and boundary pins |
-| `kamy explain-reject <in> [--rva <hex>]` | why a function was left unlowered; per-function reason (not aggregate) |
-| `kamy protect <in> -o <out> --no-transform [--only-rva H,..] [--reject-rva H,..] [--debug-map F]` | canonical SSA identity; `--ssa-identity` has identical behavior; selectors cannot override safe rejection |
-| `kamy protect <in> -o <out> --profile <yaml> --ssa-identity --debug-map <csv> --link-report <json>` | preserve injection/naming while suppressing semantic passes; emit source-qualified maps and structural report |
+- **Health before equality:** timeout/missing termination always fails. Corpus
+  `expected_exit` optionally requires an exact terminal code; traced faults need
+  explicit matching expectation, even without normal exit. Record validated
+  traced termination as such. Normal nonzero exits may be valid; NTSTATUS-like
+  numbers alone are not fault events. Generic `kamy verify` has no expected-fault
+  exception. DLL loaders require exit 0, no traced fault and actual typed returns;
+  GUI traces must be nonempty. Equal crashes/empty or invalid goldens cannot pass.
+- **Required lowering:** manifest `lower_exports` names HOST exports; each must
+  exist and actually lower, regardless of aggregates. Empty means all-functions
+  identity. Loader `exports` preserves exact argument tokens/repeated calls.
+  Failed requirements retain measured coverage and diagnostics, not empty records.
+- **Population/intensity:** separate selected, eligible, lowered, transformed,
+  actual intensity and rejection transitions. Compare stable source identities;
+  report additions/removals separately. Identity success is not MBA protection.
+- **Identity/profiles:** `--no-transform` = `--ssa-identity`, same SSA backend,
+  never verbatim relocation. Without a profile, require an identity flag. With profile,
+  identity suppresses semantic passes, preserving injection/naming/layout policy
+  and strict validation. Host `--only-rva`/`--reject-rva` are mutually exclusive
+  and conflict with profiles; use host `!Address`. Selection cannot override safe
+  rejection. Resident host bodies stay put but reference operands may be patched.
+- **Maps/reports:** require `kamy-debug-map,2` columns
+  `origin,source_module,source_symbol,host_source_rva,new_rva`; only host function
+  `host_source_rva` selects host dumps/bisection. Authored identities are plugin
+  instance + exact compiler symbol; `host-image-base` is an anchor, not function.
+  `new_rva` is final image RVA; sizes come from native runtime ranges. No old map
+  aliases/fake RVA namespace. Require `kamy-link-report` v1; JSON coordinates are
+  numeric, absent identities null. Inspect active placements/directories/ownership;
+  certificate `file_offset` is not RVA. Structural reports are not execution proof.
+- **D16/D22/D24/D40:** one format-agnostic frame, memory homes, bounded scratch,
+  explicit flags, actual-body unwind, one backend/rebuild; table-free recovered
+  switches, safe rejection for genuinely unproved semantics. No blanket rejects,
+  witness special cases, old allocator, pressure retries or reduced MBA intensity.
+- **Quarantine:** historical locked 23-member corpus remains unavailable; disclose
+  subset versus full population. `dll_strutil`'s quarantined original MUST NOT be
+  restored, rebuilt, re-blessed or have deletion staged. NEVER change security
+  settings/exclusions. Skip/disclose, never PASS. Do not replace existing goldens.
+- **Scope:** green identity/old campaigns do not establish H2 reacceptance or
+  authorize H3–H7, std/startup/lifecycle/whole-image-compaction claims.
 
-## Rules & gotchas
+## References
 
-- **SSA-only is the design.** Verbatim relocation is banned (D22/D37).
-  `--no-transform` and `--ssa-identity` run the same SSA pipeline. Without a
-  profile they honor the mutually exclusive host RVA selectors. With a profile,
-  either flag suppresses semantic passes but preserves injection/naming policy;
-  CLI RVA selectors conflict with profiles (use host `!Address` instead).
-  Profiles are still validated; unsupported passes do not become legal in
-  identity mode. Resident and deselected host bodies stay in place, never
-  relocated verbatim. Their reference operands may still be
-  patched to movers; thunk-free reference rewriting requires this, so residency
-  does not mean byte-identical bytes. If a tool relocates verbatim, stop and
-  report the bug; do not paper over it.
-- **Address maps:** `protect --debug-map <csv>` works for identity and profile
-  runs. Require first record `kamy-debug-map,2`, then
-  `origin,source_module,source_symbol,host_source_rva,new_rva`. Rows are sorted by
-  symbol identity and CSV-escaped. Use `host_source_rva` from host function rows
-  with `dump --rva`, `--only-rva` and `--reject-rva`. A `host-image-base` row
-  is an anchor without a host source RVA, not a function. Authored rows
-  identify the plugin instance and exact compiler symbol, never a fake host RVA.
-  `new_rva` is the actual final image RVA. The old unversioned
-  `old_rva,new_rva` format is obsolete; migrate parsers, do not accept both as
-  equivalent. Function sizes are not in this map; consult final native runtime
-  ranges. Filesystem errors fail with path context.
-- **Structural reports:** `--link-report <json>` requires
-  `schema="kamy-link-report"`, `version=1`. Use `placements` and active
-  `directories`/`contributions` to inspect helpers, actual runtime ranges and
-  ownership. JSON coordinates are numbers; `file_offset` distinguishes a
-  certificate directory's file coordinate from RVA directories. The report
-  alone is neither runtime proof nor reference-completeness evidence.
-- **`bisect` oracle:** require the expected exit and, for wrong-output defects,
-  `--expect-stdout <file>`. Timeout or missing termination always fails;
-  unexpected traced fatal exceptions fail, but explicitly declared matching
-  negative faults are accepted. A numeric exit resembling an NTSTATUS is not
-  itself a fault event. Preserve stdin, timeout and output predicate through
-  the final replay. Keep its exact output in the invocation's exclusively
-  reserved artifact directory; never overwrite prior retained evidence.
-  If the all-lowered build passes, there is nothing to bisect.
-  The initial access-denied probe cleanup failure was lifecycle-repaired; actual
-  stdin/output-aware CLI replay then succeeded (43 candidates, 13 steps, culprit
-  `0x19000`). Latest command/log: `target/pre-repair-now/current-bisect.txt`;
-  final identities/results: `target/pre-repair-now/receipt.json`.
-- **Corpus health:** `expected_exit` optionally declares an exact terminal code.
-  A traced fault is allowed only by an explicit matching expectation, even if
-  no normal exit event follows; the golden exit field then records that traced
-  terminal code, not a normal exit. Timeout/missing termination always fails.
-  Normal nonzero exits may be valid without a declaration. Generic differential
-  verification has no expected-fault exception. The DLL loader always requires
-  exit 0 and actual return output; matching empty failures cannot pass.
-- **Required host lowering:** `lower_exports` selects named host exports for
-  identity lowering; every listed export MUST exist and actually lower.
-  Rejection or absent lowering fails, regardless of aggregate coverage. Empty
-  selection retains the existing all-functions behavior. Loader `exports`
-  retains exact argument tokens and may call the same selected export twice.
-  Preserve actual coverage and diagnostics when a required lowering fails;
-  do not replace a failed requirement's measured coverage with an empty record.
-- **Corpus source identity:** use `--corpus <dir>` or `KAMY_CORPUS_DIR`. The
-  available `C:/dev/kamy-corpus` source HEAD is
-  `df9431c03da55fe0432608740ba5d29c78951860` (four historical members);
-  fetching locked `d9bc70d9970d3e1988203acd3415b103bcb62197` failed `not our ref`.
-  Do not call it the historical locked 23-member campaign. Defender quarantine
-  subsequently explained the initially modified `dll_strutil` original; its
-  directory is empty. The user directed skipping it; no exclusion/restore was
-  executed. Report unavailable/skipped, never PASS or a healthy full baseline.
-  Do not rebuild/re-bless/restore it. Preserve all existing goldens and record
-  local witness changes separately. Consult `docs/STATUS.md`,
-  not historical known-FAIL lists, for evidence. Compare stable populations and
-  report additions/removals separately. Identity coverage is not actual MBA
-  transformation.
-- **Pre-repair #37:** `dll_frame_select` uses `lower_exports: [frame_select]` and
-  two six-`u64` loader calls, conditions 0 and 1, args2–4 zero. The independently
-  checked original must return arg5 `0x1122334455667788` and arg6
-  `0x8877665544332211` respectively. The local source-built original already has
-  an independently blessed `expected.yml`; do not re-bless it to match a failure.
-  Run selected doctor, then
-  `kamy corpus verify --corpus C:/dev/kamy-corpus --member dll_frame_select --keep`.
-  After runner-lifecycle repair doctor exited 0, verify exited 1, and coverage
-  was 1 selected / 1 lowered / 0 transformed. Condition 0 expected
-  1234605616436508552 but observed 500008219856; condition 1 expected
-  9833440827789222417 but observed 0. Exit 0 is not this oracle. Keep exact
-  binary/maps/report and actual hashes/IR/results; the current retained DLL is
-  `C:/dev/kamy-corpus/protected/kamy-protected-dll_frame_select-21892.dll`.
-  Final gates passed 455 tests / 47 suites plus fmt/clippy/build; the initial
-  451/454 snapshots are historical. NOW evidence net complete includes actual
-  CLI replay, not H2 acceptance. Available old
-  members console_fibmix/gui_msgbox/kernel32 passed; quarantined dll_strutil is
-  skipped, not a full historical four- or 23-member PASS. This is an acceptance
-  net, not a backend repair: #37–43 stay unfixed, H2 reopened; #38 producer
-  reachability is unresolved and #39–41 have no new timings. No transforms,
-  ASan, Rocq, CI or commit/push work.
-- **Runner is headless by construction:** every launch goes through `kamy-run`
-  (job-object, WER-popup suppressed, hang-killed) — no WER dialogs, no orphaned
-  children, safe in bulk and in parallel. On a crash it reports the faulting RVA
-  + NTSTATUS for any unhandled exception, not just access violations.
-
-Full command surface and flags: `docs/tooling.md`. Decision context:
-`docs/grilling.md` (D22/D37/D40). Memory-backed allocation, compiled startup,
-Rust std/runtime support and whole-image compaction have separate ordered
-handoffs; do not infer their implementation from a green identity run.
+- Commands, profile/schema/ABI/module semantics: `docs/tooling.md`.
+- Frame/save/unwind contracts: `docs/architecture.md` §8.1; decisions:
+  `docs/grilling.md` D16/D22/D24/D40.
+- Acceptance and evidence: `docs/handoffs/02-memory-backed-lowering.md`,
+  `docs/STATUS.md`. Keep historical snapshots there, not in this checklist.

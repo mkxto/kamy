@@ -176,6 +176,10 @@ impl PeFile {
         Ok(pe)
     }
 
+    pub fn image_base(&self) -> u64 {
+        self.image_base
+    }
+
     pub fn section_headers(&self) -> &[SectionRecord] {
         &self.sections
     }

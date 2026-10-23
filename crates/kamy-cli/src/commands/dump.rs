@@ -1,4 +1,4 @@
-//! `kamy dump`: human-readable IR dump of a single function at a chosen stage.
+//! `kamy dump`: human-readable IR or an exact native byte range.
 
 use std::path::Path;
 
@@ -13,22 +13,40 @@ pub(crate) enum StageArg {
     Ssa,
     Optimize,
     Regalloc,
+    Native,
 }
 
-impl From<StageArg> for Stage {
-    fn from(s: StageArg) -> Self {
-        match s {
-            StageArg::Lift => Stage::Lift,
-            StageArg::Ssa => Stage::Ssa,
-            StageArg::Optimize => Stage::Optimize,
-            StageArg::Regalloc => Stage::Regalloc,
-        }
-    }
-}
-
-pub(crate) fn run(input: &Path, rva: &str, stage: StageArg) -> anyhow::Result<()> {
+pub(crate) fn run(
+    input: &Path,
+    rva: &str,
+    stage: StageArg,
+    size: Option<u32>,
+) -> anyhow::Result<()> {
     let rva = parse_rva(rva)?;
-    let text = kamy_triage::dump_function(input, rva, stage.into())?;
+    let text = match stage {
+        StageArg::Native => {
+            let size = size.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--stage native requires --size <byte count> from the exact map/report"
+                )
+            })?;
+            kamy_triage::dump_native(input, rva, size)?
+        }
+        _ => {
+            anyhow::ensure!(
+                size.is_none(),
+                "--size is supported only with --stage native"
+            );
+            let stage = match stage {
+                StageArg::Lift => Stage::Lift,
+                StageArg::Ssa => Stage::Ssa,
+                StageArg::Optimize => Stage::Optimize,
+                StageArg::Regalloc => Stage::Regalloc,
+                StageArg::Native => unreachable!(),
+            };
+            kamy_triage::dump_function(input, rva, stage)?
+        }
+    };
     print!("{text}");
     Ok(())
 }

@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 tracing.workspace = true
+iced-x86.workspace = true
 kamy-core.workspace = true
 kamy-pe.workspace = true
 kamy-disasm.workspace = true
